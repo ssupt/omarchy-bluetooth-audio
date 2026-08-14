@@ -1,4 +1,4 @@
-# Bluetooth Audio for Omarchy
+# Advanced Bluetooth Audio for Omarchy
 
 An extension of Omarchy's native Bluetooth panel that exposes the active
 PipeWire audio mode for connected headsets and speakers.
@@ -9,7 +9,7 @@ opens a keyboard- and pointer-friendly selector. Modes are labelled by their
 trade-off, such as `High fidelity · AAC` or `Headset + microphone · mSBC`.
 
 This is the Bluetooth-panel companion to
-[Omarchy Audio Control](https://github.com/ssupt/omarchy-audio-control), which
+[Advanced Audio Control](https://github.com/ssupt/omarchy-audio-control), which
 provides per-application output routing and the full Devices/Bluetooth settings
 window.
 

@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "id": "ssupt.bluetooth-audio",
-  "name": "Bluetooth Audio",
+  "name": "Advanced Bluetooth Audio",
   "version": "0.1.0",
   "author": "Lorenzo Golluscio",
-  "description": "Bluetooth device controls with native PipeWire codec selection",
+  "description": "View and switch Bluetooth audio codecs from Omarchy's native panel",
   "kinds": [
     "bar-widget"
   ],
@@ -12,8 +12,8 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Bluetooth Audio",
-    "description": "Bluetooth device controls with native PipeWire codec selection",
+    "displayName": "Advanced Bluetooth Audio",
+    "description": "View and switch Bluetooth audio codecs from Omarchy's native panel",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right"
