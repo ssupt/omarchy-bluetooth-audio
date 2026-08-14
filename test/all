@@ -1,0 +1,67 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+TEST_DIR="$ROOT/test"
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+for script in "$ROOT"/scripts/*; do
+  bash -n "$script" || fail "bash syntax: ${script##*/}"
+done
+echo "PASS: helper syntax"
+
+node - "$ROOT/Model.js" <<'JS'
+const assert = require('node:assert/strict')
+const model = require(process.argv[2])
+
+const profiles = {
+  '001122334455': {
+    activeProfile: 'a2dp-sink-aac',
+    activeCodec: 'AAC',
+    profiles: [
+      { value: 'a2dp-sink-aac', codec: 'AAC', label: 'High fidelity · AAC' },
+      { value: 'headset-head-unit-msbc', codec: 'mSBC', label: 'Headset + microphone · mSBC' }
+    ]
+  }
+}
+
+const state = model.audioProfileState(profiles, '00:11:22:33:44:55')
+assert.equal(state.activeCodec, 'AAC')
+assert.deepEqual(model.audioProfileOptions(state), [
+  { value: 'a2dp-sink-aac', label: 'High fidelity · AAC' },
+  { value: 'headset-head-unit-msbc', label: 'Headset + microphone · mSBC' }
+])
+assert.equal(model.audioProfileCodec(state, 'headset-head-unit-msbc'), 'mSBC')
+assert.equal(model.audioProfileState(profiles, 'AA:BB:CC:DD:EE:FF'), null)
+console.log('PASS: Bluetooth profile model')
+JS
+
+bluetooth_profiles=$(
+  AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+    PATH="$TEST_DIR/mocks:$PATH" \
+    "$ROOT/scripts/bluetooth-audio-profiles"
+)
+
+jq -e '
+  ."001122334455".card == "bluez_card.00_11_22_33_44_55"
+  and ."001122334455".activeCodec == "AAC"
+  and [."001122334455".profiles[].label] == [
+    "High fidelity · AAC",
+    "Headset + microphone · mSBC"
+  ]
+' <<<"$bluetooth_profiles" >/dev/null || fail "Bluetooth codec discovery"
+echo "PASS: Bluetooth codec discovery"
+
+jq -e '
+  .schemaVersion == 1
+  and .id == "ssupt.bluetooth-audio"
+  and (.kinds | index("bar-widget") != null)
+  and .entryPoints.barWidget == "Panel.qml"
+  and .omarchy.clonedFrom == "omarchy.bluetooth"
+' "$ROOT/manifest.json" >/dev/null || fail "manifest"
+echo "PASS: manifest"

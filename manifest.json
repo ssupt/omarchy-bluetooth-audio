@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "ssupt.bluetooth-audio",
+  "name": "Bluetooth Audio",
+  "version": "0.1.0",
+  "author": "Lorenzo Golluscio",
+  "description": "Bluetooth device controls with native PipeWire codec selection",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Bluetooth Audio",
+    "description": "Bluetooth device controls with native PipeWire codec selection",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.bluetooth"
+  }
+}

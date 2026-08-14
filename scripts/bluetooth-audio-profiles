@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# omarchy:summary=List connected Bluetooth audio codecs as JSON
+# omarchy:group=audio
+
+if (( $# != 0 )); then
+  echo "Usage: bluetooth-audio-profiles" >&2
+  exit 1
+fi
+
+set -o pipefail
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+"$script_dir/audio-profiles" | jq -c '
+  def normalized_address:
+    ascii_downcase | gsub("[^0-9a-f]"; "");
+
+  def codec:
+    try ((.label // "") | capture("codec (?<codec>[^)]+)"; "i").codec) catch ""
+    | if ascii_upcase == "MSBC" then "mSBC" else . end;
+
+  def option_label:
+    codec as $codec
+    | if $codec == "" then (.label // .value)
+      elif (.sources // 0) > 0 then "Headset + microphone · " + $codec
+      else "High fidelity · " + $codec
+      end;
+
+  [
+    .[]
+    | select(.bluetooth == true and (.address // "") != "")
+    | . as $card
+    | [
+        .profiles[]
+        | select(.value != "off" and (.sinks // 0) > 0)
+        | {
+            value,
+            codec: codec,
+            label: option_label,
+            hasInput: ((.sources // 0) > 0)
+          }
+      ] as $profiles
+    | select($profiles | length > 0)
+    | {
+        key: ($card.address | normalized_address),
+        value: {
+          address: $card.address,
+          card: $card.name,
+          label: $card.label,
+          activeProfile: $card.activeProfile,
+          activeCodec: (($profiles | map(select(.value == $card.activeProfile))[0].codec) // ""),
+          profiles: $profiles
+        }
+      }
+    | select(.key != "")
+  ]
+  | from_entries
+' || exit 1

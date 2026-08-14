@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# omarchy:summary=Set a connected Bluetooth audio codec
+# omarchy:group=audio
+# omarchy:args=<address> <profile>
+
+address=${1:-}
+profile=${2:-}
+
+if (( $# != 2 )) || [[ ! $address =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ || -z $profile ]]; then
+  echo "Usage: bluetooth-audio-profile-set <address> <profile>" >&2
+  exit 1
+fi
+
+set -o pipefail
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+card=$("$script_dir/bluetooth-audio-profiles" | jq -r --arg address "$address" --arg profile "$profile" '
+  def normalized_address:
+    ascii_downcase | gsub("[^0-9a-f]"; "");
+  .[($address | normalized_address)]
+  | select(any(.profiles[]; .value == $profile))
+  | .card // empty
+') || exit 1
+
+[[ -n $card ]] || { echo "Bluetooth audio profile is not available" >&2; exit 1; }
+"$script_dir/audio-profile-set" "$card" "$profile"
