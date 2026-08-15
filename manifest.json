@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "ssupt.bluetooth-audio",
   "name": "Advanced Bluetooth Audio",
-  "version": "0.1.0",
-  "author": "Lorenzo Golluscio",
-  "description": "View and switch Bluetooth audio codecs from Omarchy's native panel",
+  "version": "0.2.0",
+  "author": "ssupt",
+  "description": "Shows active codecs, makes connected devices the default output (and input when available), and remembers their preferred audio modes",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Advanced Bluetooth Audio",
-    "description": "View and switch Bluetooth audio codecs from Omarchy's native panel",
+    "description": "Shows active codecs, makes connected devices the default output (and input when available), and remembers their preferred audio modes",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right"

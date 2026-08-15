@@ -7,18 +7,19 @@ fi
 
 if [[ -n ${AUDIO_CONTROL_PROFILE_LOG:-} && -n ${AUDIO_CONTROL_PROFILE_STATE:-} ]]; then
   state=$(<"$AUDIO_CONTROL_PROFILE_STATE")
+  card_index=${AUDIO_CONTROL_PROFILE_CARD_INDEX:-10}
 
   case "$*" in
     "-f json list sinks")
       if [[ $state == old ]]; then
-        echo '[{"index":100,"card":10,"volume":{"front-left":{"value_percent":"42%"}},"mute":false}]'
+        printf '[{"index":100,"card":%s,"volume":{"front-left":{"value_percent":"42%%"}},"mute":false}]\n' "$card_index"
       else
-        echo '[{"index":101,"card":10,"volume":{"front-left":{"value_percent":"100%"}},"mute":false}]'
+        printf '[{"index":101,"card":%s,"volume":{"front-left":{"value_percent":"100%%"}},"mute":false}]\n' "$card_index"
       fi
       exit 0
       ;;
     "-f json list sources")
-      echo '[{"index":200,"card":10,"volume":{"mono":{"value_percent":"36%"}},"mute":true}]'
+      printf '[{"index":200,"card":%s,"volume":{"mono":{"value_percent":"36%%"}},"mute":true}]\n' "$card_index"
       exit 0
       ;;
     "-f json list sink-inputs")

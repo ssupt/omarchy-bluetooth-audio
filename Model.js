@@ -63,8 +63,10 @@ function nodeText(node) {
   ].join(" ").toLowerCase()
 }
 
-function bluetoothSinkMatchesDevice(node, device) {
-  if (!node || !node.isSink || node.isStream || !device) return false
+function bluetoothNodeMatchesDevice(node, device, direction) {
+  if (!node || node.isStream || !device) return false
+  if (direction === "sink" && !node.isSink) return false
+  if (direction === "source" && !node.isSource) return false
 
   var address = normalizedAddress(device.address)
   var text = nodeText(node)
@@ -72,6 +74,29 @@ function bluetoothSinkMatchesDevice(node, device) {
 
   var label = deviceLabel(device).toLowerCase()
   return label !== "" && text.indexOf(label) !== -1
+}
+
+function bluetoothSinkMatchesDevice(node, device) {
+  return bluetoothNodeMatchesDevice(node, device, "sink")
+}
+
+function bluetoothSourceMatchesDevice(node, device) {
+  return bluetoothNodeMatchesDevice(node, device, "source")
+}
+
+function sameAudioNode(left, right) {
+  if (!left || !right) return false
+  if (left === right) return true
+
+  if (left.id !== undefined && left.id !== null
+      && right.id !== undefined && right.id !== null
+      && String(left.id) === String(right.id)) return true
+
+  var leftProps = nodeProps(left)
+  var rightProps = nodeProps(right)
+  var leftName = String(left.name || leftProps["node.name"] || "")
+  var rightName = String(right.name || rightProps["node.name"] || "")
+  return leftName !== "" && leftName === rightName
 }
 
 function audioProfileState(states, address) {
@@ -198,6 +223,8 @@ if (typeof module !== "undefined") {
     nodeProps: nodeProps,
     nodeText: nodeText,
     bluetoothSinkMatchesDevice: bluetoothSinkMatchesDevice,
+    bluetoothSourceMatchesDevice: bluetoothSourceMatchesDevice,
+    sameAudioNode: sameAudioNode,
     audioProfileState: audioProfileState,
     audioProfileOptions: audioProfileOptions,
     audioProfileCodec: audioProfileCodec,

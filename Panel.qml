@@ -31,8 +31,7 @@ Panel {
   property bool owesDiscoveryStop: false
   readonly property var devices: Bluetooth.devices ? Bluetooth.devices.values : []
   readonly property var pipewireNodes: Pipewire.nodes ? Pipewire.nodes.values : []
-  property var pendingAudioOutputDevice: null
-  property int pendingAudioOutputAttempts: 0
+  readonly property var defaultAudioSink: Pipewire.defaultAudioSink
 
   // BlueZ owns pairing and connection state; PipeWire owns the audio card's
   // active profile and therefore the codec/microphone mode offered here.
@@ -104,9 +103,9 @@ Panel {
   // guaranteeing one highlight on screen.
   property string focusSection: "connected"
   property int selectedIndex: 0
-  // Empty selects the device row. Connected audio rows add a codec action
-  // before the existing forget action, both reachable with h/l or Left/Right.
-  property string focusedAction: ""  // "" | "profile" | "forget"
+  // Empty selects the device row. Connected audio rows add explicit default-
+  // audio and preferred-mode actions alongside the existing forget action.
+  property string focusedAction: ""  // "" | "audio" | "forget" | "profile"
   property bool cursorActive: false
 
   // Stable identity for the focused device. Devices move between sections as
@@ -212,12 +211,33 @@ Panel {
     return sinks
   }
 
+  function audioSources() {
+    var sources = []
+    for (var i = 0; i < pipewireNodes.length; i++) {
+      var node = pipewireNodes[i]
+      if (node && node.isSource && !node.isStream) sources.push(node)
+    }
+    return sources
+  }
+
   function bluetoothAudioSink(device) {
     var sinks = audioSinks()
     for (var i = 0; i < sinks.length; i++) {
       if (Model.bluetoothSinkMatchesDevice(sinks[i], device)) return sinks[i]
     }
     return null
+  }
+
+  function bluetoothAudioSource(device) {
+    var sources = audioSources()
+    for (var i = 0; i < sources.length; i++) {
+      if (Model.bluetoothSourceMatchesDevice(sources[i], device)) return sources[i]
+    }
+    return null
+  }
+
+  function audioUseActionAvailable(device) {
+    return !!device && device.connected && !!bluetoothAudioSink(device)
   }
 
   function audioProfileState(address) {
@@ -304,33 +324,29 @@ Panel {
     }
   }
 
-  function scheduleAudioOutputSwitch(device) {
-    pendingAudioOutputDevice = {
-      address: device && device.address ? device.address : "",
-      name: device && device.name ? device.name : "",
-      deviceName: device && device.deviceName ? device.deviceName : ""
+  function setDefaultAudioSource(source) {
+    if (!source) return
+    Pipewire.preferredDefaultAudioSource = source
+    if (source.id !== undefined && source.name) {
+      Quickshell.execDetached([
+        "omarchy-audio-input-set-default",
+        String(source.id),
+        String(source.name)
+      ])
     }
-    pendingAudioOutputAttempts = 0
-    audioSwitchTimer.restart()
   }
 
-  function switchPendingAudioOutput() {
-    if (!pendingAudioOutputDevice) return
+  function useDeviceForAudio(device) {
+    if (!device) return
+    var sink = bluetoothAudioSink(device)
+    if (!sink) return
+    setDefaultAudioSink(sink)
 
-    var sink = bluetoothAudioSink(pendingAudioOutputDevice)
-    if (sink) {
-      setDefaultAudioSink(sink)
-      pendingAudioOutputDevice = null
-      audioSwitchTimer.stop()
-      return
-    }
-
-    pendingAudioOutputAttempts += 1
-    if (pendingAudioOutputAttempts >= 8) {
-      pendingAudioOutputDevice = null
-      return
-    }
-    audioSwitchTimer.restart()
+    // High-fidelity Bluetooth profiles expose output only. Communication
+    // profiles also expose a matching microphone; when present, selecting the
+    // device for audio makes that source the default as well.
+    var source = bluetoothAudioSource(device)
+    if (source) setDefaultAudioSource(source)
   }
 
   function deviceAt(section, index) {
@@ -401,7 +417,6 @@ Panel {
       if (finishedConnecting
           || (action === "disconnecting" && found && !found.connected)
           || (action === "forgetting" && (!found || (!found.paired && !found.bonded && !found.trusted)))) {
-        if (finishedConnecting) scheduleAudioOutputSwitch(found)
         delete next[address]
         changed = true
       }
@@ -457,8 +472,9 @@ Panel {
     if (focusSection !== "known" && focusSection !== "connected") return actions
     var dev = deviceAt(focusSection, selectedIndex)
     if (!dev || !dev.address) return actions
-    if (focusSection === "connected" && audioProfileActionAvailable(dev)) actions.push("profile")
+    if (focusSection === "connected" && audioUseActionAvailable(dev)) actions.push("audio")
     actions.push("forget")
+    if (focusSection === "connected" && audioProfileActionAvailable(dev)) actions.push("profile")
     return actions
   }
 
@@ -479,6 +495,10 @@ Panel {
     if (focusedAction === "profile") {
       var row = connectedRepeater.itemAt(selectedIndex)
       if (row) row.toggleProfileMenu()
+      return
+    }
+    if (focusedAction === "audio") {
+      useDeviceForAudio(deviceAt(focusSection, selectedIndex))
       return
     }
     if (focusedAction === "forget") {
@@ -581,7 +601,11 @@ Panel {
   onKnownDevicesChanged: { reselectFocusedDevice(); syncPendingActions() }
   onDiscoveredDevicesChanged: { reselectFocusedDevice(); syncPendingActions() }
   onVisibleSectionsChanged: clampCursor()
-  onPipewireNodesChanged: if (opened) audioProfileSettleTimer.restart()
+  onPipewireNodesChanged: {
+    if (opened) audioProfileSettleTimer.restart()
+    if (focusedAction === "audio"
+        && !audioUseActionAvailable(deviceAt(focusSection, selectedIndex))) focusedAction = ""
+  }
   onAudioProfilesChanged: if (focusedAction === "profile"
     && !audioProfileActionAvailable(deviceAt(focusSection, selectedIndex))) focusedAction = ""
 
@@ -758,13 +782,6 @@ Panel {
     interval: 20000
     repeat: false
     onTriggered: root.pendingActions = ({})
-  }
-
-  Timer {
-    id: audioSwitchTimer
-    interval: 500
-    repeat: false
-    onTriggered: root.switchPendingAudioOutput()
   }
 
   Timer {
@@ -1095,10 +1112,16 @@ Panel {
     readonly property string currentProfileName: pendingProfileName !== ""
       ? pendingProfileName : String(profileState ? profileState.activeProfile || "" : "")
     readonly property string activeCodec: Model.audioProfileCodec(profileState, currentProfileName)
+    readonly property var deviceAudioSink: root.bluetoothAudioSink(dev)
+    readonly property var deviceAudioSource: root.bluetoothAudioSource(dev)
+    readonly property bool useAudioAvailable: isConnected && !!deviceAudioSink
+    readonly property bool usingForAudio: useAudioAvailable
+      && Model.sameAudioNode(deviceAudioSink, root.defaultAudioSink)
 
     readonly property bool rowSelected: root.cursorActive && root.focusSection === sectionName && root.selectedIndex === rowIndex
     readonly property bool forgetAvailable: (sectionName === "known" || sectionName === "connected") && !isDiscovered
     readonly property bool showForgetButton: forgetAvailable && (rowMouse.containsMouse || rowSelected)
+    readonly property bool showUseAudioButton: useAudioAvailable && (rowMouse.containsMouse || rowSelected)
 
     hasCursor: rowSelected && root.focusedAction === ""
     current: isConnected
@@ -1112,6 +1135,7 @@ Panel {
       if (action === "disconnecting" || devState === 2) return "Disconnecting…"
       if (isConnected) {
         var details = []
+        if (usingForAudio) details.push("Default audio")
         if (activeCodec !== "") details.push(activeCodec)
         if (dev.batteryAvailable) details.push(Math.round(dev.battery * 100) + "%")
         if (details.length > 0) return details.join(" · ")
@@ -1171,7 +1195,7 @@ Panel {
       anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(10)
       implicitHeight: Math.max(deviceIcon.implicitHeight, info.implicitHeight,
-        profileDropdown.implicitHeight, forgetBtn.implicitHeight)
+        profileDropdown.implicitHeight, forgetBtn.implicitHeight, useAudioBtn.implicitHeight)
 
       Text {
         id: deviceIcon
@@ -1188,9 +1212,10 @@ Panel {
         spacing: Style.space(1)
         anchors.left: deviceIcon.right
         anchors.leftMargin: Style.space(10)
-        anchors.right: forgetBtn.visible ? forgetBtn.left
-          : (profileDropdown.visible ? profileDropdown.left : parent.right)
-        anchors.rightMargin: profileDropdown.visible || forgetBtn.visible ? Style.space(8) : 0
+        anchors.right: useAudioBtn.visible ? useAudioBtn.left
+          : (forgetBtn.visible ? forgetBtn.left
+          : (profileDropdown.visible ? profileDropdown.left : parent.right))
+        anchors.rightMargin: profileDropdown.visible || forgetBtn.visible || useAudioBtn.visible ? Style.space(8) : 0
         anchors.verticalCenter: parent.verticalCenter
 
         Text {
@@ -1232,6 +1257,7 @@ Panel {
         popupGap: Style.space(6)
         chevronOnly: true
         triggerChrome: hasCursor
+        tooltipText: "Preferred audio mode"
         value: row.currentProfileName
         options: row.profileOptions
         hasCursor: row.rowSelected && root.focusedAction === "profile"
@@ -1285,6 +1311,39 @@ Panel {
           var dev = root.deviceFor(row)
           if (!dev) return
           root.forgetDevice(dev)
+        }
+      }
+
+      PanelActionButton {
+        id: useAudioBtn
+        anchors.right: forgetBtn.visible ? forgetBtn.left
+          : (profileDropdown.visible ? profileDropdown.left : parent.right)
+        anchors.rightMargin: forgetBtn.visible || profileDropdown.visible ? Style.space(6) : 0
+        anchors.verticalCenter: parent.verticalCenter
+        visible: row.showUseAudioButton
+        iconText: row.usingForAudio ? "󰄬" : "󰓃"
+        tooltipText: row.usingForAudio ? "Default audio device"
+          : (row.deviceAudioSource ? "Use for audio input and output" : "Use for audio output")
+        foreground: row.usingForAudio
+          ? Style.selectedStateColor(root.bar.foreground, Color.accent)
+          : root.bar.foreground
+        hoverColor: root.bar.foreground
+        fontFamily: root.bar.fontFamily
+        hasCursor: row.rowSelected && root.focusedAction === "audio"
+        onHovered: function(isHovered) {
+          if (!isHovered) {
+            if (rowMouse.containsMouse && root.focusedAction === "audio") root.focusedAction = ""
+            return
+          }
+          root.cursorActive = true
+          root.focusSection = row.sectionName
+          root.selectedIndex = row.rowIndex
+          root.focusedAction = "audio"
+        }
+        onClicked: {
+          var dev = root.deviceFor(row)
+          if (!dev) return
+          root.useDeviceForAudio(dev)
         }
       }
     }

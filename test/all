@@ -38,6 +38,32 @@ assert.deepEqual(model.audioProfileOptions(state), [
 ])
 assert.equal(model.audioProfileCodec(state, 'headset-head-unit-msbc'), 'mSBC')
 assert.equal(model.audioProfileState(profiles, 'AA:BB:CC:DD:EE:FF'), null)
+
+const device = { address: '00:11:22:33:44:55', deviceName: 'Bluetooth Headphones' }
+const sink = {
+  id: 40,
+  name: 'bluez_output.00_11_22_33_44_55.1',
+  isSink: true,
+  isSource: false,
+  isStream: false,
+  ready: true,
+  properties: { 'api.bluez5.address': '00:11:22:33:44:55' }
+}
+const source = {
+  id: 41,
+  name: 'bluez_input.00_11_22_33_44_55.0',
+  isSink: false,
+  isSource: true,
+  isStream: false,
+  ready: true,
+  properties: { 'api.bluez5.address': '00:11:22:33:44:55' }
+}
+assert.equal(model.bluetoothSinkMatchesDevice(sink, device), true)
+assert.equal(model.bluetoothSourceMatchesDevice(source, device), true)
+assert.equal(model.bluetoothSourceMatchesDevice(sink, device), false)
+assert.equal(model.sameAudioNode(sink, { id: 40, name: 'replacement' }), true)
+assert.equal(model.sameAudioNode(sink, { id: 42, name: sink.name }), true)
+assert.equal(model.sameAudioNode(sink, source), false)
 console.log('PASS: Bluetooth profile model')
 JS
 
@@ -57,11 +83,42 @@ jq -e '
 ' <<<"$bluetooth_profiles" >/dev/null || fail "Bluetooth codec discovery"
 echo "PASS: Bluetooth codec discovery"
 
+profile_log=$(mktemp)
+profile_state=$(mktemp)
+trap 'rm -f "$profile_log" "$profile_state"' EXIT
+printf 'old\n' >"$profile_state"
+
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-audio-profile-set" \
+    00:11:22:33:44:55 headset-head-unit-msbc
+
+expected_profile_log=$(cat <<'EOF'
+set-sink-mute 100 true
+set-sink-input-mute 300 true
+set-card-profile bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+set-sink-mute 101 true
+set-sink-volume 101 42%
+set-sink-mute 101 false
+set-source-volume 200 36%
+set-source-mute 200 true
+set-sink-input-mute 300 false
+EOF
+)
+[[ $(<"$profile_log") == "$expected_profile_log" ]] || fail "safe preferred-mode transition"
+echo "PASS: preferred mode selection"
+
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
+  and .version == "0.2.0"
+  and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"
+  and .description == .barWidget.description
   and .omarchy.clonedFrom == "omarchy.bluetooth"
 ' "$ROOT/manifest.json" >/dev/null || fail "manifest"
 echo "PASS: manifest"

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# omarchy:summary=Set a connected Bluetooth audio codec
+# omarchy:summary=Set a connected Bluetooth device's preferred audio mode
 # omarchy:group=audio
 # omarchy:args=<address> <profile>
 
@@ -24,4 +24,6 @@ card=$("$script_dir/bluetooth-audio-profiles" | jq -r --arg address "$address" -
 ') || exit 1
 
 [[ -n $card ]] || { echo "Bluetooth audio profile is not available" >&2; exit 1; }
+# WirePlumber's device.restore-profile policy stores this profile against the
+# individual BlueZ card and restores it the next time that device appears.
 "$script_dir/audio-profile-set" "$card" "$profile"

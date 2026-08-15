@@ -43,6 +43,7 @@ Item {
   property bool chevronOnly: false
   property bool showChevron: true
   property bool triggerChrome: true
+  property string tooltipText: ""
 
   // Panel-cursor flag. When true, the trigger renders the shared
   // hover-cursor state. Active Qt focus defaults to the same visuals.
@@ -113,6 +114,12 @@ Item {
       HoverHandler {
         id: triggerHover
         onHoveredChanged: root.hovered(hovered)
+      }
+
+      PanelToolTip {
+        visible: root.tooltipText !== "" && triggerHover.hovered && !popup.opened
+        text: root.tooltipText
+        fontFamily: root.fontFamily
       }
 
       Keys.onPressed: function(event) {
