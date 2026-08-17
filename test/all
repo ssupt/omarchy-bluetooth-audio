@@ -15,9 +15,15 @@ for script in "$ROOT"/scripts/*; do
 done
 echo "PASS: helper syntax"
 
-node - "$ROOT/Model.js" <<'JS'
+node - "$ROOT/Model.js" "$ROOT/Panel.qml" <<'JS'
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
 const model = require(process.argv[2])
+const panelSource = fs.readFileSync(process.argv[3], 'utf8')
+
+assert.match(panelSource, /audioControlInstalled/)
+assert.match(panelSource, /var payload = '\{"tab":"bluetooth"\}'/)
+assert.match(panelSource, /summon\("ssupt\.audio-control", payload\)/)
 
 const profiles = {
   '001122334455': {
@@ -38,6 +44,22 @@ assert.deepEqual(model.audioProfileOptions(state), [
 ])
 assert.equal(model.audioProfileCodec(state, 'headset-head-unit-msbc'), 'mSBC')
 assert.equal(model.audioProfileState(profiles, 'AA:BB:CC:DD:EE:FF'), null)
+
+const audioPreferences = model.parseAudioPreferences(JSON.stringify({
+  defaults: { output: 'bluez_output.00_11_22_33_44_55.1' },
+  bluetoothProfiles: { '00:11:22:33:44:55': 'headset-head-unit-msbc' }
+}))
+assert.deepEqual(audioPreferences, {
+  version: 1,
+  defaults: { output: 'bluez_output.00_11_22_33_44_55.1', input: '' },
+  bluetoothProfiles: { '001122334455': 'headset-head-unit-msbc' }
+})
+assert.equal(model.preferredAudioProfile(
+  audioPreferences, '00-11-22-33-44-55', state.profiles, state.activeProfile
+), 'headset-head-unit-msbc')
+assert.equal(model.preferredAudioProfile(
+  audioPreferences, '00:11:22:33:44:55', [{ value: 'a2dp-sink-aac' }], state.activeProfile
+), 'a2dp-sink-aac')
 
 const device = { address: '00:11:22:33:44:55', deviceName: 'Bluetooth Headphones' }
 const sink = {
@@ -64,6 +86,8 @@ assert.equal(model.bluetoothSourceMatchesDevice(sink, device), false)
 assert.equal(model.sameAudioNode(sink, { id: 40, name: 'replacement' }), true)
 assert.equal(model.sameAudioNode(sink, { id: 42, name: sink.name }), true)
 assert.equal(model.sameAudioNode(sink, source), false)
+assert.equal(model.preferredAudioNodeName(audioPreferences, 'output', source, [sink]), sink.name)
+assert.equal(model.preferredAudioNodeName(audioPreferences, 'output', source, [source]), source.name)
 console.log('PASS: Bluetooth profile model')
 JS
 
@@ -85,13 +109,16 @@ echo "PASS: Bluetooth codec discovery"
 
 profile_log=$(mktemp)
 profile_state=$(mktemp)
-trap 'rm -f "$profile_log" "$profile_state"' EXIT
+shared_preferences=$(mktemp)
+shared_preferences_lock="${shared_preferences}.lock"
+trap 'rm -f "$profile_log" "$profile_state" "$shared_preferences" "$shared_preferences_lock"' EXIT
 printf 'old\n' >"$profile_state"
 
 AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
   AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
   AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  OMARCHY_AUDIO_PREFERENCES_FILE="$shared_preferences" \
   PATH="$TEST_DIR/mocks:$PATH" \
   "$ROOT/scripts/bluetooth-audio-profile-set" \
     00:11:22:33:44:55 headset-head-unit-msbc
@@ -109,12 +136,19 @@ set-sink-input-mute 300 false
 EOF
 )
 [[ $(<"$profile_log") == "$expected_profile_log" ]] || fail "safe preferred-mode transition"
+OMARCHY_AUDIO_PREFERENCES_FILE="$shared_preferences" \
+  "$ROOT/scripts/audio-preferences" set-default output bluez_output.00_11_22_33_44_55.1
+jq -e '
+  .version == 1
+  and .defaults.output == "bluez_output.00_11_22_33_44_55.1"
+  and .bluetoothProfiles == {"001122334455":"headset-head-unit-msbc"}
+' "$shared_preferences" >/dev/null || fail "shared audio preferences"
 echo "PASS: preferred mode selection"
 
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.2.0"
+  and .version == "0.3.0"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

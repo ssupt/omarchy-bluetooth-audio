@@ -32,6 +32,22 @@ Panel {
   readonly property var devices: Bluetooth.devices ? Bluetooth.devices.values : []
   readonly property var pipewireNodes: Pipewire.nodes ? Pipewire.nodes.values : []
   readonly property var defaultAudioSink: Pipewire.defaultAudioSink
+  readonly property var defaultAudioSource: Pipewire.defaultAudioSource
+  readonly property string audioPreferencesPath: {
+    var configHome = Quickshell.env("XDG_CONFIG_HOME")
+    if (!configHome) configHome = Quickshell.env("HOME") + "/.config"
+    return configHome + "/omarchy/audio-preferences.json"
+  }
+  readonly property string audioControlManifestPath: {
+    var configHome = Quickshell.env("XDG_CONFIG_HOME")
+    if (!configHome) configHome = Quickshell.env("HOME") + "/.config"
+    return configHome + "/omarchy/plugins/ssupt.audio-control/manifest.json"
+  }
+  property var audioPreferences: Model.parseAudioPreferences("")
+  readonly property var audioPluginRegistry: bar && bar.shell ? bar.shell.pluginRegistry : null
+  property bool audioControlInstalled: false
+  onAudioPluginRegistryChanged: Qt.callLater(function() { root.refreshAudioControlInstalled() })
+  onAudioControlInstalledChanged: if (!audioControlInstalled && headerIndex === 0) headerIndex = 1
 
   // BlueZ owns pairing and connection state; PipeWire owns the audio card's
   // active profile and therefore the codec/microphone mode offered here.
@@ -46,6 +62,10 @@ Panel {
   function pluginScript(name) {
     var url = String(Qt.resolvedUrl("scripts/" + name))
     return decodeURIComponent(url.replace(/^file:\/\//, ""))
+  }
+
+  function audioControlScript(name) {
+    return audioControlManifestPath.replace(/\/manifest\.json$/, "") + "/scripts/" + name
   }
 
   function deviceLabel(device) {
@@ -107,16 +127,18 @@ Panel {
   // audio and preferred-mode actions alongside the existing forget action.
   property string focusedAction: ""  // "" | "audio" | "forget" | "profile"
   property bool cursorActive: false
+  property int headerIndex: 1
 
   // Stable identity for the focused device. Devices move between sections as
   // they connect, disconnect, pair, or get forgotten, so follow the BlueZ
   // address across section changes instead of preserving a stale row index.
   property string focusedDeviceAddress: ""
 
-  // "header" is a virtual section for the hero Bluetooth on/off toggle; it
-  // sits above the device sections so the adapter can be toggled by keyboard
-  // even when it is off and no device rows exist.
-  readonly property bool headerHasCursor: cursorActive && focusSection === "header"
+  // "header" is a virtual horizontal section for companion settings + power.
+  // It sits above the device sections so the adapter can still be toggled by
+  // keyboard when it is off and no device rows exist.
+  readonly property bool settingsHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === 0
+  readonly property bool powerHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === 1
   readonly property string toggleHint: root.adapter && root.adapter.enabled ? "Turn Bluetooth off" : "Turn Bluetooth on"
 
   readonly property color hoverFill: bar
@@ -220,6 +242,23 @@ Panel {
     return sources
   }
 
+  readonly property string preferredAudioSinkName: Model.preferredAudioNodeName(
+    audioPreferences, "output", defaultAudioSink, audioSinks())
+
+  function loadAudioPreferences(raw) {
+    audioPreferences = Model.parseAudioPreferences(raw)
+  }
+
+  function refreshAudioControlInstalled() {
+    if (audioPluginRegistry && audioPluginRegistry.installedPlugins
+        && typeof audioPluginRegistry.isEnabled === "function") {
+      audioControlInstalled = !!audioPluginRegistry.installedPlugins["ssupt.audio-control"]
+        && audioPluginRegistry.isEnabled("ssupt.audio-control")
+      return
+    }
+    if (!audioControlCheckProc.running) audioControlCheckProc.running = true
+  }
+
   function bluetoothAudioSink(device) {
     var sinks = audioSinks()
     for (var i = 0; i < sinks.length; i++) {
@@ -314,11 +353,19 @@ Panel {
 
   function setDefaultAudioSink(sink) {
     if (!sink) return
+    var previousSinkName = defaultAudioSink && defaultAudioSink.name
+      ? String(defaultAudioSink.name) : ""
     Pipewire.preferredDefaultAudioSink = sink
     if (sink.id !== undefined && sink.name) {
+      var command = audioControlInstalled
+        ? [audioControlScript("audio-output-set-default"), String(sink.id),
+            String(sink.name), previousSinkName]
+        : ["omarchy-audio-output-set-default", String(sink.id), String(sink.name)]
+      Quickshell.execDetached(command)
       Quickshell.execDetached([
-        "omarchy-audio-output-set-default",
-        String(sink.id),
+        pluginScript("audio-preferences"),
+        "set-default",
+        "output",
         String(sink.name)
       ])
     }
@@ -326,11 +373,19 @@ Panel {
 
   function setDefaultAudioSource(source) {
     if (!source) return
+    var previousSourceName = defaultAudioSource && defaultAudioSource.name
+      ? String(defaultAudioSource.name) : ""
     Pipewire.preferredDefaultAudioSource = source
     if (source.id !== undefined && source.name) {
+      var command = audioControlInstalled
+        ? [audioControlScript("audio-input-set-default"), String(source.id),
+            String(source.name), previousSourceName]
+        : ["omarchy-audio-input-set-default", String(source.id), String(source.name)]
+      Quickshell.execDetached(command)
       Quickshell.execDetached([
-        "omarchy-audio-input-set-default",
-        String(source.id),
+        pluginScript("audio-preferences"),
+        "set-default",
+        "input",
         String(source.name)
       ])
     }
@@ -461,9 +516,10 @@ Panel {
     }
   }
 
-  function setHeaderCursor() {
+  function setHeaderCursor(index) {
     cursorActive = true
     focusSection = "header"
+    headerIndex = audioControlInstalled ? Math.max(0, Math.min(1, index)) : 1
     focusedAction = ""
   }
 
@@ -480,6 +536,11 @@ Panel {
 
   function moveCursorH(delta) {
     if (!cursorActive) { cursorActive = true; return }
+    if (focusSection === "header") {
+      headerIndex = audioControlInstalled
+        ? Math.max(0, Math.min(1, headerIndex + delta)) : 1
+      return
+    }
     var actions = focusedRowActions()
     if (actions.length === 0) return
     var index = focusedAction === "" ? -1 : actions.indexOf(focusedAction)
@@ -489,7 +550,8 @@ Panel {
 
   function activateCursor() {
     if (focusSection === "header") {
-      toggleBluetooth()
+      if (headerIndex === 0 && audioControlInstalled) openAdvancedAudio()
+      else toggleBluetooth()
       return
     }
     if (focusedAction === "profile") {
@@ -540,6 +602,7 @@ Panel {
       else if (discoveredDevices.length > 0) { focusSection = "discovered"; selectedIndex = 0 }
       else { focusSection = "header" }
       focusedAction = ""
+      headerIndex = 1
       cursorActive = false
       audioProfileRefreshTimer.restart()
     } else {
@@ -717,6 +780,42 @@ Panel {
     if (adapter !== null && adapter.discovering) adapter.discovering = false
   }
 
+  Component.onCompleted: refreshAudioControlInstalled()
+
+  Connections {
+    target: root.audioPluginRegistry
+    function onPluginsChanged() { root.refreshAudioControlInstalled() }
+  }
+
+  FileView {
+    path: root.audioPreferencesPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.loadAudioPreferences(text())
+    onLoadFailed: root.loadAudioPreferences("")
+    onFileChanged: reload()
+  }
+
+  Process {
+    id: audioControlCheckProc
+    command: ["test", "-f", root.audioControlManifestPath]
+    onExited: function(exitCode) {
+      if (root.audioPluginRegistry && root.audioPluginRegistry.installedPlugins
+          && typeof root.audioPluginRegistry.isEnabled === "function")
+        root.refreshAudioControlInstalled()
+      else
+        root.audioControlInstalled = exitCode === 0
+    }
+  }
+
+  Timer {
+    interval: 10000
+    running: root.opened
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refreshAudioControlInstalled()
+  }
+
   Process {
     id: audioProfilesProc
     command: [root.pluginScript("bluetooth-audio-profiles")]
@@ -825,6 +924,18 @@ Panel {
   // Asking for a direction rather than a toggle: the helper runs detached and the
   // switch only moves once BlueZ catches up, so a second click inside that window
   // would re-read the old state and undo the first.
+  function openAdvancedAudio() {
+    if (!audioControlInstalled) return
+    controller.hide()
+    var payload = '{"tab":"bluetooth"}'
+    if (bar && bar.shell && typeof bar.shell.summon === "function")
+      bar.shell.summon("ssupt.audio-control", payload)
+    else
+      Quickshell.execDetached([
+        "omarchy-shell", "shell", "summon", "ssupt.audio-control", payload
+      ])
+  }
+
   function toggleBluetooth() {
     if (!adapter) return
     Quickshell.execDetached(["omarchy-bluetooth-power", adapter.enabled ? "off" : "on"])
@@ -887,7 +998,7 @@ Panel {
         // ---------- Hero: Bluetooth icon · status ----------
         Item {
           width: parent.width
-          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, powerSwitch.implicitHeight)
+          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, heroActions.implicitHeight)
 
           // Status only — the switch owns toggling, mouse and keyboard alike.
           Text {
@@ -901,23 +1012,43 @@ Panel {
             opacity: root.adapter && root.adapter.enabled ? 1.0 : 0.5
           }
 
-          // Compact on/off switch on the trailing edge of the hero, and the
-          // header's only cursor target.
-          ToggleSwitch {
-            id: powerSwitch
-            visible: !!root.adapter
-            checked: !!root.adapter && root.adapter.enabled
-            hasCursor: root.headerHasCursor
-            foreground: root.bar.foreground
+          Row {
+            id: heroActions
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            onHovered: function(on) { if (on) root.setHeaderCursor() }
-            onToggled: root.toggleBluetooth()
+            spacing: Style.space(8)
 
-            PanelToolTip {
-              visible: powerSwitch.containsMouse
-              text: root.toggleHint
+            Button {
+              id: settingsAction
+              visible: root.audioControlInstalled
+              iconText: "󰒓"
+              tooltipText: "Advanced audio · Bluetooth"
+              foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
+              iconSize: Style.font.subtitle * 1.5
+              horizontalPadding: Style.space(5)
+              verticalPadding: Style.space(2)
+              hasCursor: root.settingsHeaderHasCursor
+              anchors.verticalCenter: parent.verticalCenter
+              onHovered: function(on) { if (on) root.setHeaderCursor(0) }
+              onClicked: root.openAdvancedAudio()
+            }
+
+            ToggleSwitch {
+              id: powerSwitch
+              visible: !!root.adapter
+              checked: !!root.adapter && root.adapter.enabled
+              hasCursor: root.powerHeaderHasCursor
+              foreground: root.bar.foreground
+              anchors.verticalCenter: parent.verticalCenter
+              onHovered: function(on) { if (on) root.setHeaderCursor(1) }
+              onToggled: root.toggleBluetooth()
+
+              PanelToolTip {
+                visible: powerSwitch.containsMouse
+                text: root.toggleHint
+                fontFamily: root.bar.fontFamily
+              }
             }
           }
 
@@ -926,7 +1057,7 @@ Panel {
             anchors.left: heroIcon.right
             anchors.leftMargin: Style.space(14)
             anchors.right: parent.right
-            anchors.rightMargin: powerSwitch.visible ? powerSwitch.width + Style.space(12) : 0
+            anchors.rightMargin: heroActions.width + Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
 
@@ -1110,13 +1241,15 @@ Panel {
         ? String(root.pendingAudioProfile.profile || "") : ""
     }
     readonly property string currentProfileName: pendingProfileName !== ""
-      ? pendingProfileName : String(profileState ? profileState.activeProfile || "" : "")
+      ? pendingProfileName
+      : Model.preferredAudioProfile(root.audioPreferences, dev ? dev.address : "",
+          profileOptions, profileState ? profileState.activeProfile : "")
     readonly property string activeCodec: Model.audioProfileCodec(profileState, currentProfileName)
     readonly property var deviceAudioSink: root.bluetoothAudioSink(dev)
     readonly property var deviceAudioSource: root.bluetoothAudioSource(dev)
     readonly property bool useAudioAvailable: isConnected && !!deviceAudioSink
     readonly property bool usingForAudio: useAudioAvailable
-      && Model.sameAudioNode(deviceAudioSink, root.defaultAudioSink)
+      && String(deviceAudioSink.name || "") === root.preferredAudioSinkName
 
     readonly property bool rowSelected: root.cursorActive && root.focusSection === sectionName && root.selectedIndex === rowIndex
     readonly property bool forgetAvailable: (sectionName === "known" || sectionName === "connected") && !isDiscovered

@@ -16,7 +16,13 @@ are remembered independently for each Bluetooth device by WirePlumber.
 This is the Bluetooth-panel companion to
 [Advanced Audio Control](https://github.com/ssupt/omarchy-audio-control), which
 provides per-application output routing and the full Devices/Bluetooth settings
-window.
+window. When that companion is enabled, a settings button in this panel opens
+its Bluetooth tab directly.
+
+Both plugins read and write codec and preferred-device choices through
+`~/.config/omarchy/audio-preferences.json`. The file is optional and each plugin
+continues to work on its own; live PipeWire state is used whenever a saved
+device or profile is unavailable.
 
 More plugins by `ssupt`: [omarchy-plugins](https://github.com/ssupt/omarchy-plugins).
 
@@ -29,7 +35,7 @@ omarchy plugin add https://github.com/ssupt/omarchy-bluetooth-audio.git --enable
 Enabling the plugin replaces the built-in `omarchy.bluetooth` widget in its
 current bar position. Disabling or removing it restores the built-in widget.
 
-Requires `pactl`, `jq`, and `timeout`, all present in a standard Omarchy
+Requires `pactl`, `jq`, `timeout`, and `flock`, all present in a standard Omarchy
 installation.
 
 ## Removing

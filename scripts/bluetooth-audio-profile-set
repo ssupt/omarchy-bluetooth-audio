@@ -27,3 +27,4 @@ card=$("$script_dir/bluetooth-audio-profiles" | jq -r --arg address "$address" -
 # WirePlumber's device.restore-profile policy stores this profile against the
 # individual BlueZ card and restores it the next time that device appears.
 "$script_dir/audio-profile-set" "$card" "$profile"
+"$script_dir/audio-preferences" set-profile "$address" "$profile"
