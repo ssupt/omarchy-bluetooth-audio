@@ -17,9 +17,17 @@ Panel {
   manageIpc: false
 
   // Address -> "connecting" | "disconnecting" | "forgetting".
-  // The actual Bluetooth sequencing lives in bin/omarchy-bluetooth-device;
-  // this map only keeps the panel responsive while BlueZ catches up.
+  // The plugin-local helper reports command failures; this map keeps the
+  // panel responsive while successful operations propagate through BlueZ.
   property var pendingActions: ({})
+  // Normalized address -> { action, message }. Failures stay attached to the
+  // device row until the user retries or live BlueZ state proves the action
+  // completed after all.
+  property var deviceActionFailures: ({})
+  property var activeDeviceAction: null
+  property var lastExitedDeviceAction: null
+  property string deviceActionStderr: ""
+  property bool deviceActionCancelRequested: false
 
   readonly property var adapter: Bluetooth.defaultAdapter
 
@@ -126,7 +134,7 @@ Panel {
   property int selectedIndex: 0
   // Empty selects the device row. Connected audio rows add explicit default-
   // audio and preferred-mode actions alongside the existing forget action.
-  property string focusedAction: ""  // "" | "audio" | "forget" | "profile"
+  property string focusedAction: ""  // "" | "audio" | "forget" | "profile" | "retry" | "cancel"
   property bool cursorActive: false
   property int headerIndex: 1
 
@@ -438,14 +446,49 @@ Panel {
     if (action) pendingTimeout.restart()
   }
 
+  function deviceActionFailure(address) {
+    return Model.deviceActionFailure(deviceActionFailures, address)
+  }
+
+  function setDeviceActionFailure(address, action, message) {
+    deviceActionFailures = Model.withDeviceActionFailure(
+      deviceActionFailures, address, action, message)
+  }
+
+  function recoveryAction(address) {
+    if (activeDeviceAction
+        && Model.normalizedAddress(activeDeviceAction.address) === Model.normalizedAddress(address)
+        && activeDeviceAction.action === "pair" && !deviceActionCancelRequested)
+      return "cancel"
+    return deviceActionFailure(address) ? "retry" : ""
+  }
+
   function deviceCommand(action, address) {
-    return ["omarchy-bluetooth-device", action, address]
+    return [pluginScript("bluetooth-device-action"), action, address]
+  }
+
+  function defaultDeviceActionError(action) {
+    if (action === "pair") return "Could not pair with the device"
+    if (action === "connect") return "Could not connect to the device"
+    if (action === "disconnect") return "Could not disconnect the device"
+    if (action === "forget") return "Could not forget the device"
+    return "The Bluetooth operation failed"
   }
 
   function runDeviceAction(device, action, pending) {
-    if (!device || !device.address) return
+    if (!device || !device.address || deviceActionProc.running) return
+    setDeviceActionFailure(device.address, "", "")
+    lastExitedDeviceAction = null
+    deviceActionStderr = ""
+    deviceActionCancelRequested = false
+    activeDeviceAction = {
+      address: String(device.address),
+      action: String(action),
+      pending: String(pending)
+    }
     setPendingAction(device.address, pending)
-    Quickshell.execDetached(deviceCommand(action, device.address))
+    deviceActionProc.command = deviceCommand(action, device.address)
+    deviceActionProc.running = true
   }
 
   function connectDevice(device) {
@@ -457,14 +500,33 @@ Panel {
   function disconnectDevice(device) {
     if (!device || !device.address) return
     if (!device.connected) return
-    setPendingAction(device.address, "disconnecting")
-    if (device.disconnect) device.disconnect()
-    Quickshell.execDetached(deviceCommand("disconnect", device.address))
+    runDeviceAction(device, "disconnect", "disconnecting")
   }
 
   function forgetDevice(device) {
     if (!device || !device.address) return
     runDeviceAction(device, "forget", "forgetting")
+  }
+
+  function retryDeviceAction(device) {
+    if (!device || !device.address || deviceActionProc.running) return
+    var failure = deviceActionFailure(device.address)
+    if (!failure) return
+    if (failure.action === "pair" || failure.action === "connect") connectDevice(device)
+    else if (failure.action === "disconnect") disconnectDevice(device)
+    else if (failure.action === "forget") forgetDevice(device)
+  }
+
+  function cancelPairing(device) {
+    if (!device || !device.address || !activeDeviceAction
+        || activeDeviceAction.action !== "pair"
+        || Model.normalizedAddress(activeDeviceAction.address) !== Model.normalizedAddress(device.address)) return
+
+    deviceActionCancelRequested = true
+    setPendingAction(device.address, "")
+    setDeviceActionFailure(device.address, "", "")
+    if (typeof device.cancelPair === "function") device.cancelPair()
+    if (deviceActionProc.running) deviceActionProc.signal(15)
   }
 
   function syncPendingActions() {
@@ -493,6 +555,24 @@ Panel {
     }
 
     if (changed) pendingActions = next
+
+    var nextFailures = cloneMap(deviceActionFailures)
+    var failuresChanged = false
+    for (var failureAddress in nextFailures) {
+      var failure = nextFailures[failureAddress]
+      var failedDevice = null
+      for (var j = 0; j < devices.length; j++) {
+        if (devices[j] && Model.normalizedAddress(devices[j].address) === failureAddress) {
+          failedDevice = devices[j]
+          break
+        }
+      }
+      if (failure && Model.deviceActionReachedState(failure.action, failedDevice)) {
+        delete nextFailures[failureAddress]
+        failuresChanged = true
+      }
+    }
+    if (failuresChanged) deviceActionFailures = nextFailures
   }
 
   // j/k navigates the hero toggle ("header") and the device sections
@@ -540,9 +620,11 @@ Panel {
 
   function focusedRowActions() {
     var actions = []
-    if (focusSection !== "known" && focusSection !== "connected") return actions
     var dev = deviceAt(focusSection, selectedIndex)
     if (!dev || !dev.address) return actions
+    var recovery = recoveryAction(dev.address)
+    if (recovery !== "") return [recovery]
+    if (focusSection !== "known" && focusSection !== "connected") return actions
     if (focusSection === "connected" && audioUseActionAvailable(dev)) actions.push("audio")
     actions.push("forget")
     if (focusSection === "connected" && audioProfileActionAvailable(dev)) actions.push("profile")
@@ -567,6 +649,14 @@ Panel {
     if (focusSection === "header") {
       if (headerIndex === 0 && audioControlInstalled) openAdvancedAudio()
       else toggleBluetooth()
+      return
+    }
+    if (focusedAction === "retry") {
+      retryDeviceAction(deviceAt(focusSection, selectedIndex))
+      return
+    }
+    if (focusedAction === "cancel") {
+      cancelPairing(deviceAt(focusSection, selectedIndex))
       return
     }
     if (focusedAction === "profile") {
@@ -597,8 +687,8 @@ Panel {
     }
   }
 
-  // 'x' forgets remembered devices. For connected devices this first
-  // disconnects, then removes the BlueZ pairing record via omarchy-bluetooth-device.
+  // 'x' forgets remembered devices. For connected devices the result-aware
+  // helper first disconnects, then removes the BlueZ pairing record.
   function deleteSelected() {
     if (focusSection !== "known" && focusSection !== "connected") return
     var dev = deviceAt(focusSection, selectedIndex)
@@ -819,6 +909,47 @@ Panel {
   }
 
   Process {
+    id: deviceActionProc
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var message = String(text || "").trim()
+        root.deviceActionStderr = message
+        var operation = root.lastExitedDeviceAction
+        var currentFailure = operation
+          ? root.deviceActionFailure(operation.address) : null
+        if (message !== "" && operation && currentFailure
+            && currentFailure.action === operation.action)
+          root.setDeviceActionFailure(operation.address, operation.action, message)
+      }
+    }
+    onExited: function(exitCode) {
+      var operation = root.activeDeviceAction
+      if (!operation) return
+
+      if (root.deviceActionCancelRequested) {
+        root.setPendingAction(operation.address, "")
+        root.setDeviceActionFailure(operation.address, "", "")
+        root.lastExitedDeviceAction = null
+      } else if (exitCode !== 0) {
+        root.setPendingAction(operation.address, "")
+        root.lastExitedDeviceAction = operation
+        root.setDeviceActionFailure(
+          operation.address,
+          operation.action,
+          root.deviceActionStderr || root.defaultDeviceActionError(operation.action))
+      } else {
+        root.setDeviceActionFailure(operation.address, "", "")
+        root.lastExitedDeviceAction = null
+      }
+
+      root.activeDeviceAction = null
+      root.deviceActionCancelRequested = false
+      root.syncPendingActions()
+    }
+  }
+
+  Process {
     id: audioControlCheckProc
     command: ["test", "-f", root.audioControlManifestPath]
     onExited: function(exitCode) {
@@ -903,7 +1034,10 @@ Panel {
     id: pendingTimeout
     interval: 20000
     repeat: false
-    onTriggered: root.pendingActions = ({})
+    onTriggered: {
+      if (deviceActionProc.running) restart()
+      else root.pendingActions = ({})
+    }
   }
 
   Timer {
@@ -1248,6 +1382,14 @@ Panel {
     readonly property bool isConnected: dev && dev.connected
     readonly property int devState: dev && dev.state !== undefined ? dev.state : -1
     readonly property string action: root.pendingAction(dev ? dev.address : "")
+    readonly property var actionFailure: root.deviceActionFailure(dev ? dev.address : "")
+    readonly property string actionFailureMessage: actionFailure
+      ? String(actionFailure.message || "") : ""
+    readonly property string recoveryAction: root.recoveryAction(dev ? dev.address : "")
+    readonly property bool recoveryVisible: recoveryAction !== ""
+    readonly property bool cancellingPair: root.deviceActionCancelRequested
+      && root.activeDeviceAction && dev
+      && Model.normalizedAddress(root.activeDeviceAction.address) === Model.normalizedAddress(dev.address)
     readonly property string actionTooltip: {
       if (!dev) return ""
       if (isConnected) return "Disconnect"
@@ -1279,8 +1421,8 @@ Panel {
 
     readonly property bool rowSelected: root.cursorActive && root.focusSection === sectionName && root.selectedIndex === rowIndex
     readonly property bool forgetAvailable: (sectionName === "known" || sectionName === "connected") && !isDiscovered
-    readonly property bool showForgetButton: forgetAvailable && (rowMouse.containsMouse || rowSelected)
-    readonly property bool showUseAudioButton: useAudioAvailable && (rowMouse.containsMouse || rowSelected)
+    readonly property bool showForgetButton: !recoveryVisible && forgetAvailable && (rowMouse.containsMouse || rowSelected)
+    readonly property bool showUseAudioButton: !recoveryVisible && useAudioAvailable && (rowMouse.containsMouse || rowSelected)
 
     hasCursor: rowSelected && root.focusedAction === ""
     current: isConnected
@@ -1290,8 +1432,10 @@ Panel {
 
     readonly property string statusText: {
       if (!dev) return ""
+      if (cancellingPair) return "Cancelling pairing…"
       if (action === "forgetting") return "Forgetting…"
       if (action === "disconnecting" || devState === 2) return "Disconnecting…"
+      if (actionFailureMessage !== "") return actionFailureMessage
       if (isConnected) {
         var details = []
         if (usingForAudio) details.push("Default audio")
@@ -1306,6 +1450,7 @@ Panel {
     }
 
     readonly property color statusColor: {
+      if (actionFailureMessage !== "") return root.bar.urgent
       if (isConnected) return root.bar.foreground
       if (action !== "" || devState === 3 || dev.pairing === true) return root.bar.foreground
       return Qt.darker(root.bar.foreground, 1.5)
@@ -1354,7 +1499,8 @@ Panel {
       anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(10)
       implicitHeight: Math.max(deviceIcon.implicitHeight, info.implicitHeight,
-        profileDropdown.implicitHeight, forgetBtn.implicitHeight, useAudioBtn.implicitHeight)
+        profileDropdown.implicitHeight, forgetBtn.implicitHeight,
+        useAudioBtn.implicitHeight, recoveryBtn.implicitHeight)
 
       Text {
         id: deviceIcon
@@ -1373,8 +1519,10 @@ Panel {
         anchors.leftMargin: Style.space(10)
         anchors.right: useAudioBtn.visible ? useAudioBtn.left
           : (forgetBtn.visible ? forgetBtn.left
-          : (profileDropdown.visible ? profileDropdown.left : parent.right))
-        anchors.rightMargin: profileDropdown.visible || forgetBtn.visible || useAudioBtn.visible ? Style.space(8) : 0
+          : (profileDropdown.visible ? profileDropdown.left
+          : (recoveryBtn.visible ? recoveryBtn.left : parent.right)))
+        anchors.rightMargin: profileDropdown.visible || forgetBtn.visible
+          || useAudioBtn.visible || recoveryBtn.visible ? Style.space(8) : 0
         anchors.verticalCenter: parent.verticalCenter
 
         Text {
@@ -1399,9 +1547,10 @@ Panel {
       AudioDropdown {
         id: profileDropdown
         width: Style.spacing.controlHeight
-        anchors.right: parent.right
+        anchors.right: recoveryBtn.visible ? recoveryBtn.left : parent.right
+        anchors.rightMargin: recoveryBtn.visible ? Style.space(6) : 0
         anchors.verticalCenter: parent.verticalCenter
-        visible: row.profileMenuAvailable
+        visible: row.profileMenuAvailable && !row.recoveryVisible
         rowHeight: Style.spacing.controlHeight
         popupRowHeight: Style.space(36)
         popupDirection: {
@@ -1446,8 +1595,9 @@ Panel {
 
       PanelActionButton {
         id: forgetBtn
-        anchors.right: profileDropdown.visible ? profileDropdown.left : parent.right
-        anchors.rightMargin: profileDropdown.visible ? Style.space(6) : 0
+        anchors.right: profileDropdown.visible ? profileDropdown.left
+          : (recoveryBtn.visible ? recoveryBtn.left : parent.right)
+        anchors.rightMargin: profileDropdown.visible || recoveryBtn.visible ? Style.space(6) : 0
         anchors.verticalCenter: parent.verticalCenter
         visible: row.showForgetButton
         iconText: "󰅙"
@@ -1476,8 +1626,10 @@ Panel {
       PanelActionButton {
         id: useAudioBtn
         anchors.right: forgetBtn.visible ? forgetBtn.left
-          : (profileDropdown.visible ? profileDropdown.left : parent.right)
-        anchors.rightMargin: forgetBtn.visible || profileDropdown.visible ? Style.space(6) : 0
+          : (profileDropdown.visible ? profileDropdown.left
+          : (recoveryBtn.visible ? recoveryBtn.left : parent.right))
+        anchors.rightMargin: forgetBtn.visible || profileDropdown.visible
+          || recoveryBtn.visible ? Style.space(6) : 0
         anchors.verticalCenter: parent.verticalCenter
         visible: row.showUseAudioButton
         iconText: row.usingForAudio ? "󰄬" : "󰓃"
@@ -1505,12 +1657,49 @@ Panel {
           root.useDeviceForAudio(dev)
         }
       }
+
+      PanelActionButton {
+        id: recoveryBtn
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        visible: row.recoveryVisible
+        enabled: row.recoveryAction === "cancel" || !deviceActionProc.running
+        iconText: row.recoveryAction === "cancel" ? "󰅙" : "󰑐"
+        tooltipText: row.recoveryAction === "cancel" ? "Cancel pairing"
+          : (row.actionFailureMessage !== ""
+            ? "Retry · " + row.actionFailureMessage : "Retry")
+        foreground: root.bar.foreground
+        hoverColor: row.recoveryAction === "retry" ? root.bar.urgent : root.bar.foreground
+        fontFamily: root.bar.fontFamily
+        hasCursor: row.rowSelected && root.focusedAction === row.recoveryAction
+        onHovered: function(isHovered) {
+          if (!isHovered) {
+            if (rowMouse.containsMouse && root.focusedAction === row.recoveryAction)
+              root.focusedAction = ""
+            return
+          }
+          root.cursorActive = true
+          root.focusSection = row.sectionName
+          root.selectedIndex = row.rowIndex
+          root.focusedAction = row.recoveryAction
+        }
+        onClicked: {
+          var dev = root.deviceFor(row)
+          if (!dev) return
+          if (row.recoveryAction === "cancel") root.cancelPairing(dev)
+          else root.retryDeviceAction(dev)
+        }
+      }
     }
 
     function toggleProfileMenu() { profileDropdown.toggle() }
     function closeProfileMenu() { profileDropdown.close() }
 
     onProfileMenuAvailableChanged: if (!profileMenuAvailable) closeProfileMenu()
+    onRecoveryVisibleChanged: if (recoveryVisible) closeProfileMenu()
+    onRecoveryActionChanged: if (rowSelected
+      && (root.focusedAction === "retry" || root.focusedAction === "cancel")
+      && root.focusedAction !== recoveryAction) root.focusedAction = ""
     Component.onDestruction: if (profileDropdown.popupOpen) root.audioProfileMenuOpen = false
   }
 }

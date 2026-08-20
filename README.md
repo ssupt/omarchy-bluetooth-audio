@@ -13,6 +13,10 @@ on a connected device to make it the default output; a microphone exposed by
 the selected mode becomes the default input at the same time. Audio-mode choices
 are remembered independently for each Bluetooth device by WirePlumber.
 
+Pairing and connection operations report the reason when BlueZ rejects them.
+Failed device rows keep a retry action, while an active pairing attempt can be
+cancelled directly from the panel.
+
 This is the Bluetooth-panel companion to
 [Advanced Audio Control](https://github.com/ssupt/omarchy-audio-control), which
 provides per-application output routing and the full Devices/Bluetooth settings
@@ -35,8 +39,8 @@ omarchy plugin add https://github.com/ssupt/omarchy-bluetooth-audio.git --enable
 Enabling the plugin replaces the built-in `omarchy.bluetooth` widget in its
 current bar position. Disabling or removing it restores the built-in widget.
 
-Requires `pactl`, `jq`, `timeout`, and `flock`, all present in a standard Omarchy
-installation.
+Requires `bluetoothctl`, `pactl`, `jq`, `timeout`, and `flock`, all present in a
+standard Omarchy installation.
 
 ## Removing
 
@@ -52,6 +56,8 @@ bar position.
 - Click a device row to connect or disconnect it.
 - Use the audio action on a connected device to make it the default audio device.
 - Click the arrow on a connected audio device to choose its audio mode.
+- Failed pairing or connection actions expose a retry button on the device row.
+- Cancel an active pairing attempt with the row's cancel button.
 - Use `j`/`k` or the arrow keys to navigate devices.
 - Use `h`/`l` or Left/Right to reach the audio, forget, and preferred-mode actions.
 - Press Enter to activate the selected row or action, and Escape to close.

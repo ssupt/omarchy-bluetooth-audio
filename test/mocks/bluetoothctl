@@ -1,0 +1,41 @@
+#!/bin/bash
+
+[[ -n ${BLUETOOTH_ACTION_LOG:-} ]] || {
+  echo "Unexpected bluetoothctl call: $*" >&2
+  exit 1
+}
+
+printf '%s\n' "$*" >>"$BLUETOOTH_ACTION_LOG"
+
+command=${1:-}
+if [[ $command == show ]]; then
+  if [[ ${BLUETOOTH_ACTION_POWERED:-1} == 1 ]]; then
+    printf 'Controller 00:11:22:33:44:55\n\tPowered: yes\n'
+  else
+    printf 'Controller 00:11:22:33:44:55\n\tPowered: no\n'
+  fi
+  exit 0
+fi
+
+if [[ $command == info ]]; then
+  printf 'Device %s\n\tBlocked: %s\n' "${2:-}" "${BLUETOOTH_ACTION_BLOCKED:-no}"
+  exit 0
+fi
+
+if [[ $command == "${BLUETOOTH_ACTION_DELAY_COMMAND:-}" ]]; then
+  sleep "${BLUETOOTH_ACTION_DELAY_SECONDS:-1}"
+fi
+
+if [[ $command == "${BLUETOOTH_ACTION_FAIL_COMMAND:-}" ]]; then
+  echo "${BLUETOOTH_ACTION_FAIL_MESSAGE:-Failed to run command}" >&2
+  exit "${BLUETOOTH_ACTION_FAIL_STATUS:-1}"
+fi
+
+case "$command" in
+  pair) echo "Pairing successful" ;;
+  connect) echo "Connection successful" ;;
+  disconnect) echo "Successful disconnected" ;;
+  trust) echo "Changing trust succeeded" ;;
+  remove) echo "Device has been removed" ;;
+  *) echo "Unexpected bluetoothctl action: $*" >&2; exit 1 ;;
+esac

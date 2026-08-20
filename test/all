@@ -10,7 +10,7 @@ fail() {
   exit 1
 }
 
-for script in "$ROOT"/scripts/*; do
+for script in "$ROOT"/scripts/* "$TEST_DIR"/mocks/*; do
   bash -n "$script" || fail "bash syntax: ${script##*/}"
 done
 echo "PASS: helper syntax"
@@ -102,6 +102,27 @@ assert.equal(model.sameAudioNode(sink, source), false)
 assert.equal(model.preferredAudioNodeName(audioPreferences, 'output', source, [sink]), sink.name)
 assert.equal(model.preferredAudioNodeName(audioPreferences, 'output', source, [source]), source.name)
 assert.equal(model.currentAudioNodeName(audioPreferences, 'output', source, [sink, source]), source.name)
+
+let failures = model.withDeviceActionFailure(
+  {}, '00:11:22:33:44:55', 'connect', 'Connection timed out')
+assert.deepEqual(model.deviceActionFailure(failures, '00-11-22-33-44-55'), {
+  action: 'connect', message: 'Connection timed out'
+})
+assert.equal(model.deviceActionReachedState('connect', { connected: true }), true)
+assert.equal(model.deviceActionReachedState('disconnect', { connected: false }), true)
+assert.equal(model.deviceActionReachedState('forget', {
+  paired: false, bonded: false, trusted: false
+}), true)
+assert.equal(model.deviceActionReachedState('pair', { connected: false }), false)
+failures = model.withDeviceActionFailure(
+  failures, '00:11:22:33:44:55', '', '')
+assert.equal(model.deviceActionFailure(failures, '00:11:22:33:44:55'), null)
+
+assert.match(panelSource, /pluginScript\("bluetooth-device-action"\)/)
+assert.match(panelSource, /device\.cancelPair\(\)/)
+assert.match(panelSource, /deviceActionProc\.signal\(15\)/)
+assert.match(panelSource, /root\.retryDeviceAction\(dev\)/)
+assert.doesNotMatch(panelSource, /execDetached\(deviceCommand/)
 assert.doesNotMatch(panelSource, /\.isSource\b/)
 console.log('PASS: Bluetooth profile model')
 JS
@@ -124,14 +145,123 @@ echo "PASS: Bluetooth codec discovery"
 
 profile_log=$(mktemp)
 profile_state=$(mktemp)
+bluetooth_action_log=$(mktemp)
+bluetooth_action_error=$(mktemp)
 shared_preferences=$(mktemp)
 failed_preferences=$(mktemp)
 no_source_preferences=$(mktemp)
 shared_preferences_lock="${shared_preferences}.lock"
 failed_preferences_lock="${failed_preferences}.lock"
 no_source_preferences_lock="${no_source_preferences}.lock"
-trap 'rm -f "$profile_log" "$profile_state" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock"' EXIT
+trap 'rm -f "$profile_log" "$profile_state" "$bluetooth_action_log" "$bluetooth_action_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock"' EXIT
 printf 'old\n' >"$profile_state"
+
+: >"$bluetooth_action_log"
+BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" pair 00:11:22:33:44:55
+expected_bluetooth_action_log=$(cat <<'EOF'
+show
+info 00:11:22:33:44:55
+pair 00:11:22:33:44:55
+trust 00:11:22:33:44:55
+connect 00:11:22:33:44:55
+EOF
+)
+[[ $(<"$bluetooth_action_log") == "$expected_bluetooth_action_log" ]] \
+  || fail "result-aware Bluetooth pairing sequence"
+
+: >"$bluetooth_action_log"
+if BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_FAIL_COMMAND=pair \
+  BLUETOOTH_ACTION_FAIL_MESSAGE='Failed to pair: org.bluez.Error.AuthenticationRejected' \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" pair 00:11:22:33:44:55 \
+    > /dev/null 2>"$bluetooth_action_error"; then
+  fail "rejected Bluetooth pairing reported success"
+fi
+[[ $(<"$bluetooth_action_error") == \
+  "Pairing was rejected by the device. Confirm the code and try again." ]] \
+  || fail "Bluetooth authentication error mapping"
+if rg -q '^(trust|connect) ' "$bluetooth_action_log"; then
+  fail "Bluetooth pairing continued after authentication rejection"
+fi
+
+: >"$bluetooth_action_log"
+if BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_BLOCKED=yes \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" connect 00:11:22:33:44:55 \
+    > /dev/null 2>"$bluetooth_action_error"; then
+  fail "blocked Bluetooth device connection reported success"
+fi
+[[ $(<"$bluetooth_action_error") == \
+  "This device is blocked. Unblock it before trying again." ]] \
+  || fail "blocked Bluetooth device error mapping"
+if rg -q '^connect ' "$bluetooth_action_log"; then
+  fail "blocked Bluetooth device received a connection attempt"
+fi
+
+: >"$bluetooth_action_log"
+if BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_POWERED=0 \
+  BLUETOOTH_ACTION_POWER_FAIL=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" connect 00:11:22:33:44:55 \
+    > /dev/null 2>"$bluetooth_action_error"; then
+  fail "unavailable Bluetooth adapter connection reported success"
+fi
+[[ $(<"$bluetooth_action_error") == \
+  "The Bluetooth adapter could not be powered on." ]] \
+  || fail "Bluetooth adapter error mapping"
+
+: >"$bluetooth_action_log"
+if BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_FAIL_COMMAND=connect \
+  BLUETOOTH_ACTION_FAIL_MESSAGE='Failed to connect: org.bluez.Error.Failed br-connection-page-timeout' \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" connect 00:11:22:33:44:55 \
+    > /dev/null 2>"$bluetooth_action_error"; then
+  fail "unresponsive Bluetooth device connection reported success"
+fi
+[[ $(<"$bluetooth_action_error") == \
+  "The device did not respond. Make sure it is nearby, awake, and not connected elsewhere." ]] \
+  || fail "Bluetooth connection timeout error mapping"
+
+: >"$bluetooth_action_log"
+BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_FAIL_COMMAND=disconnect \
+  BLUETOOTH_ACTION_FAIL_MESSAGE='Failed to disconnect: org.bluez.Error.Failed' \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" forget 00:11:22:33:44:55
+rg -q '^remove 00:11:22:33:44:55$' "$bluetooth_action_log" \
+  || fail "failed disconnect prevented forgetting the Bluetooth device"
+
+: >"$bluetooth_action_log"
+BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_DELAY_COMMAND=pair \
+  BLUETOOTH_ACTION_DELAY_SECONDS=2 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" pair 00:11:22:33:44:55 \
+    > /dev/null 2>"$bluetooth_action_error" &
+bluetooth_action_pid=$!
+pair_started=false
+for (( attempt = 0; attempt < 40; attempt++ )); do
+  if rg -q '^pair ' "$bluetooth_action_log"; then
+    pair_started=true
+    break
+  fi
+  sleep 0.025
+done
+[[ $pair_started == true ]] || fail "cancellable Bluetooth pairing did not start"
+kill -TERM "$bluetooth_action_pid"
+if wait "$bluetooth_action_pid"; then
+  fail "cancelled Bluetooth pairing reported success"
+fi
+if rg -q '^(trust|connect) ' "$bluetooth_action_log"; then
+  fail "cancelled Bluetooth pairing continued to trust or connect"
+fi
+echo "PASS: result-aware Bluetooth device actions"
 
 AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
@@ -261,7 +391,7 @@ echo "PASS: unknown input state is preserved"
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.3.0"
+  and .version == "0.4.0"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

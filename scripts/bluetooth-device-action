@@ -1,0 +1,207 @@
+#!/bin/bash
+
+# omarchy:summary=Control a Bluetooth device and report actionable failures
+# omarchy:group=bluetooth
+# omarchy:args=<pair|connect|disconnect|forget> <address>
+
+set -uo pipefail
+
+action=${1:-}
+address=${2:-}
+
+if (( $# != 2 )) \
+  || [[ $action != pair && $action != connect && $action != disconnect && $action != forget ]] \
+  || [[ ! $address =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+  echo "Usage: bluetooth-device-action <pair|connect|disconnect|forget> <address>" >&2
+  exit 1
+fi
+
+active_control_pid=
+active_output_file=
+
+cleanup() {
+  [[ -z $active_output_file ]] || rm -f -- "$active_output_file"
+}
+
+cancel_active_control() {
+  trap - INT TERM
+  if [[ -n $active_control_pid ]]; then
+    kill -TERM "$active_control_pid" >/dev/null 2>&1 || true
+    wait "$active_control_pid" >/dev/null 2>&1 || true
+  fi
+  exit 130
+}
+
+trap cleanup EXIT
+trap cancel_active_control INT TERM
+
+strip_terminal_codes() {
+  sed $'s/\033\[[0-9;?]*[ -\/]*[@-~]//g'
+}
+
+failure_message() {
+  local phase=$1
+  local status=$2
+  local output=$3
+  local lower=${output,,}
+  local detail
+
+  if (( status == 124 )); then
+    case "$phase" in
+      pair) echo "Pairing timed out. Put the device in pairing mode and try again." ;;
+      connect) echo "Connection timed out. Make sure the device is nearby and awake." ;;
+      disconnect) echo "Disconnecting the device timed out." ;;
+      remove) echo "Forgetting the device timed out." ;;
+      *) echo "The Bluetooth operation timed out." ;;
+    esac
+    return
+  fi
+
+  case "$lower" in
+    *authenticationrejected*|*authentication\ rejected*)
+      echo "Pairing was rejected by the device. Confirm the code and try again."
+      ;;
+    *authenticationfailed*|*authentication\ failed*)
+      echo "Pairing failed authentication. Remove the device's old pairing and try again."
+      ;;
+    *authenticationtimeout*|*authentication\ timeout*)
+      echo "Pairing timed out. Put the device in pairing mode and try again."
+      ;;
+    *authenticationcanceled*|*authenticationcancelled*|*authentication\ canceled*|*authentication\ cancelled*)
+      echo "Pairing was cancelled."
+      ;;
+    *blocked*)
+      echo "This device is blocked. Unblock it before trying again."
+      ;;
+    *notready*|*not\ ready*)
+      echo "The Bluetooth adapter is not ready. Turn Bluetooth on and try again."
+      ;;
+    *inprogress*|*in\ progress*)
+      echo "Another Bluetooth operation is already in progress."
+      ;;
+    *profile-unavailable*|*profile\ unavailable*)
+      echo "The device's Bluetooth service is unavailable. Reconnect or repair the device."
+      ;;
+    *connectionattemptfailed*|*page-timeout*|*connection\ attempt\ failed*)
+      echo "The device did not respond. Make sure it is nearby, awake, and not connected elsewhere."
+      ;;
+    *notavailable*|*not\ available*)
+      echo "The device is unavailable. Make sure it is nearby and in pairing mode."
+      ;;
+    *)
+      detail=$(printf '%s\n' "$output" | awk 'NF { line=$0 } END { print line }')
+      case "$phase" in
+        pair) printf 'Could not pair with the device%s\n' "${detail:+: $detail}" ;;
+        connect) printf 'Could not connect to the device%s\n' "${detail:+: $detail}" ;;
+        disconnect) printf 'Could not disconnect the device%s\n' "${detail:+: $detail}" ;;
+        remove) printf 'Could not forget the device%s\n' "${detail:+: $detail}" ;;
+        *) printf 'The Bluetooth operation failed%s\n' "${detail:+: $detail}" ;;
+      esac
+      ;;
+  esac
+}
+
+run_control() {
+  local phase=$1
+  local seconds=$2
+  shift 2
+
+  local output status lower failed=false
+  active_output_file=$(mktemp) || {
+    echo "Could not start the Bluetooth operation." >&2
+    return 1
+  }
+  timeout "${seconds}s" bluetoothctl "$@" >"$active_output_file" 2>&1 &
+  active_control_pid=$!
+  status=0
+  wait "$active_control_pid" || status=$?
+  active_control_pid=
+
+  output=$(strip_terminal_codes <"$active_output_file")
+  rm -f -- "$active_output_file"
+  active_output_file=
+  lower=${output,,}
+
+  # These outcomes already satisfy the requested idempotent operation.
+  if [[ $phase == connect && ( $lower == *alreadyconnected* || $lower == *already\ connected* ) ]]; then
+    return 0
+  fi
+  if [[ $phase == pair && ( $lower == *alreadyexists* || $lower == *already\ paired* ) ]]; then
+    return 0
+  fi
+  if [[ $phase == disconnect && ( $lower == *notconnected* || $lower == *not\ connected* ) ]]; then
+    return 0
+  fi
+  if [[ $phase == remove && ( $lower == *doesnotexist* || $lower == *not\ available* ) ]]; then
+    return 0
+  fi
+
+  (( status == 0 )) || failed=true
+  if [[ $lower == *org.bluez.error* || $lower == *"failed to "*
+      || $lower == *"not available"* || $lower == error:* ]]; then
+    failed=true
+  fi
+
+  if [[ $failed == true ]]; then
+    failure_message "$phase" "$status" "$output" >&2
+    return 1
+  fi
+}
+
+ensure_powered() {
+  local state
+  state=$(timeout 2s bluetoothctl show 2>/dev/null | strip_terminal_codes) || state=
+  [[ $state == *"Powered: yes"* ]] && return 0
+
+  if ! omarchy-bluetooth-power on >/dev/null 2>&1; then
+    echo "The Bluetooth adapter could not be powered on." >&2
+    return 1
+  fi
+
+  state=$(timeout 2s bluetoothctl show 2>/dev/null | strip_terminal_codes) || state=
+  if [[ $state != *"Powered: yes"* ]]; then
+    echo "The Bluetooth adapter is not ready. Turn Bluetooth on and try again." >&2
+    return 1
+  fi
+}
+
+ensure_not_blocked() {
+  local info
+  info=$(timeout 2s bluetoothctl info "$address" 2>/dev/null | strip_terminal_codes) || return 0
+  if [[ $info == *"Blocked: yes"* ]]; then
+    echo "This device is blocked. Unblock it before trying again." >&2
+    return 1
+  fi
+}
+
+trust_device() {
+  # Trust is a convenience for future incoming reconnects, not a condition for
+  # completing the user's immediate pair/connect request.
+  run_control trust 5 trust "$address" >/dev/null 2>&1 || true
+}
+
+case "$action" in
+  pair)
+    ensure_powered || exit 1
+    ensure_not_blocked || exit 1
+    run_control pair 20 pair "$address" || exit 1
+    trust_device
+    run_control connect 20 connect "$address" || exit 1
+    ;;
+  connect)
+    ensure_powered || exit 1
+    ensure_not_blocked || exit 1
+    run_control connect 20 connect "$address" || exit 1
+    trust_device
+    ;;
+  disconnect)
+    run_control disconnect 10 disconnect "$address" || exit 1
+    ;;
+  forget)
+    ensure_powered || exit 1
+    # Removal is authoritative and also tears down a live connection. Do not
+    # make a misbehaving device's failed disconnect prevent it being forgotten.
+    run_control disconnect 10 disconnect "$address" >/dev/null 2>&1 || true
+    run_control remove 10 remove "$address" || exit 1
+    ;;
+esac

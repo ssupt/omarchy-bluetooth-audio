@@ -289,6 +289,30 @@ function withPendingAction(actions, address, action) {
   return next
 }
 
+function deviceActionFailure(failures, address) {
+  var key = normalizedAddress(address)
+  if (key === "" || !failures || typeof failures !== "object") return null
+  var failure = failures[key]
+  return failure && typeof failure === "object" ? failure : null
+}
+
+function withDeviceActionFailure(failures, address, action, message) {
+  var next = cloneMap(failures)
+  var key = normalizedAddress(address)
+  if (key === "") return next
+  if (action && message) next[key] = { action: String(action), message: String(message) }
+  else delete next[key]
+  return next
+}
+
+function deviceActionReachedState(action, device) {
+  if (action === "pair" || action === "connect") return !!device && !!device.connected
+  if (action === "disconnect") return !!device && !device.connected
+  if (action === "forget")
+    return !device || (!device.paired && !device.bonded && !device.trusted)
+  return false
+}
+
 function visibleSections(lists, discovering) {
   var sections = []
   if (lists && lists.connected && lists.connected.length > 0) sections.push("connected")
@@ -334,6 +358,9 @@ if (typeof module !== "undefined") {
     cloneMap: cloneMap,
     pendingAction: pendingAction,
     withPendingAction: withPendingAction,
+    deviceActionFailure: deviceActionFailure,
+    withDeviceActionFailure: withDeviceActionFailure,
+    deviceActionReachedState: deviceActionReachedState,
     visibleSections: visibleSections,
     sectionDevices: sectionDevices
   }

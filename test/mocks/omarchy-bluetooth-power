@@ -1,0 +1,5 @@
+#!/bin/bash
+
+[[ -n ${BLUETOOTH_ACTION_LOG:-} ]] || exit 1
+printf 'power %s\n' "$*" >>"$BLUETOOTH_ACTION_LOG"
+[[ ${BLUETOOTH_ACTION_POWER_FAIL:-0} != 1 ]]
