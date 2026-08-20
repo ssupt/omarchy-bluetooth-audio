@@ -12,16 +12,16 @@ if (( $# != 2 )) || [[ ! $address =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ || -z 
   exit 1
 fi
 
-set -o pipefail
+set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 card=$("$script_dir/bluetooth-audio-profiles" | jq -r --arg address "$address" --arg profile "$profile" '
   def normalized_address:
     ascii_downcase | gsub("[^0-9a-f]"; "");
-  .[($address | normalized_address)]
-  | select(any(.profiles[]; .value == $profile))
+  (.[($address | normalized_address)] // {})
+  | select(any((.profiles // [])[]; .value == $profile))
   | .card // empty
-') || exit 1
+')
 
 [[ -n $card ]] || { echo "Bluetooth audio profile is not available" >&2; exit 1; }
 # WirePlumber's device.restore-profile policy stores this profile against the

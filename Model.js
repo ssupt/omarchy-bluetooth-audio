@@ -75,6 +75,18 @@ function preferredAudioProfile(preferences, address, options, activeProfile) {
   return String(activeProfile || "")
 }
 
+// Pending and live PipeWire state are authoritative. A saved preference is a
+// fallback for the short interval before card state becomes available, not a
+// replacement for an active profile reported by PipeWire.
+function currentAudioProfile(preferences, address, options, activeProfile, pendingProfile) {
+  var pending = String(pendingProfile || "")
+  if (pending !== "") return pending
+
+  var active = String(activeProfile || "")
+  if (active !== "") return active
+  return preferredAudioProfile(preferences, address, options, "")
+}
+
 function preferredAudioNodeName(preferences, direction, liveNode, nodes) {
   var defaults = preferences && preferences.defaults
   var saved = defaults && (direction === "output" || direction === "input")
@@ -85,6 +97,12 @@ function preferredAudioNodeName(preferences, direction, liveNode, nodes) {
       if (values[i] && String(values[i].name || "") === saved) return saved
   }
   return liveNode ? String(liveNode.name || "") : ""
+}
+
+function currentAudioNodeName(preferences, direction, liveNode, nodes) {
+  var liveName = liveNode ? String(liveNode.name || "") : ""
+  return liveName !== "" ? liveName
+    : preferredAudioNodeName(preferences, direction, null, nodes)
 }
 
 function hasHumanName(device) {
@@ -117,10 +135,19 @@ function nodeText(node) {
   ].join(" ").toLowerCase()
 }
 
+function isAudioSource(node) {
+  if (!node || node.isSink || node.isStream || !node.audio) return false
+  var name = String(node.name || "")
+  if (/\.monitor$/i.test(name)) return false
+
+  var props = nodeProps(node)
+  return String(props["media.class"] || "") !== "Audio/Sink"
+}
+
 function bluetoothNodeMatchesDevice(node, device, direction) {
   if (!node || node.isStream || !device) return false
   if (direction === "sink" && !node.isSink) return false
-  if (direction === "source" && !node.isSource) return false
+  if (direction === "source" && !isAudioSource(node)) return false
 
   var address = normalizedAddress(device.address)
   var text = nodeText(node)
@@ -184,6 +211,18 @@ function audioProfileCodec(state, profileName) {
       return String(profiles[i].codec || "")
   }
   return name === String(state.activeProfile || "") ? String(state.activeCodec || "") : ""
+}
+
+function audioProfileHasInput(state, profileName) {
+  if (!state) return false
+  var name = String(profileName || state.activeProfile || "")
+  var profiles = Array.isArray(state.profiles) ? state.profiles : []
+  for (var i = 0; i < profiles.length; i++) {
+    var profile = profiles[i]
+    if (!profile || String(profile.value || profile.name || "") !== name) continue
+    return profile.hasInput === true || Number(profile.sources || 0) > 0
+  }
+  return false
 }
 
 function sortedByLabel(devices) {
@@ -275,16 +314,20 @@ if (typeof module !== "undefined") {
     normalizedAddress: normalizedAddress,
     parseAudioPreferences: parseAudioPreferences,
     preferredAudioProfile: preferredAudioProfile,
+    currentAudioProfile: currentAudioProfile,
     preferredAudioNodeName: preferredAudioNodeName,
+    currentAudioNodeName: currentAudioNodeName,
     hasHumanName: hasHumanName,
     nodeProps: nodeProps,
     nodeText: nodeText,
+    isAudioSource: isAudioSource,
     bluetoothSinkMatchesDevice: bluetoothSinkMatchesDevice,
     bluetoothSourceMatchesDevice: bluetoothSourceMatchesDevice,
     sameAudioNode: sameAudioNode,
     audioProfileState: audioProfileState,
     audioProfileOptions: audioProfileOptions,
     audioProfileCodec: audioProfileCodec,
+    audioProfileHasInput: audioProfileHasInput,
     sortedByLabel: sortedByLabel,
     deviceRow: deviceRow,
     deviceLists: deviceLists,

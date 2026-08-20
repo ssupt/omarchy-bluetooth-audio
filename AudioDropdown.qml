@@ -56,9 +56,10 @@ Item {
   // own keyCatcher so j/k inside the popup don't double-drive the panel
   // cursor.
   readonly property bool popupOpen: popup.opened
-  function open() { popup.open() }
+  function canOpen() { return enabled && options && options.length > 0 }
+  function open() { if (canOpen()) popup.open() }
   function close() { popup.close() }
-  function toggle() { popup.opened ? popup.close() : popup.open() }
+  function toggle() { popup.opened ? popup.close() : open() }
 
   signal changed(string value)
   signal hovered(bool isHovered)
@@ -70,11 +71,14 @@ Item {
     return (o && typeof o === "object") ? String(o.label) : String(o)
   }
   function currentLabel() {
-    for (var i = 0; i < options.length; i++) {
-      if (optionValue(options[i]) === value) return optionLabel(options[i])
+    var values = options || []
+    for (var i = 0; i < values.length; i++) {
+      if (optionValue(values[i]) === value) return optionLabel(values[i])
     }
     return value
   }
+
+  onEnabledChanged: if (!enabled) close()
 
   implicitWidth: Style.spacing.dropdownWidth
   implicitHeight: showLabel && label !== "" ? rowHeight + Style.spacing.huge : rowHeight
@@ -125,7 +129,7 @@ Item {
       Keys.onPressed: function(event) {
         if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
             || event.key === Qt.Key_Space || event.key === Qt.Key_Down) {
-          popup.opened ? popup.close() : popup.open()
+          root.toggle()
           event.accepted = true
         } else if (event.key === Qt.Key_Escape && popup.opened) {
           popup.close(); event.accepted = true
@@ -169,7 +173,7 @@ Item {
         onPressed: popupWasOpenOnPress = popup.opened
         onClicked: {
           trigger.forceActiveFocus()
-          popupWasOpenOnPress ? popup.close() : popup.open()
+          popupWasOpenOnPress ? popup.close() : root.open()
         }
       }
 

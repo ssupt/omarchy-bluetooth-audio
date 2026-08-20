@@ -57,6 +57,7 @@ Panel {
   readonly property string audioProfileError: audioProfileSetError !== ""
     ? audioProfileSetError : audioProfileReadError
   property var pendingAudioProfile: null
+  property var unconfirmedAudioProfile: null
   property bool audioProfileMenuOpen: false
 
   function pluginScript(name) {
@@ -237,12 +238,12 @@ Panel {
     var sources = []
     for (var i = 0; i < pipewireNodes.length; i++) {
       var node = pipewireNodes[i]
-      if (node && node.isSource && !node.isStream) sources.push(node)
+      if (Model.isAudioSource(node)) sources.push(node)
     }
     return sources
   }
 
-  readonly property string preferredAudioSinkName: Model.preferredAudioNodeName(
+  readonly property string currentAudioSinkName: Model.currentAudioNodeName(
     audioPreferences, "output", defaultAudioSink, audioSinks())
 
   function loadAudioPreferences(raw) {
@@ -288,7 +289,17 @@ Panel {
   }
 
   function audioProfileActionAvailable(device) {
-    return !!device && device.connected && audioProfileOptions(device.address).length > 1
+    if (!device || !device.connected) return false
+    var state = audioProfileState(device.address)
+    var options = Model.audioProfileOptions(state)
+    if (options.length > 1) return true
+    return options.length === 1
+      && String(state ? state.activeProfile || "" : "") !== String(options[0].value)
+  }
+
+  function audioProfileHasInput(address) {
+    var state = audioProfileState(address)
+    return Model.audioProfileHasInput(state, state ? state.activeProfile : "")
   }
 
   function refreshAudioProfiles() {
@@ -304,10 +315,13 @@ Panel {
       audioProfiles = parsed
       audioProfileReadError = ""
 
-      if (pendingAudioProfile) {
-        var state = Model.audioProfileState(parsed, pendingAudioProfile.address)
-        if (state && String(state.activeProfile || "") === pendingAudioProfile.profile) {
+      var expected = pendingAudioProfile || unconfirmedAudioProfile
+      if (expected) {
+        var state = Model.audioProfileState(parsed, expected.address)
+        if (state && String(state.activeProfile || "") === expected.profile) {
           pendingAudioProfile = null
+          unconfirmedAudioProfile = null
+          audioProfileSetError = ""
           audioProfilePendingTimeout.stop()
         }
       }
@@ -333,6 +347,7 @@ Panel {
       address: Model.normalizedAddress(address),
       profile: String(profile)
     }
+    unconfirmedAudioProfile = pendingAudioProfile
     audioProfileSetError = ""
     audioProfileSetProc.command = [
       pluginScript("bluetooth-audio-profile-set"),
@@ -400,7 +415,7 @@ Panel {
     // High-fidelity Bluetooth profiles expose output only. Communication
     // profiles also expose a matching microphone; when present, selecting the
     // device for audio makes that source the default as well.
-    var source = bluetoothAudioSource(device)
+    var source = audioProfileHasInput(device.address) ? bluetoothAudioSource(device) : null
     if (source) setDefaultAudioSource(source)
   }
 
@@ -658,7 +673,14 @@ Panel {
   onConnectedDevicesChanged: {
     reselectFocusedDevice()
     syncPendingActions()
-    if (connectedDevices.length === 0) audioProfiles = ({})
+    if (connectedDevices.length === 0) {
+      audioProfiles = ({})
+      audioProfileReadError = ""
+      audioProfileSetError = ""
+      pendingAudioProfile = null
+      unconfirmedAudioProfile = null
+      audioProfilePendingTimeout.stop()
+    }
     else if (opened) audioProfileRefreshTimer.restart()
   }
   onKnownDevicesChanged: { reselectFocusedDevice(); syncPendingActions() }
@@ -835,6 +857,7 @@ Panel {
       if (exitCode !== 0) {
         root.audioProfileSetError = "Could not change the Bluetooth audio mode"
         root.pendingAudioProfile = null
+        root.unconfirmedAudioProfile = null
         audioProfilePendingTimeout.stop()
       } else {
         root.audioProfileSetError = ""
@@ -1234,22 +1257,25 @@ Panel {
 
     readonly property var profileState: root.audioProfileState(dev ? dev.address : "")
     readonly property var profileOptions: Model.audioProfileOptions(profileState)
-    readonly property bool profileMenuAvailable: isConnected && profileOptions.length > 1
+    readonly property bool profileMenuAvailable: root.audioProfileActionAvailable(dev)
     readonly property string pendingProfileName: {
       if (!root.pendingAudioProfile || !dev) return ""
       return root.pendingAudioProfile.address === Model.normalizedAddress(dev.address)
         ? String(root.pendingAudioProfile.profile || "") : ""
     }
-    readonly property string currentProfileName: pendingProfileName !== ""
-      ? pendingProfileName
-      : Model.preferredAudioProfile(root.audioPreferences, dev ? dev.address : "",
-          profileOptions, profileState ? profileState.activeProfile : "")
-    readonly property string activeCodec: Model.audioProfileCodec(profileState, currentProfileName)
+    readonly property string currentProfileName: Model.currentAudioProfile(
+      root.audioPreferences, dev ? dev.address : "", profileOptions,
+      profileState ? profileState.activeProfile : "", pendingProfileName)
+    readonly property string activeCodec: Model.audioProfileCodec(
+      profileState, profileState ? profileState.activeProfile : "")
     readonly property var deviceAudioSink: root.bluetoothAudioSink(dev)
-    readonly property var deviceAudioSource: root.bluetoothAudioSource(dev)
+    readonly property var deviceAudioSource: root.audioProfileHasInput(dev ? dev.address : "")
+      ? root.bluetoothAudioSource(dev) : null
     readonly property bool useAudioAvailable: isConnected && !!deviceAudioSink
     readonly property bool usingForAudio: useAudioAvailable
-      && String(deviceAudioSink.name || "") === root.preferredAudioSinkName
+      && (root.defaultAudioSink
+        ? Model.sameAudioNode(deviceAudioSink, root.defaultAudioSink)
+        : String(deviceAudioSink.name || "") === root.currentAudioSinkName)
 
     readonly property bool rowSelected: root.cursorActive && root.focusSection === sectionName && root.selectedIndex === rowIndex
     readonly property bool forgetAvailable: (sectionName === "known" || sectionName === "connected") && !isDiscovered

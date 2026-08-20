@@ -30,8 +30,8 @@ const profiles = {
     activeProfile: 'a2dp-sink-aac',
     activeCodec: 'AAC',
     profiles: [
-      { value: 'a2dp-sink-aac', codec: 'AAC', label: 'High fidelity · AAC' },
-      { value: 'headset-head-unit-msbc', codec: 'mSBC', label: 'Headset + microphone · mSBC' }
+      { value: 'a2dp-sink-aac', codec: 'AAC', label: 'High fidelity · AAC', hasInput: false },
+      { value: 'headset-head-unit-msbc', codec: 'mSBC', label: 'Headset + microphone · mSBC', hasInput: true }
     ]
   }
 }
@@ -43,6 +43,8 @@ assert.deepEqual(model.audioProfileOptions(state), [
   { value: 'headset-head-unit-msbc', label: 'Headset + microphone · mSBC' }
 ])
 assert.equal(model.audioProfileCodec(state, 'headset-head-unit-msbc'), 'mSBC')
+assert.equal(model.audioProfileHasInput(state, state.activeProfile), false)
+assert.equal(model.audioProfileHasInput(state, 'headset-head-unit-msbc'), true)
 assert.equal(model.audioProfileState(profiles, 'AA:BB:CC:DD:EE:FF'), null)
 
 const audioPreferences = model.parseAudioPreferences(JSON.stringify({
@@ -60,14 +62,21 @@ assert.equal(model.preferredAudioProfile(
 assert.equal(model.preferredAudioProfile(
   audioPreferences, '00:11:22:33:44:55', [{ value: 'a2dp-sink-aac' }], state.activeProfile
 ), 'a2dp-sink-aac')
+assert.equal(model.currentAudioProfile(
+  audioPreferences, '00:11:22:33:44:55', state.profiles, state.activeProfile, ''
+), 'a2dp-sink-aac')
+assert.equal(model.currentAudioProfile(
+  audioPreferences, '00:11:22:33:44:55', state.profiles, state.activeProfile,
+  'headset-head-unit-msbc'
+), 'headset-head-unit-msbc')
 
 const device = { address: '00:11:22:33:44:55', deviceName: 'Bluetooth Headphones' }
 const sink = {
   id: 40,
   name: 'bluez_output.00_11_22_33_44_55.1',
   isSink: true,
-  isSource: false,
   isStream: false,
+  audio: {},
   ready: true,
   properties: { 'api.bluez5.address': '00:11:22:33:44:55' }
 }
@@ -75,19 +84,25 @@ const source = {
   id: 41,
   name: 'bluez_input.00_11_22_33_44_55.0',
   isSink: false,
-  isSource: true,
   isStream: false,
+  audio: {},
   ready: true,
   properties: { 'api.bluez5.address': '00:11:22:33:44:55' }
 }
 assert.equal(model.bluetoothSinkMatchesDevice(sink, device), true)
 assert.equal(model.bluetoothSourceMatchesDevice(source, device), true)
 assert.equal(model.bluetoothSourceMatchesDevice(sink, device), false)
+assert.equal(model.bluetoothSourceMatchesDevice({
+  ...source,
+  name: 'bluez_output.00_11_22_33_44_55.1.monitor'
+}, device), false)
 assert.equal(model.sameAudioNode(sink, { id: 40, name: 'replacement' }), true)
 assert.equal(model.sameAudioNode(sink, { id: 42, name: sink.name }), true)
 assert.equal(model.sameAudioNode(sink, source), false)
 assert.equal(model.preferredAudioNodeName(audioPreferences, 'output', source, [sink]), sink.name)
 assert.equal(model.preferredAudioNodeName(audioPreferences, 'output', source, [source]), source.name)
+assert.equal(model.currentAudioNodeName(audioPreferences, 'output', source, [sink, source]), source.name)
+assert.doesNotMatch(panelSource, /\.isSource\b/)
 console.log('PASS: Bluetooth profile model')
 JS
 
@@ -110,8 +125,12 @@ echo "PASS: Bluetooth codec discovery"
 profile_log=$(mktemp)
 profile_state=$(mktemp)
 shared_preferences=$(mktemp)
+failed_preferences=$(mktemp)
+no_source_preferences=$(mktemp)
 shared_preferences_lock="${shared_preferences}.lock"
-trap 'rm -f "$profile_log" "$profile_state" "$shared_preferences" "$shared_preferences_lock"' EXIT
+failed_preferences_lock="${failed_preferences}.lock"
+no_source_preferences_lock="${no_source_preferences}.lock"
+trap 'rm -f "$profile_log" "$profile_state" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock"' EXIT
 printf 'old\n' >"$profile_state"
 
 AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
@@ -130,6 +149,7 @@ set-card-profile bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
 set-sink-mute 101 true
 set-sink-volume 101 42%
 set-sink-mute 101 false
+set-source-mute 200 true
 set-source-volume 200 36%
 set-source-mute 200 true
 set-sink-input-mute 300 false
@@ -144,6 +164,99 @@ jq -e '
   and .bluetoothProfiles == {"001122334455":"headset-head-unit-msbc"}
 ' "$shared_preferences" >/dev/null || fail "shared audio preferences"
 echo "PASS: preferred mode selection"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_LEGACY_CARD_FIELD=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+[[ $(<"$profile_log") == "$expected_profile_log" ]] || fail "legacy PulseAudio card association"
+echo "PASS: legacy PulseAudio card association"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_SET_FAIL=1 \
+  OMARCHY_AUDIO_PREFERENCES_FILE="$failed_preferences" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-audio-profile-set" \
+    00:11:22:33:44:55 headset-head-unit-msbc >/dev/null 2>&1; then
+  fail "failed Bluetooth profile change reported success"
+fi
+[[ ! -s $failed_preferences ]] || fail "failed Bluetooth profile change was persisted"
+expected_failure_log=$(cat <<'EOF'
+set-sink-mute 100 true
+set-sink-input-mute 300 true
+set-card-profile bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+set-sink-input-mute 300 false
+set-sink-mute 100 false
+EOF
+)
+[[ $(<"$profile_log") == "$expected_failure_log" ]] || fail "failed profile transition cleanup"
+echo "PASS: failed profile transition rollback"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_SINK_READ_FAIL=1 \
+  OMARCHY_AUDIO_PREFERENCES_FILE="$failed_preferences" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-audio-profile-set" \
+    00:11:22:33:44:55 headset-head-unit-msbc >/dev/null 2>&1; then
+  fail "profile change continued without an endpoint inventory"
+fi
+[[ ! -s $profile_log ]] || fail "hardware changed without an endpoint inventory"
+echo "PASS: profile transition fails closed"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_NO_NEW_SOURCE=1 \
+  OMARCHY_AUDIO_PREFERENCES_FILE="$failed_preferences" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-audio-profile-set" \
+    00:11:22:33:44:55 headset-head-unit-msbc >/dev/null 2>&1; then
+  fail "duplex profile succeeded without its audio input"
+fi
+rg -q '^set-sink-mute 101 true$' "$profile_log" \
+  || fail "new output was not muted while waiting for the duplex input"
+if rg -q '^set-source-' "$profile_log"; then
+  fail "missing duplex input received state changes"
+fi
+[[ ! -s $failed_preferences ]] || fail "incomplete duplex profile was persisted"
+echo "PASS: duplex transition waits for input"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_NO_OLD_SOURCE=1 \
+  OMARCHY_AUDIO_PREFERENCES_FILE="$no_source_preferences" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-audio-profile-set" \
+    00:11:22:33:44:55 headset-head-unit-msbc
+if rg -q '^set-source-' "$profile_log"; then
+  fail "new audio input was assigned an invented mute state"
+fi
+jq -e '.bluetoothProfiles == {"001122334455":"headset-head-unit-msbc"}' \
+  "$no_source_preferences" >/dev/null || fail "source-less profile transition preference"
+echo "PASS: unknown input state is preserved"
 
 jq -e '
   .schemaVersion == 1
