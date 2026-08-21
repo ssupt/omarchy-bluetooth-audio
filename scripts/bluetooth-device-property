@@ -1,0 +1,98 @@
+#!/bin/bash
+
+# omarchy:summary=Update a Bluetooth device property and report actionable failures
+# omarchy:group=bluetooth
+# omarchy:args=<name|trusted|blocked|wakeAllowed> <dbus-path> <value>
+
+set -uo pipefail
+export LC_ALL=C
+
+property=${1:-}
+device_path=${2:-}
+value=${3-}
+
+if (( $# != 3 )) \
+  || [[ $property != name && $property != trusted && $property != blocked && $property != wakeAllowed ]] \
+  || [[ ! $device_path =~ ^/org/bluez/hci[0-9]+/dev_([0-9A-Fa-f]{2}_){5}[0-9A-Fa-f]{2}$ ]]; then
+  echo "Usage: bluetooth-device-property <name|trusted|blocked|wakeAllowed> <dbus-path> <value>" >&2
+  exit 1
+fi
+
+case "$property" in
+  name)
+    bluez_property=Alias
+    signature=s
+    wire_value=$value
+    ;;
+  trusted)
+    bluez_property=Trusted
+    signature=b
+    ;;
+  blocked)
+    bluez_property=Blocked
+    signature=b
+    ;;
+  wakeAllowed)
+    bluez_property=WakeAllowed
+    signature=b
+    ;;
+esac
+
+if [[ $signature == b ]]; then
+  case "${value,,}" in
+    true|1|yes|on) wire_value=true ;;
+    false|0|no|off) wire_value=false ;;
+    *)
+      echo "Bluetooth boolean values must be true or false." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+output=
+status=0
+output=$(timeout 5s busctl set-property \
+  org.bluez "$device_path" org.bluez.Device1 \
+  "$bluez_property" "$signature" "$wire_value" 2>&1) || status=$?
+if (( status == 0 )); then
+  exit 0
+fi
+
+if (( status == 124 )); then
+  echo "Changing the Bluetooth device setting timed out." >&2
+  exit 1
+fi
+
+lower=${output,,}
+case "$lower" in
+  *unknownobject*|*unknown\ object*|*does\ not\ exist*|*no\ such\ object*)
+    echo "This device is no longer available." >&2
+    ;;
+  *notready*|*not\ ready*)
+    echo "The Bluetooth adapter is not ready. Turn Bluetooth on and try again." >&2
+    ;;
+  *accessdenied*|*notauthorized*|*not\ authorized*|*notpermitted*|*not\ permitted*)
+    echo "BlueZ did not permit this device setting to be changed." >&2
+    ;;
+  *unknownproperty*|*unknown\ property*|*invalidargs*|*invalid\ argument*)
+    if [[ $property == wakeAllowed ]]; then
+      echo "This device or Bluetooth adapter does not support wake permission." >&2
+    elif [[ $property == name ]]; then
+      echo "BlueZ rejected this device name." >&2
+    else
+      echo "BlueZ rejected this device setting." >&2
+    fi
+    ;;
+  *timed\ out*|*timeout*)
+    echo "Changing the Bluetooth device setting timed out." >&2
+    ;;
+  *)
+    case "$property" in
+      name) echo "Could not rename this device." >&2 ;;
+      trusted) echo "Could not update whether this device is trusted." >&2 ;;
+      blocked) echo "Could not update whether this device is blocked." >&2 ;;
+      wakeAllowed) echo "Could not change wake permission." >&2 ;;
+    esac
+    ;;
+esac
+exit 1

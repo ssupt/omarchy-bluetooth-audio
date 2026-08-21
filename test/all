@@ -71,6 +71,46 @@ assert.equal(model.currentAudioProfile(
 ), 'headset-head-unit-msbc')
 
 const device = { address: '00:11:22:33:44:55', deviceName: 'Bluetooth Headphones' }
+const detailedDevice = {
+  address: 'AA:BB:CC:DD:EE:FF',
+  dbusPath: '/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF',
+  name: 'Desk headset',
+  deviceName: 'Hardware headset',
+  icon: 'audio-headset',
+  connected: false,
+  state: 0,
+  paired: true,
+  bonded: true,
+  pairing: false,
+  trusted: true,
+  blocked: false,
+  wakeAllowed: true,
+  batteryAvailable: true,
+  battery: 0.64
+}
+assert.equal(model.deviceLabel(detailedDevice), 'Desk headset')
+assert.equal(model.hasHumanName({ name: '00112233-4455-6677-8899-aabbccddeeff', deviceName: 'Keyboard' }), true)
+assert.deepEqual(model.deviceRow(detailedDevice), {
+  address: 'AA:BB:CC:DD:EE:FF',
+  dbusPath: '/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF',
+  name: 'Desk headset',
+  deviceName: 'Hardware headset',
+  icon: 'audio-headset',
+  connected: false,
+  state: 0,
+  paired: true,
+  bonded: true,
+  trusted: true,
+  blocked: false,
+  wakeAllowed: true,
+  batteryAvailable: true,
+  battery: 0.64,
+  pairing: false
+})
+const blockedDevice = {
+  address: '11:22:33:44:55:66', name: 'Blocked keyboard', blocked: true
+}
+assert.deepEqual(model.deviceLists([blockedDevice]).known, [blockedDevice])
 const sink = {
   id: 40,
   name: 'bluez_output.00_11_22_33_44_55.1',
@@ -92,6 +132,15 @@ const source = {
 assert.equal(model.bluetoothSinkMatchesDevice(sink, device), true)
 assert.equal(model.bluetoothSourceMatchesDevice(source, device), true)
 assert.equal(model.bluetoothSourceMatchesDevice(sink, device), false)
+assert.equal(model.bluetoothSinkMatchesDevice({
+  id: 42,
+  name: 'bluez_output.unknown',
+  isSink: true,
+  isStream: false,
+  audio: {},
+  ready: true,
+  properties: { 'node.description': 'Hardware headset' }
+}, detailedDevice), true)
 assert.equal(model.bluetoothSourceMatchesDevice({
   ...source,
   name: 'bluez_output.00_11_22_33_44_55.1.monitor'
@@ -113,18 +162,36 @@ assert.equal(model.deviceActionReachedState('disconnect', { connected: false }),
 assert.equal(model.deviceActionReachedState('forget', {
   paired: false, bonded: false, trusted: false
 }), true)
+assert.equal(model.deviceActionReachedState('forget', {
+  paired: false, bonded: false, trusted: false, blocked: true
+}), false)
 assert.equal(model.deviceActionReachedState('pair', { connected: false }), false)
 failures = model.withDeviceActionFailure(
   failures, '00:11:22:33:44:55', '', '')
 assert.equal(model.deviceActionFailure(failures, '00:11:22:33:44:55'), null)
 
+assert.equal(model.deviceIconGlyph('audio-headset', 'Galaxy Buds FEee', true), '󰋋')
+assert.equal(model.deviceIconGlyph('audio-headset', 'MOMENTUM 4', false), '󰋋')
+assert.equal(model.deviceIconGlyph('audio-card', 'GoogleTV3764', false), '󰍹')
+assert.equal(model.deviceIconGlyph('audio-card', 'MiTV-MSSP2', false), '󰍹')
+assert.equal(model.deviceIconGlyph('input-keyboard', 'Keychron K2', false), '󰌌')
+assert.equal(model.deviceIconGlyph('input-mouse', 'MX Master 3S', false), '󰍽')
+assert.equal(model.deviceIconGlyph('input-gaming', 'DualSense', false), '󰊴')
+assert.equal(model.deviceIconGlyph('', 'Unknown Device', true), '󰂱')
+assert.equal(model.deviceIconGlyph('', 'Unknown Device', false), '󰂯')
+
 assert.match(panelSource, /pluginScript\("bluetooth-device-action"\)/)
 assert.match(panelSource, /device\.cancelPair\(\)/)
 assert.match(panelSource, /deviceActionProc\.signal\(15\)/)
 assert.match(panelSource, /root\.retryDeviceAction\(dev\)/)
+assert.match(panelSource, /Model\.deviceIconGlyph/)
+assert.match(panelSource, /pluginScript\("bluetooth-device-property"\)/)
+assert.match(panelSource, /id: devicePropertyProc/)
+assert.match(panelSource, /id: forgetDialog/)
+assert.doesNotMatch(panelSource, /device\.(?:name|trusted|blocked|wakeAllowed)\s*=/)
 assert.doesNotMatch(panelSource, /execDetached\(deviceCommand/)
 assert.doesNotMatch(panelSource, /\.isSource\b/)
-console.log('PASS: Bluetooth profile model')
+console.log('PASS: Bluetooth model and panel wiring')
 JS
 
 bluetooth_profiles=$(
@@ -147,13 +214,15 @@ profile_log=$(mktemp)
 profile_state=$(mktemp)
 bluetooth_action_log=$(mktemp)
 bluetooth_action_error=$(mktemp)
+bluetooth_property_log=$(mktemp)
+bluetooth_property_error=$(mktemp)
 shared_preferences=$(mktemp)
 failed_preferences=$(mktemp)
 no_source_preferences=$(mktemp)
 shared_preferences_lock="${shared_preferences}.lock"
 failed_preferences_lock="${failed_preferences}.lock"
 no_source_preferences_lock="${no_source_preferences}.lock"
-trap 'rm -f "$profile_log" "$profile_state" "$bluetooth_action_log" "$bluetooth_action_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock"' EXIT
+trap 'rm -f "$profile_log" "$profile_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock"' EXIT
 printf 'old\n' >"$profile_state"
 
 : >"$bluetooth_action_log"
@@ -262,6 +331,38 @@ if rg -q '^(trust|connect) ' "$bluetooth_action_log"; then
   fail "cancelled Bluetooth pairing continued to trust or connect"
 fi
 echo "PASS: result-aware Bluetooth device actions"
+
+: >"$bluetooth_property_log"
+BLUETOOTH_PROPERTY_LOG="$bluetooth_property_log" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-property" \
+    name /org/bluez/hci0/dev_00_11_22_33_44_55 "Desk headset"
+[[ $(<"$bluetooth_property_log") == \
+  "set-property org.bluez /org/bluez/hci0/dev_00_11_22_33_44_55 org.bluez.Device1 Alias s Desk headset" ]] \
+  || fail "Bluetooth device rename property"
+
+: >"$bluetooth_property_log"
+BLUETOOTH_PROPERTY_LOG="$bluetooth_property_log" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-property" \
+    blocked /org/bluez/hci0/dev_00_11_22_33_44_55 true
+rg -q ' org\.bluez\.Device1 Blocked b true$' "$bluetooth_property_log" \
+  || fail "Bluetooth boolean device property"
+
+: >"$bluetooth_property_log"
+if BLUETOOTH_PROPERTY_LOG="$bluetooth_property_log" \
+  BLUETOOTH_PROPERTY_FAIL_PROPERTY=WakeAllowed \
+  BLUETOOTH_PROPERTY_FAIL_MESSAGE='Call failed: org.freedesktop.DBus.Error.InvalidArgs' \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-property" \
+    wakeAllowed /org/bluez/hci0/dev_00_11_22_33_44_55 true \
+      > /dev/null 2>"$bluetooth_property_error"; then
+  fail "unsupported Bluetooth wake property reported success"
+fi
+[[ $(<"$bluetooth_property_error") == \
+  "This device or Bluetooth adapter does not support wake permission." ]] \
+  || fail "unsupported Bluetooth wake property error"
+echo "PASS: result-aware Bluetooth device properties"
 
 AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
@@ -391,7 +492,7 @@ echo "PASS: unknown input state is preserved"
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.4.0"
+  and .version == "0.5.0"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

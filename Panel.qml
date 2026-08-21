@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import Quickshell.Bluetooth
@@ -28,6 +29,17 @@ Panel {
   property var lastExitedDeviceAction: null
   property string deviceActionStderr: ""
   property bool deviceActionCancelRequested: false
+
+  // Device details deliberately retain only a stable address plus primitive
+  // projections. Renaming can re-sort a row, blocking can move it between
+  // sections, and forgetting destroys the BlueZ QObject altogether.
+  property string deviceDetailsAddress: ""
+  property int deviceDetailsIndex: 0
+  property bool forgetConfirmationOpen: false
+  property var pendingDeviceProperty: null
+  property var lastExitedDeviceProperty: null
+  property string devicePropertyStderr: ""
+  property string devicePropertyError: ""
 
   readonly property var adapter: Bluetooth.defaultAdapter
 
@@ -132,9 +144,9 @@ Panel {
   // guaranteeing one highlight on screen.
   property string focusSection: "connected"
   property int selectedIndex: 0
-  // Empty selects the device row. Connected audio rows add explicit default-
-  // audio and preferred-mode actions alongside the existing forget action.
-  property string focusedAction: ""  // "" | "audio" | "forget" | "profile" | "retry" | "cancel"
+  // Empty selects the device row. Rows expose details, while connected audio
+  // devices add explicit default-audio and preferred-mode actions.
+  property string focusedAction: ""  // "" | "audio" | "details" | "profile" | "retry" | "cancel"
   property bool cursorActive: false
   property int headerIndex: 1
 
@@ -202,18 +214,48 @@ Panel {
     return rows
   }
 
+  readonly property var deviceDetailsRow: {
+    var address = Model.normalizedAddress(deviceDetailsAddress)
+    if (address === "") return null
+    var devs = devices || []
+    for (var i = 0; i < devs.length; i++) {
+      if (devs[i] && Model.normalizedAddress(devs[i].address) === address)
+        return Model.deviceRow(devs[i])
+    }
+    return null
+  }
+  readonly property bool deviceDetailsOpen: deviceDetailsAddress !== ""
+  readonly property bool deviceDetailsForgetAvailable: !!deviceDetailsRow
+    && (deviceDetailsRow.connected || deviceDetailsRow.paired
+      || deviceDetailsRow.bonded || deviceDetailsRow.trusted
+      || deviceDetailsRow.blocked)
+  readonly property int deviceDetailsActionCount: !deviceDetailsRow ? 0
+    : (deviceDetailsForgetAvailable ? 5 : 4)
+  readonly property bool devicePropertyBusy: pendingDeviceProperty !== null
+  readonly property bool deviceDetailsActionBusy: !!activeDeviceAction
+    && Model.normalizedAddress(activeDeviceAction.address)
+      === Model.normalizedAddress(deviceDetailsAddress)
+  readonly property bool deviceDetailsControlsBusy: devicePropertyBusy
+    || deviceDetailsActionBusy || pendingAction(deviceDetailsAddress) !== ""
+  onDeviceDetailsActionCountChanged: if (deviceDetailsOpen)
+    setDeviceDetailsCursor(deviceDetailsIndex)
+
   // Live BlueZ device behind a row. Rows carry primitives only, so actions
   // resolve the backend object here rather than holding a wrapper that can
   // dangle mid-incubation. `devices` is already the raw device array (see the
   // property declaration), so it is iterated directly.
-  function deviceFor(row) {
-    if (!row || !row.dev) return null
-    var addr = row.dev.address || ""
+  function deviceByAddress(address) {
+    var normalized = Model.normalizedAddress(address)
+    if (normalized === "") return null
     var devs = devices || []
     for (var i = 0; i < devs.length; i++) {
-      if ((devs[i].address || "") === addr) return devs[i]
+      if (devs[i] && Model.normalizedAddress(devs[i].address) === normalized) return devs[i]
     }
     return null
+  }
+
+  function deviceFor(row) {
+    return row && row.dev ? deviceByAddress(row.dev.address) : null
   }
 
   // Flat position of the keyboard cursor, or -1 while it sits on the hero or
@@ -467,6 +509,11 @@ Panel {
     return [pluginScript("bluetooth-device-action"), action, address]
   }
 
+  function devicePropertyCommand(propertyName, dbusPath, value) {
+    return [pluginScript("bluetooth-device-property"), propertyName, dbusPath,
+      typeof value === "boolean" ? (value ? "true" : "false") : String(value)]
+  }
+
   function defaultDeviceActionError(action) {
     if (action === "pair") return "Could not pair with the device"
     if (action === "connect") return "Could not connect to the device"
@@ -506,6 +553,178 @@ Panel {
   function forgetDevice(device) {
     if (!device || !device.address) return
     runDeviceAction(device, "forget", "forgetting")
+  }
+
+  function openDeviceDetails(device) {
+    if (!device || !device.address) return
+    closeAudioProfileMenus(-1)
+    audioProfileMenuOpen = false
+    deviceDetailsAddress = String(device.address)
+    focusedDeviceAddress = String(device.address)
+    deviceDetailsIndex = 0
+    forgetConfirmationOpen = false
+    devicePropertyError = ""
+    Qt.callLater(function() {
+      if (!root.deviceDetailsOpen) return
+      var details = root.deviceDetailsRow
+      detailsNameField.text = details ? String(details.name || details.deviceName || "") : ""
+      detailsScroll.contentY = 0
+      keyCatcher.forceActiveFocus()
+    })
+  }
+
+  function closeDeviceDetails() {
+    if (!deviceDetailsOpen) return
+    forgetConfirmationOpen = false
+    devicePropertyError = ""
+    if (detailsNameField.activeFocus) detailsNameField.focus = false
+    deviceDetailsAddress = ""
+    deviceDetailsIndex = 0
+    reselectFocusedDevice()
+    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function setDeviceDetailsCursor(index) {
+    var count = deviceDetailsActionCount
+    if (count <= 0) {
+      deviceDetailsIndex = 0
+      return
+    }
+    deviceDetailsIndex = Math.max(0, Math.min(count - 1, index))
+    Qt.callLater(function() { detailsScroll.ensureCursorVisible() })
+  }
+
+  function moveDeviceDetailsCursor(delta) {
+    if (deviceDetailsActionCount <= 0) return
+    setDeviceDetailsCursor(deviceDetailsIndex + delta)
+  }
+
+  function beginDeviceRename() {
+    if (!deviceDetailsRow || deviceDetailsControlsBusy) return
+    detailsNameField.text = String(deviceDetailsRow.name || deviceDetailsRow.deviceName || "")
+    detailsNameField.selectAll()
+    detailsNameField.forceActiveFocus()
+  }
+
+  function cancelDeviceRename() {
+    var details = deviceDetailsRow
+    detailsNameField.text = details ? String(details.name || details.deviceName || "") : ""
+    detailsNameField.focus = false
+    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function liveDeviceProperty(device, propertyName) {
+    if (!device) return undefined
+    if (propertyName === "name") return String(device.name || device.deviceName || "").trim()
+    if (propertyName === "trusted") return !!device.trusted
+    if (propertyName === "blocked") return !!device.blocked
+    if (propertyName === "wakeAllowed") return !!device.wakeAllowed
+    return undefined
+  }
+
+  function updateDeviceProperty(propertyName, value, expected, errorMessage) {
+    if (deviceDetailsControlsBusy) return
+    var device = deviceByAddress(deviceDetailsAddress)
+    if (!device) {
+      devicePropertyError = "This device is no longer available."
+      return
+    }
+
+    if (liveDeviceProperty(device, propertyName) === expected) {
+      devicePropertyError = ""
+      return
+    }
+
+    var details = deviceDetailsRow
+    if (!details || !details.dbusPath) {
+      devicePropertyError = "Could not find this device's BlueZ object."
+      return
+    }
+
+    pendingDeviceProperty = {
+      address: String(device.address),
+      dbusPath: String(details.dbusPath),
+      propertyName: String(propertyName),
+      expected: expected,
+      errorMessage: String(errorMessage)
+    }
+    lastExitedDeviceProperty = null
+    devicePropertyStderr = ""
+    devicePropertyError = ""
+    devicePropertyProc.command = devicePropertyCommand(
+      propertyName, details.dbusPath, value)
+    devicePropertyProc.running = true
+  }
+
+  function commitDeviceRename() {
+    var device = deviceByAddress(deviceDetailsAddress)
+    if (!device || deviceDetailsControlsBusy) return
+    var requested = String(detailsNameField.text || "").trim()
+    var expected = requested !== "" ? requested : String(device.deviceName || "").trim()
+    detailsNameField.text = expected
+    detailsNameField.focus = false
+    updateDeviceProperty("name", requested, expected, "Could not rename this device.")
+    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function updateDeviceBoolean(propertyName, value, errorMessage) {
+    updateDeviceProperty(propertyName, !!value, !!value, errorMessage)
+  }
+
+  function confirmDeviceProperty() {
+    var operation = pendingDeviceProperty
+    if (!operation) return
+    var device = deviceByAddress(operation.address)
+    var matches = device
+      && liveDeviceProperty(device, operation.propertyName) === operation.expected
+    pendingDeviceProperty = null
+
+    if (Model.normalizedAddress(deviceDetailsAddress)
+        !== Model.normalizedAddress(operation.address)) return
+    devicePropertyError = matches ? ""
+      : (device ? operation.errorMessage : "This device is no longer available.")
+    if (operation.propertyName === "name" && deviceDetailsRow && !detailsNameField.activeFocus)
+      detailsNameField.text = String(deviceDetailsRow.name || deviceDetailsRow.deviceName || "")
+  }
+
+  function activateDeviceDetailsCursor() {
+    if (!deviceDetailsRow || deviceDetailsControlsBusy) return
+    if (deviceDetailsIndex === 0) beginDeviceRename()
+    else if (deviceDetailsIndex === 1)
+      updateDeviceBoolean("trusted", !deviceDetailsRow.trusted,
+        "Could not update whether this device is trusted.")
+    else if (deviceDetailsIndex === 2)
+      updateDeviceBoolean("blocked", !deviceDetailsRow.blocked,
+        "Could not update whether this device is blocked.")
+    else if (deviceDetailsIndex === 3)
+      updateDeviceBoolean("wakeAllowed", !deviceDetailsRow.wakeAllowed,
+        "Could not change wake permission. This device or adapter may not support it.")
+    else if (deviceDetailsIndex === 4 && deviceDetailsForgetAvailable)
+      requestForgetConfirmation()
+  }
+
+  function requestForgetConfirmation(device) {
+    var address = device && device.address ? String(device.address) : deviceDetailsAddress
+    if (devicePropertyBusy || deviceActionProc.running || pendingAction(address) !== "") return
+    if (device && device.address
+        && Model.normalizedAddress(device.address) !== Model.normalizedAddress(deviceDetailsAddress))
+      openDeviceDetails(device)
+    if (!deviceDetailsForgetAvailable && !device) return
+    forgetConfirmationOpen = true
+    forgetDialog.selectedIndex = 0
+  }
+
+  function cancelForgetConfirmation() {
+    forgetConfirmationOpen = false
+    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function confirmForgetDevice() {
+    if (devicePropertyBusy || deviceActionProc.running) return
+    var device = deviceByAddress(deviceDetailsAddress)
+    forgetConfirmationOpen = false
+    closeDeviceDetails()
+    if (device) forgetDevice(device)
   }
 
   function retryDeviceAction(device) {
@@ -548,7 +767,8 @@ Panel {
       var finishedConnecting = action === "connecting" && found && found.connected
       if (finishedConnecting
           || (action === "disconnecting" && found && !found.connected)
-          || (action === "forgetting" && (!found || (!found.paired && !found.bonded && !found.trusted)))) {
+          || (action === "forgetting" && (!found
+            || (!found.paired && !found.bonded && !found.trusted && !found.blocked)))) {
         delete next[address]
         changed = true
       }
@@ -624,9 +844,8 @@ Panel {
     if (!dev || !dev.address) return actions
     var recovery = recoveryAction(dev.address)
     if (recovery !== "") return [recovery]
-    if (focusSection !== "known" && focusSection !== "connected") return actions
     if (focusSection === "connected" && audioUseActionAvailable(dev)) actions.push("audio")
-    actions.push("forget")
+    actions.push("details")
     if (focusSection === "connected" && audioProfileActionAvailable(dev)) actions.push("profile")
     return actions
   }
@@ -668,8 +887,8 @@ Panel {
       useDeviceForAudio(deviceAt(focusSection, selectedIndex))
       return
     }
-    if (focusedAction === "forget") {
-      deleteSelected()
+    if (focusedAction === "details") {
+      openDeviceDetails(deviceAt(focusSection, selectedIndex))
       return
     }
 
@@ -687,13 +906,14 @@ Panel {
     }
   }
 
-  // 'x' forgets remembered devices. For connected devices the result-aware
-  // helper first disconnects, then removes the BlueZ pairing record.
+  // 'x' opens an explicit confirmation for remembered devices. For connected
+  // devices the result-aware helper then disconnects before removing BlueZ's
+  // pairing record.
   function deleteSelected() {
     if (focusSection !== "known" && focusSection !== "connected") return
     var dev = deviceAt(focusSection, selectedIndex)
     if (!dev) return
-    forgetDevice(dev)
+    requestForgetConfirmation(dev)
   }
 
   onOpenedChanged: {
@@ -713,6 +933,8 @@ Panel {
     } else {
       closeAudioProfileMenus(-1)
       audioProfileMenuOpen = false
+      forgetConfirmationOpen = false
+      if (deviceDetailsOpen) closeDeviceDetails()
     }
   }
 
@@ -950,6 +1172,37 @@ Panel {
   }
 
   Process {
+    id: devicePropertyProc
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var message = String(text || "").trim()
+        root.devicePropertyStderr = message
+        var operation = root.lastExitedDeviceProperty
+        if (message !== "" && operation
+            && Model.normalizedAddress(root.deviceDetailsAddress)
+              === Model.normalizedAddress(operation.address))
+          root.devicePropertyError = message
+      }
+    }
+    onExited: function(exitCode) {
+      var operation = root.pendingDeviceProperty
+      if (!operation) return
+
+      if (exitCode !== 0) {
+        root.lastExitedDeviceProperty = operation
+        root.pendingDeviceProperty = null
+        if (Model.normalizedAddress(root.deviceDetailsAddress)
+            === Model.normalizedAddress(operation.address))
+          root.devicePropertyError = root.devicePropertyStderr || operation.errorMessage
+      } else {
+        root.lastExitedDeviceProperty = null
+        devicePropertyConfirmTimer.restart()
+      }
+    }
+  }
+
+  Process {
     id: audioControlCheckProc
     command: ["test", "-f", root.audioControlManifestPath]
     onExited: function(exitCode) {
@@ -1040,6 +1293,16 @@ Panel {
     }
   }
 
+  // The helper reports the D-Bus result directly. After it succeeds, give
+  // Quickshell time to receive BlueZ's PropertiesChanged signal and verify
+  // that the projected value settled as requested.
+  Timer {
+    id: devicePropertyConfirmTimer
+    interval: 1500
+    repeat: false
+    onTriggered: root.confirmDeviceProperty()
+  }
+
   Timer {
     id: phraseTimer
     interval: 2800
@@ -1128,28 +1391,60 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+    contentHeight: panel.fittedContentHeight(root.deviceDetailsOpen
+      ? detailsColumn.implicitHeight : column.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.audioProfileMenuOpen
+      blocked: root.audioProfileMenuOpen || detailsNameField.activeFocus
       onMoveRequested: function(dx, dy) {
+        if (root.forgetConfirmationOpen) {
+          forgetDialog.selectedIndex = forgetDialog.selectedIndex === 0 ? 1 : 0
+          return
+        }
+        if (root.deviceDetailsOpen) {
+          if (dy !== 0) root.moveDeviceDetailsCursor(dy)
+          else if (dx !== 0) root.moveDeviceDetailsCursor(dx)
+          return
+        }
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
         else if (dx !== 0) root.moveCursorH(dx)
       }
-      onActivateRequested: if (root.cursorActive) root.activateCursor()
-      onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.switchPanel(direction) }
-      onDeleteRequested: if (root.cursorActive) root.deleteSelected()
+      onActivateRequested: {
+        if (root.forgetConfirmationOpen) {
+          if (forgetDialog.selectedIndex === 0) root.cancelForgetConfirmation()
+          else root.confirmForgetDevice()
+        } else if (root.deviceDetailsOpen) root.activateDeviceDetailsCursor()
+        else if (root.cursorActive) root.activateCursor()
+      }
+      onCloseRequested: {
+        if (root.forgetConfirmationOpen) root.cancelForgetConfirmation()
+        else if (root.deviceDetailsOpen) root.closeDeviceDetails()
+        else root.close()
+      }
+      onTabRequested: function(direction) {
+        if (root.forgetConfirmationOpen)
+          forgetDialog.selectedIndex = forgetDialog.selectedIndex === 0 ? 1 : 0
+        else if (root.deviceDetailsOpen) root.moveDeviceDetailsCursor(direction)
+        else root.switchPanel(direction)
+      }
+      onDeleteRequested: {
+        if (root.forgetConfirmationOpen) return
+        if (root.deviceDetailsOpen) {
+          if (root.deviceDetailsForgetAvailable) root.requestForgetConfirmation()
+        } else if (root.cursorActive) root.deleteSelected()
+      }
       onTextKey: function(t) {
-        if (t === "b" || t === "B") root.toggleBluetooth()
+        if (!root.deviceDetailsOpen && !root.forgetConfirmationOpen
+            && (t === "b" || t === "B")) root.toggleBluetooth()
       }
 
       Column {
         id: column
         anchors.fill: parent
+        visible: !root.deviceDetailsOpen
         spacing: Style.space(14)
 
         // ---------- Hero: Bluetooth icon · status ----------
@@ -1367,6 +1662,349 @@ Panel {
           width: parent.width
         }
       }
+
+      Flickable {
+        id: detailsScroll
+        anchors.fill: parent
+        visible: root.deviceDetailsOpen
+        contentWidth: width
+        contentHeight: detailsColumn.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height
+
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+        function cursorItem() {
+          if (root.deviceDetailsIndex === 0) return detailsNameField
+          if (root.deviceDetailsIndex === 1) return trustedToggle
+          if (root.deviceDetailsIndex === 2) return blockedToggle
+          if (root.deviceDetailsIndex === 3) return wakeToggle
+          if (root.deviceDetailsIndex === 4) return forgetDeviceButton
+          return null
+        }
+
+        function ensureCursorVisible() {
+          var target = cursorItem()
+          if (!target || !target.visible || height <= 0) return
+          var point = target.mapToItem(detailsColumn, 0, 0)
+          var margin = Style.space(8)
+          if (point.y < contentY + margin) contentY = Math.max(0, point.y - margin)
+          else if (point.y + target.height > contentY + height - margin)
+            contentY = Math.min(Math.max(0, contentHeight - height),
+              point.y + target.height - height + margin)
+        }
+
+        Column {
+          id: detailsColumn
+          width: detailsScroll.width
+          spacing: Style.space(12)
+
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(backDetailsButton.implicitHeight,
+              detailsDeviceIcon.height, detailsHeading.implicitHeight)
+
+            Button {
+              id: backDetailsButton
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: "←"
+              tooltipText: "Back to Bluetooth devices"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              fontSize: Style.font.heading
+              horizontalPadding: Style.space(6)
+              verticalPadding: Style.space(2)
+              onClicked: root.closeDeviceDetails()
+            }
+
+            BluetoothDeviceIcon {
+              id: detailsDeviceIcon
+              anchors.left: backDetailsButton.right
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(34)
+              height: Style.space(34)
+              iconName: root.deviceDetailsRow ? root.deviceDetailsRow.icon : ""
+              deviceName: root.deviceDetailsRow
+                ? String(root.deviceDetailsRow.name || root.deviceDetailsRow.deviceName || "") : ""
+              connected: root.deviceDetailsRow ? root.deviceDetailsRow.connected : false
+              foreground: root.deviceDetailsRow && root.deviceDetailsRow.blocked
+                ? root.bar.urgent : root.bar.foreground
+              iconSize: Style.font.display
+            }
+
+            Column {
+              id: detailsHeading
+              anchors.left: detailsDeviceIcon.right
+              anchors.leftMargin: Style.space(10)
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(1)
+
+              Text {
+                width: parent.width
+                text: root.deviceDetailsRow
+                  ? (root.deviceLabel(root.deviceDetailsRow) || "Bluetooth device")
+                  : "Device unavailable"
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                text: !root.deviceDetailsRow ? "NO LONGER VISIBLE"
+                  : root.deviceDetailsRow.blocked ? "BLOCKED"
+                  : root.deviceDetailsRow.connected ? "CONNECTED"
+                  : (root.deviceDetailsRow.paired || root.deviceDetailsRow.bonded) ? "PAIRED"
+                  : "AVAILABLE"
+                color: root.deviceDetailsRow && root.deviceDetailsRow.blocked
+                  ? root.bar.urgent : Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.0
+                elide: Text.ElideRight
+              }
+            }
+          }
+
+          PanelSeparator {
+            foreground: root.bar.foreground
+          }
+
+          Text {
+            visible: !root.deviceDetailsRow
+            width: parent.width
+            text: "This Bluetooth device disappeared. It may be out of range or no longer remembered."
+            color: Qt.darker(root.bar.foreground, 1.4)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.body
+            wrapMode: Text.WordWrap
+          }
+
+          Column {
+            visible: !!root.deviceDetailsRow
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              text: "DEVICE NAME"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+            }
+
+            TextField {
+              id: detailsNameField
+              width: parent.width
+              enabled: !!root.deviceDetailsRow && !root.deviceDetailsControlsBusy
+              opacity: enabled ? 1 : 0.55
+              placeholderText: root.deviceDetailsRow
+                ? String(root.deviceDetailsRow.deviceName || "Device name") : "Device name"
+              foreground: root.bar.foreground
+              accent: Color.accent
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              hasCursor: !activeFocus && root.deviceDetailsOpen
+                && !root.forgetConfirmationOpen && root.deviceDetailsIndex === 0
+
+              onHoveredChanged: if (hovered) root.setDeviceDetailsCursor(0)
+              onActiveFocusChanged: if (activeFocus) root.setDeviceDetailsCursor(0)
+              onAccepted: root.commitDeviceRename()
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  root.cancelDeviceRename()
+                  event.accepted = true
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              text: "Press Enter to rename. Leave empty to restore the device's original name."
+              color: Qt.darker(root.bar.foreground, 1.5)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          Toggle {
+            id: trustedToggle
+            visible: !!root.deviceDetailsRow
+            width: parent.width
+            label: "Trusted"
+            description: "Permit this device to reconnect without asking for authorization."
+            checked: !!root.deviceDetailsRow && root.deviceDetailsRow.trusted
+            enabled: !root.deviceDetailsControlsBusy
+            opacity: enabled ? 1 : 0.55
+            foreground: root.bar.foreground
+            accent: Color.accent
+            fontFamily: root.bar.fontFamily
+            hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
+              && root.deviceDetailsIndex === 1
+            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(1) }
+            onClicked: {
+              root.setDeviceDetailsCursor(1)
+              root.updateDeviceBoolean("trusted", !checked,
+                "Could not update whether this device is trusted.")
+            }
+          }
+
+          Toggle {
+            id: blockedToggle
+            visible: !!root.deviceDetailsRow
+            width: parent.width
+            label: "Blocked"
+            description: "Prevent connections from this device. Blocking also disconnects it."
+            checked: !!root.deviceDetailsRow && root.deviceDetailsRow.blocked
+            enabled: !root.deviceDetailsControlsBusy
+            opacity: enabled ? 1 : 0.55
+            foreground: root.bar.foreground
+            accent: Color.accent
+            fontFamily: root.bar.fontFamily
+            hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
+              && root.deviceDetailsIndex === 2
+            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(2) }
+            onClicked: {
+              root.setDeviceDetailsCursor(2)
+              root.updateDeviceBoolean("blocked", !checked,
+                "Could not update whether this device is blocked.")
+            }
+          }
+
+          Toggle {
+            id: wakeToggle
+            visible: !!root.deviceDetailsRow
+            width: parent.width
+            label: "Allow wake"
+            description: "Let this device wake the computer when the device and adapter support it."
+            checked: !!root.deviceDetailsRow && root.deviceDetailsRow.wakeAllowed
+            enabled: !root.deviceDetailsControlsBusy
+            opacity: enabled ? 1 : 0.55
+            foreground: root.bar.foreground
+            accent: Color.accent
+            fontFamily: root.bar.fontFamily
+            hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
+              && root.deviceDetailsIndex === 3
+            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(3) }
+            onClicked: {
+              root.setDeviceDetailsCursor(3)
+              root.updateDeviceBoolean("wakeAllowed", !checked,
+                "Could not change wake permission. This device or adapter may not support it.")
+            }
+          }
+
+          Column {
+            visible: !!root.deviceDetailsRow
+            width: parent.width
+            spacing: Style.space(3)
+
+            PanelSectionHeader {
+              text: "MAC ADDRESS"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              text: root.deviceDetailsRow ? String(root.deviceDetailsRow.address || "—") : "—"
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              font.letterSpacing: 0.8
+              elide: Text.ElideRight
+            }
+          }
+
+          Text {
+            visible: root.deviceDetailsControlsBusy
+            width: parent.width
+            text: root.devicePropertyBusy ? "Saving device setting…" : "Bluetooth operation in progress…"
+            color: Qt.darker(root.bar.foreground, 1.4)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            visible: root.devicePropertyError !== ""
+            width: parent.width
+            text: root.devicePropertyError
+            color: root.bar.urgent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Button {
+            id: forgetDeviceButton
+            visible: root.deviceDetailsForgetAvailable
+            width: parent.width
+            text: "Forget device"
+            iconText: "󰅙"
+            leftAlign: true
+            bordered: true
+            enabled: !root.devicePropertyBusy && !deviceActionProc.running
+            opacity: enabled ? 1 : 0.55
+            foreground: root.bar.urgent
+            accent: root.bar.urgent
+            fontFamily: root.bar.fontFamily
+            hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
+              && root.deviceDetailsIndex === 4
+            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(4) }
+            onClicked: {
+              root.setDeviceDetailsCursor(4)
+              root.requestForgetConfirmation()
+            }
+          }
+        }
+      }
+
+      ConfirmDialog {
+        id: forgetDialog
+        anchors.fill: parent
+        z: 20
+        opened: root.forgetConfirmationOpen
+        message: "Forget “" + (root.deviceDetailsRow
+          ? (root.deviceLabel(root.deviceDetailsRow) || "this device") : "this device")
+          + "”? You will need to pair it again before reconnecting."
+        cancelText: "Cancel"
+        confirmText: "Forget"
+        background: Color.popups.background
+        foreground: root.bar.foreground
+        onCanceled: root.cancelForgetConfirmation()
+        onConfirmed: root.confirmForgetDevice()
+      }
+    }
+  }
+
+  // Device-type icon rendered with the panel's themed font glyphs for
+  // maximum sharpness, visual consistency with the rest of the Omarchy shell,
+  // and reliable high-contrast foreground colorization.
+  component BluetoothDeviceIcon: Item {
+    id: bluetoothIcon
+    property string iconName: ""
+    property string deviceName: ""
+    property bool connected: false
+    property color foreground: Color.foreground
+    property real iconSize: Style.font.heading
+
+    implicitWidth: Style.space(26)
+    implicitHeight: Style.space(26)
+
+    readonly property string glyph: Model.deviceIconGlyph(
+      iconName, deviceName, connected)
+
+    Text {
+      anchors.centerIn: parent
+      text: bluetoothIcon.glyph
+      color: bluetoothIcon.foreground
+      font.family: root.bar.fontFamily
+      font.pixelSize: bluetoothIcon.iconSize
     }
   }
 
@@ -1420,8 +2058,7 @@ Panel {
         : String(deviceAudioSink.name || "") === root.currentAudioSinkName)
 
     readonly property bool rowSelected: root.cursorActive && root.focusSection === sectionName && root.selectedIndex === rowIndex
-    readonly property bool forgetAvailable: (sectionName === "known" || sectionName === "connected") && !isDiscovered
-    readonly property bool showForgetButton: !recoveryVisible && forgetAvailable && (rowMouse.containsMouse || rowSelected)
+    readonly property bool showDetailsButton: !recoveryVisible && (rowMouse.containsMouse || rowSelected)
     readonly property bool showUseAudioButton: !recoveryVisible && useAudioAvailable && (rowMouse.containsMouse || rowSelected)
 
     hasCursor: rowSelected && root.focusedAction === ""
@@ -1436,6 +2073,7 @@ Panel {
       if (action === "forgetting") return "Forgetting…"
       if (action === "disconnecting" || devState === 2) return "Disconnecting…"
       if (actionFailureMessage !== "") return actionFailureMessage
+      if (dev.blocked) return "Blocked"
       if (isConnected) {
         var details = []
         if (usingForAudio) details.push("Default audio")
@@ -1451,6 +2089,7 @@ Panel {
 
     readonly property color statusColor: {
       if (actionFailureMessage !== "") return root.bar.urgent
+      if (dev && dev.blocked) return root.bar.urgent
       if (isConnected) return root.bar.foreground
       if (action !== "" || devState === 3 || dev.pairing === true) return root.bar.foreground
       return Qt.darker(root.bar.foreground, 1.5)
@@ -1476,8 +2115,7 @@ Panel {
         var dev = root.deviceFor(row)
         if (!dev) return
         if (mouse.button === Qt.RightButton) {
-          if (row.isConnected) root.disconnectDevice(dev)
-          else if (!row.isDiscovered) root.forgetDevice(dev)
+          root.openDeviceDetails(dev)
           return
         }
         if (row.isConnected) root.disconnectDevice(dev)
@@ -1499,15 +2137,18 @@ Panel {
       anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(10)
       implicitHeight: Math.max(deviceIcon.implicitHeight, info.implicitHeight,
-        profileDropdown.implicitHeight, forgetBtn.implicitHeight,
+        profileDropdown.implicitHeight, detailsBtn.implicitHeight,
         useAudioBtn.implicitHeight, recoveryBtn.implicitHeight)
 
-      Text {
+      BluetoothDeviceIcon {
         id: deviceIcon
-        text: row.isConnected ? "󰂱" : "󰂯"
-        color: row.statusColor
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.heading
+        width: Style.space(26)
+        height: Style.space(26)
+        iconName: row.dev ? String(row.dev.icon || "") : ""
+        deviceName: row.dev ? String(row.dev.name || row.dev.deviceName || "") : ""
+        connected: row.isConnected
+        foreground: row.statusColor
+        iconSize: Style.font.heading
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
       }
@@ -1518,10 +2159,10 @@ Panel {
         anchors.left: deviceIcon.right
         anchors.leftMargin: Style.space(10)
         anchors.right: useAudioBtn.visible ? useAudioBtn.left
-          : (forgetBtn.visible ? forgetBtn.left
+          : (detailsBtn.visible ? detailsBtn.left
           : (profileDropdown.visible ? profileDropdown.left
           : (recoveryBtn.visible ? recoveryBtn.left : parent.right)))
-        anchors.rightMargin: profileDropdown.visible || forgetBtn.visible
+        anchors.rightMargin: profileDropdown.visible || detailsBtn.visible
           || useAudioBtn.visible || recoveryBtn.visible ? Style.space(8) : 0
         anchors.verticalCenter: parent.verticalCenter
 
@@ -1594,41 +2235,41 @@ Panel {
       }
 
       PanelActionButton {
-        id: forgetBtn
+        id: detailsBtn
         anchors.right: profileDropdown.visible ? profileDropdown.left
           : (recoveryBtn.visible ? recoveryBtn.left : parent.right)
         anchors.rightMargin: profileDropdown.visible || recoveryBtn.visible ? Style.space(6) : 0
         anchors.verticalCenter: parent.verticalCenter
-        visible: row.showForgetButton
-        iconText: "󰅙"
-        tooltipText: "Forget"
+        visible: row.showDetailsButton
+        iconText: "󰒓"
+        tooltipText: "Device details"
         foreground: root.bar.foreground
         hoverColor: root.bar.foreground
         fontFamily: root.bar.fontFamily
-        hasCursor: row.rowSelected && root.focusedAction === "forget"
+        hasCursor: row.rowSelected && root.focusedAction === "details"
         onHovered: function(isHovered) {
           if (!isHovered) {
-            if (rowMouse.containsMouse && root.focusedAction === "forget") root.focusedAction = ""
+            if (rowMouse.containsMouse && root.focusedAction === "details") root.focusedAction = ""
             return
           }
           root.cursorActive = true
           root.focusSection = row.sectionName
           root.selectedIndex = row.rowIndex
-          root.focusedAction = "forget"
+          root.focusedAction = "details"
         }
         onClicked: {
           var dev = root.deviceFor(row)
           if (!dev) return
-          root.forgetDevice(dev)
+          root.openDeviceDetails(dev)
         }
       }
 
       PanelActionButton {
         id: useAudioBtn
-        anchors.right: forgetBtn.visible ? forgetBtn.left
+        anchors.right: detailsBtn.visible ? detailsBtn.left
           : (profileDropdown.visible ? profileDropdown.left
           : (recoveryBtn.visible ? recoveryBtn.left : parent.right))
-        anchors.rightMargin: forgetBtn.visible || profileDropdown.visible
+        anchors.rightMargin: detailsBtn.visible || profileDropdown.visible
           || recoveryBtn.visible ? Style.space(6) : 0
         anchors.verticalCenter: parent.verticalCenter
         visible: row.showUseAudioButton

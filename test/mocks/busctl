@@ -1,0 +1,19 @@
+#!/bin/bash
+
+[[ -n ${BLUETOOTH_PROPERTY_LOG:-} ]] || {
+  echo "Unexpected busctl call: $*" >&2
+  exit 1
+}
+
+printf '%s\n' "$*" >>"$BLUETOOTH_PROPERTY_LOG"
+
+if [[ ${1:-} != set-property || ${2:-} != org.bluez \
+    || ${4:-} != org.bluez.Device1 ]]; then
+  echo "Unexpected busctl action: $*" >&2
+  exit 1
+fi
+
+if [[ ${5:-} == "${BLUETOOTH_PROPERTY_FAIL_PROPERTY:-}" ]]; then
+  echo "${BLUETOOTH_PROPERTY_FAIL_MESSAGE:-Call failed: org.freedesktop.DBus.Error.InvalidArgs}" >&2
+  exit "${BLUETOOTH_PROPERTY_FAIL_STATUS:-1}"
+fi

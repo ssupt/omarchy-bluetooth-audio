@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "ssupt.bluetooth-audio",
   "name": "Advanced Bluetooth Audio",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "author": "ssupt",
-  "description": "Adds reliable Bluetooth device controls, active codec selection, and per-device audio preferences",
+  "description": "Adds Bluetooth device details, reliable controls, codec selection, and per-device audio preferences",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Advanced Bluetooth Audio",
-    "description": "Adds reliable Bluetooth device controls, active codec selection, and per-device audio preferences",
+    "description": "Adds Bluetooth device details, reliable controls, codec selection, and per-device audio preferences",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right"

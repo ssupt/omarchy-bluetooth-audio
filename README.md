@@ -17,6 +17,12 @@ Pairing and connection operations report the reason when BlueZ rejects them.
 Failed device rows keep a retry action, while an active pairing attempt can be
 cancelled directly from the panel.
 
+Device rows use the device type reported by BlueZ instead of a generic
+Bluetooth symbol. Open a device's details to rename it, manage trust and block
+state, allow supported devices to wake the computer, inspect its MAC address,
+or forget it with confirmation. Device-setting failures are reported in place;
+in particular, Allow wake explains when the device or adapter lacks support.
+
 This is the Bluetooth-panel companion to
 [Advanced Audio Control](https://github.com/ssupt/omarchy-audio-control), which
 provides per-application output routing and the full Devices/Bluetooth settings
@@ -39,8 +45,8 @@ omarchy plugin add https://github.com/ssupt/omarchy-bluetooth-audio.git --enable
 Enabling the plugin replaces the built-in `omarchy.bluetooth` widget in its
 current bar position. Disabling or removing it restores the built-in widget.
 
-Requires `bluetoothctl`, `pactl`, `jq`, `timeout`, and `flock`, all present in a
-standard Omarchy installation.
+Requires `bluetoothctl`, `busctl`, `pactl`, `jq`, `timeout`, and `flock`, all
+present in a standard Omarchy installation.
 
 ## Removing
 
@@ -56,10 +62,14 @@ bar position.
 - Click a device row to connect or disconnect it.
 - Use the audio action on a connected device to make it the default audio device.
 - Click the arrow on a connected audio device to choose its audio mode.
+- Open the gear on any device row, or right-click the row, for device details.
+- In device details, use `j`/`k`, the arrow keys, or Tab to move; press Enter
+  to edit or toggle, and Escape to return.
 - Failed pairing or connection actions expose a retry button on the device row.
 - Cancel an active pairing attempt with the row's cancel button.
 - Use `j`/`k` or the arrow keys to navigate devices.
-- Use `h`/`l` or Left/Right to reach the audio, forget, and preferred-mode actions.
+- Use `h`/`l` or Left/Right to reach the audio, details, and preferred-mode actions.
+- Press `x` on a remembered device to open the Forget confirmation.
 - Press Enter to activate the selected row or action, and Escape to close.
 
 Profile changes preserve the device's previous volume and mute state. The
