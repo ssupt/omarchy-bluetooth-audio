@@ -82,6 +82,12 @@ Panel {
     if (!configHome) configHome = Quickshell.env("HOME") + "/.config"
     return configHome + "/omarchy/plugins/ssupt.audio-control/manifest.json"
   }
+  readonly property string audioControlRulesPath: {
+    var configHome = Quickshell.env("XDG_CONFIG_HOME")
+    if (!configHome) configHome = Quickshell.env("HOME") + "/.config"
+    return configHome + "/omarchy/audio-rules.json"
+  }
+  property var audioControlAliases: ({})
   property var audioPreferences: Model.parseAudioPreferences("")
   readonly property var audioPluginRegistry: bar && bar.shell ? bar.shell.pluginRegistry : null
   property bool audioControlInstalled: false
@@ -110,6 +116,40 @@ Panel {
 
   function deviceLabel(device) {
     return Model.deviceLabel(device)
+  }
+
+  // The name this panel displays for a device. With the companion enabled
+  // its alias wins — the two plugins must agree on one label per device —
+  // falling back to the BlueZ alias. Node names are tried live first, then
+  // derived from the address so renamed-but-disconnected devices still
+  // resolve (bluez_output pairs use underscores and a .1 suffix, sources
+  // keep colons).
+  function audioControlAliasFor(address) {
+    if (!audioControlInstalled || !address) return ""
+    var keys = []
+    var device = deviceByAddress(address)
+    if (device) {
+      var sink = bluetoothAudioSink(device)
+      if (sink && sink.name) keys.push(String(sink.name))
+      var source = bluetoothAudioSource(device)
+      if (source && source.name) keys.push(String(source.name))
+    }
+    var mac = String(address).trim().toUpperCase().replace(/[^0-9A-F]/g, "")
+    if (mac.length === 12) {
+      keys.push("bluez_output." + mac.match(/../g).join("_") + ".1")
+      keys.push("bluez_input." + String(address).trim())
+    }
+    for (var i = 0; i < keys.length; i++) {
+      var alias = audioControlAliases[keys[i]]
+      if (alias) return String(alias)
+    }
+    return ""
+  }
+
+  function deviceDisplayName(device) {
+    if (!device) return ""
+    var alias = audioControlAliasFor(device.address)
+    return alias !== "" ? alias : Model.deviceLabel(device)
   }
 
   function isUuidLike(value) {
@@ -644,7 +684,8 @@ Panel {
     Qt.callLater(function() {
       if (!root.deviceDetailsOpen) return
       var details = root.deviceDetailsRow
-      detailsNameField.text = details ? String(details.name || details.deviceName || "") : ""
+      detailsNameField.text = details
+        ? (root.deviceDisplayName(details) || String(details.deviceName || "")) : ""
       detailsScroll.contentY = 0
       keyCatcher.forceActiveFocus()
     })
@@ -689,14 +730,16 @@ Panel {
 
   function beginDeviceRename() {
     if (!deviceDetailsRow || deviceDetailsControlsBusy) return
-    detailsNameField.text = String(deviceDetailsRow.name || deviceDetailsRow.deviceName || "")
+    detailsNameField.text = String(root.deviceDisplayName(deviceDetailsRow)
+      || deviceDetailsRow.deviceName || "")
     detailsNameField.selectAll()
     detailsNameField.forceActiveFocus()
   }
 
   function cancelDeviceRename() {
     var details = deviceDetailsRow
-    detailsNameField.text = details ? String(details.name || details.deviceName || "") : ""
+    detailsNameField.text = details
+      ? (root.deviceDisplayName(details) || String(details.deviceName || "")) : ""
     detailsNameField.focus = false
     if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -799,7 +842,8 @@ Panel {
     devicePropertyError = matches ? ""
       : (device ? operation.errorMessage : "This device is no longer available.")
     if (operation.propertyName === "name" && deviceDetailsRow && !detailsNameField.activeFocus)
-      detailsNameField.text = String(deviceDetailsRow.name || deviceDetailsRow.deviceName || "")
+      detailsNameField.text = String(root.deviceDisplayName(deviceDetailsRow)
+      || deviceDetailsRow.deviceName || "")
   }
 
   function activateDeviceDetailsCursor() {
@@ -1400,6 +1444,15 @@ Panel {
     printErrors: false
     onLoaded: root.loadAudioPreferences(text())
     onLoadFailed: root.loadAudioPreferences("")
+    onFileChanged: reload()
+  }
+
+  FileView {
+    path: root.audioControlRulesPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.audioControlAliases = Model.parseDeviceAliases(text())
+    onLoadFailed: root.audioControlAliases = ({})
     onFileChanged: reload()
   }
 
@@ -2053,7 +2106,7 @@ Panel {
               Text {
                 width: parent.width
                 text: root.deviceDetailsRow
-                  ? (root.deviceLabel(root.deviceDetailsRow) || "Bluetooth device")
+                  ? (root.deviceDisplayName(root.deviceDetailsRow) || "Bluetooth device")
                   : "Device unavailable"
                 color: root.bar.foreground
                 font.family: root.bar.fontFamily
@@ -2368,7 +2421,7 @@ Panel {
         z: 20
         opened: root.forgetConfirmationOpen
         message: "Forget “" + (root.deviceDetailsRow
-          ? (root.deviceLabel(root.deviceDetailsRow) || "this device") : "this device")
+          ? (root.deviceDisplayName(root.deviceDetailsRow) || "this device") : "this device")
           + "”? You will need to pair it again before reconnecting."
         cancelText: "Cancel"
         confirmText: "Forget"
@@ -2565,7 +2618,7 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
 
         Text {
-          text: root.deviceLabel(row.dev) || "Device"
+          text: root.deviceDisplayName(row.dev) || "Device"
           color: root.bar.foreground
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.body

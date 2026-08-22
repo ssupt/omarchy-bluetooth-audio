@@ -127,6 +127,21 @@ assert.equal(model.isAudioDevice('input-keyboard', 'Keychron K2'), false)
 assert.equal(model.isAudioDevice('input-mouse', 'MX Master 3S'), false)
 assert.equal(model.isAudioDevice('watch', 'Generic Watch'), false)
 assert.equal(model.isAudioDevice('', ''), false)
+
+const parsedAliases = model.parseDeviceAliases(JSON.stringify({
+  devices: { aliases: {
+    'bluez_output.80_C3_BA_67_04_C0.1': 'Desk headset ',
+    'bluez_input.80:C3:BA:67:04:C0': 'Desk mic',
+    '': 'bogus',
+    'bluez_output.00_00_00_00_00_00.1': 7
+  } }
+}))
+assert.deepEqual(parsedAliases, {
+  'bluez_output.80_C3_BA_67_04_C0.1': 'Desk headset',
+  'bluez_input.80:C3:BA:67:04:C0': 'Desk mic'
+})
+assert.deepEqual(model.parseDeviceAliases('not json'), {})
+assert.deepEqual(model.parseDeviceAliases('{"devices":{"aliases":{}}}'), {})
 assert.equal(model.audioProfileHasInput(duplexState, 'a2dp-sink-aac'), false)
 assert.equal(model.audioProfileHasInput(duplexState, 'headset-head-unit-msbc'), true)
 // A saved duplex preference must be detected so the applier waits for
@@ -296,6 +311,9 @@ assert.match(panelSource, /Model\.isAudioDevice\(/)
 assert.match(panelSource, /syncAudioControlAliases\(/)
 assert.match(panelSource, /audioControlScript\("audio-app-rules"\)/)
 assert.match(panelSource, /"set-alias"/)
+assert.match(panelSource, /parseDeviceAliases\(/)
+assert.match(panelSource, /deviceDisplayName\(/)
+assert.match(panelSource, /audio-rules\.json/)
 assert.doesNotMatch(panelSource, /device\.(?:name|trusted|blocked|wakeAllowed)\s*=/)
 assert.doesNotMatch(panelSource, /execDetached\(deviceCommand/)
 assert.doesNotMatch(panelSource, /\.isSource\b/)

@@ -297,6 +297,32 @@ function isAudioDevice(iconName, name) {
   return false
 }
 
+// Aliases stored by omarchy-audio-control: { devices: { aliases: { <node-name>: <label> } } }.
+// Flattened defensively so a malformed companion file degrades to no aliases
+// instead of breaking labels here.
+function parseDeviceAliases(raw) {
+  var parsed
+  try {
+    parsed = JSON.parse(String(raw || "{}"))
+  } catch (e) {
+    parsed = {}
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = {}
+
+  var devices = parsed.devices
+  if (!devices || typeof devices !== "object" || Array.isArray(devices)) devices = {}
+  var rawAliases = devices.aliases
+  if (!rawAliases || typeof rawAliases !== "object" || Array.isArray(rawAliases)) rawAliases = {}
+
+  var aliases = {}
+  for (var node in rawAliases) {
+    var label = rawAliases[node]
+    if (node !== "" && typeof label === "string" && label.trim() !== "")
+      aliases[node] = label.trim()
+  }
+  return aliases
+}
+
 function sortedByLabel(devices) {
   var list = toArray(devices)
   list.sort(function(a, b) { return deviceLabel(a).localeCompare(deviceLabel(b)) })
@@ -512,6 +538,7 @@ if (typeof module !== "undefined") {
     deviceActionFailure: deviceActionFailure,
     withDeviceActionFailure: withDeviceActionFailure,
     deviceActionReachedState: deviceActionReachedState,
+    parseDeviceAliases: parseDeviceAliases,
     visibleSections: visibleSections,
     sectionDevices: sectionDevices,
     deviceIconGlyph: deviceIconGlyph
