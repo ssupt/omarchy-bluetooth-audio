@@ -2,7 +2,7 @@
 
 # omarchy:summary=Show or update preferences shared by Omarchy audio plugins
 # omarchy:group=audio
-# omarchy:args=[set-default <output|input> <node-name> | set-profile <bluetooth-address> <profile>]
+# omarchy:args=[set-default <output|input> <node-name> | set-profile <bluetooth-address> <profile> | set-policy <bluetooth-address> <manual|output|output-mic>]
 
 set -euo pipefail
 
@@ -10,12 +10,12 @@ preferences_file=${OMARCHY_AUDIO_PREFERENCES_FILE:-${XDG_CONFIG_HOME:-${HOME:?}/
 action=${1:-show}
 
 usage() {
-  echo "Usage: audio-preferences [show | set-default <output|input> <node-name> | set-profile <bluetooth-address> <profile>]" >&2
+  echo "Usage: audio-preferences [show | set-default <output|input> <node-name> | set-profile <bluetooth-address> <profile> | set-policy <bluetooth-address> <manual|output|output-mic>]" >&2
   exit 1
 }
 
 default_preferences() {
-  printf '%s\n' '{"version":1,"defaults":{"output":"","input":""},"bluetoothProfiles":{}}'
+  printf '%s\n' '{"version":1,"defaults":{"output":"","input":""},"bluetoothProfiles":{},"bluetoothAudioPolicies":{}}'
 }
 
 read_preferences() {
@@ -26,6 +26,14 @@ read_preferences() {
       | .defaults.output = (if (.defaults.output | type) == "string" then .defaults.output else "" end)
       | .defaults.input = (if (.defaults.input | type) == "string" then .defaults.input else "" end)
       | .bluetoothProfiles = (if (.bluetoothProfiles | type) == "object" then .bluetoothProfiles else {} end)
+      | .bluetoothAudioPolicies = (
+          (if (.bluetoothAudioPolicies | type) == "object" then .bluetoothAudioPolicies else {} end)
+          | with_entries(
+              .key |= (ascii_downcase | gsub("[^0-9a-f]"; ""))
+              | select(.key | test("^[0-9a-f]{12}$"))
+              | select(.value == "output" or .value == "output-mic")
+            )
+        )
     ' "$preferences_file"
   else
     default_preferences
@@ -75,6 +83,26 @@ case "$action" in
     write_preferences \
       '.version = 1 | .bluetoothProfiles[$address] = $profile' \
       --arg address "$address" --arg profile "$profile"
+    ;;
+  set-policy)
+    (( $# == 3 )) || usage
+    address=${2,,}
+    address=${address//[^0-9a-f]/}
+    policy=$3
+    [[ $address =~ ^[0-9a-f]{12}$ ]] || usage
+    # Manual is the default, so storing it would only obscure the devices
+    # that actually opted into automatic routing.
+    if [[ $policy == manual ]]; then
+      write_preferences \
+        '.version = 1 | .bluetoothAudioPolicies |= del(.[$address])' \
+        --arg address "$address"
+    elif [[ $policy == output || $policy == output-mic ]]; then
+      write_preferences \
+        '.version = 1 | .bluetoothAudioPolicies[$address] = $policy' \
+        --arg address "$address" --arg policy "$policy"
+    else
+      usage
+    fi
     ;;
   *) usage ;;
 esac

@@ -54,7 +54,8 @@ const audioPreferences = model.parseAudioPreferences(JSON.stringify({
 assert.deepEqual(audioPreferences, {
   version: 1,
   defaults: { output: 'bluez_output.00_11_22_33_44_55.1', input: '' },
-  bluetoothProfiles: { '001122334455': 'headset-head-unit-msbc' }
+  bluetoothProfiles: { '001122334455': 'headset-head-unit-msbc' },
+  bluetoothAudioPolicies: {}
 })
 assert.equal(model.preferredAudioProfile(
   audioPreferences, '00-11-22-33-44-55', state.profiles, state.activeProfile
@@ -69,6 +70,70 @@ assert.equal(model.currentAudioProfile(
   audioPreferences, '00:11:22:33:44:55', state.profiles, state.activeProfile,
   'headset-head-unit-msbc'
 ), 'headset-head-unit-msbc')
+
+assert.deepEqual(model.audioPolicyOrder(), ['manual', 'output', 'output-mic'])
+const parsedPolicies = model.parseAudioPreferences(JSON.stringify({
+  bluetoothAudioPolicies: {
+    'AA:BB:CC:DD:EE:FF': 'output',
+    '00-11-22-33-44-55': 'output-mic',
+    '001122334455': 'manual',
+    'zz': 'output',
+    '112233445566': 'bogus',
+    '998877665544': 7
+  }
+}))
+assert.deepEqual(parsedPolicies.bluetoothAudioPolicies, {
+  'aabbccddeeff': 'output',
+  '001122334455': 'output-mic'
+})
+assert.equal(model.deviceAudioPolicy(parsedPolicies, 'AA:BB:CC:DD:EE:FF'), 'output')
+assert.equal(model.deviceAudioPolicy(parsedPolicies, 'aa-bb-cc-dd-ee-ff'), 'output')
+assert.equal(model.deviceAudioPolicy(parsedPolicies, '00:11:22:33:44:55'), 'output-mic')
+assert.equal(model.deviceAudioPolicy(parsedPolicies, '11:22:33:44:55:66'), 'manual')
+assert.equal(model.deviceAudioPolicy({}, '00:11:22:33:44:55'), 'manual')
+assert.equal(model.deviceAudioPolicy(null, ''), 'manual')
+assert.equal(model.isValidAudioPolicy('output'), true)
+assert.equal(model.isValidAudioPolicy('output-mic'), true)
+assert.equal(model.isValidAudioPolicy('manual'), false)
+
+const duplexState = {
+  activeProfile: 'a2dp-sink-aac',
+  activeCodec: 'AAC',
+  card: 'bluez_card.00_11_22_33_44_55',
+  profiles: [
+    { value: 'a2dp-sink-aac', codec: 'AAC', label: 'High fidelity · AAC', hasInput: false },
+    { value: 'headset-head-unit-cvsd', codec: 'CVSD', label: 'Headset + microphone · CVSD', hasInput: true },
+    { value: 'headset-head-unit-msbc', codec: 'mSBC', label: 'Headset + microphone · mSBC', hasInput: true }
+  ]
+}
+const micLessState = {
+  activeProfile: 'a2dp-sink-aac',
+  profiles: [{ value: 'a2dp-sink-aac', codec: 'AAC', label: 'High fidelity · AAC', hasInput: false }]
+}
+const duplex = model.duplexProfileOption(duplexState)
+assert.deepEqual(duplex, {
+  value: 'headset-head-unit-cvsd', label: 'Headset + microphone · CVSD'
+})
+assert.equal(model.duplexProfileOption(micLessState), null)
+assert.equal(model.duplexProfileOption(null), null)
+assert.equal(model.audioProfileHasInput(duplexState, 'a2dp-sink-aac'), false)
+assert.equal(model.audioProfileHasInput(duplexState, 'headset-head-unit-msbc'), true)
+// A saved duplex preference must be detected so the applier waits for
+// WirePlumber's restore instead of switching codecs behind the user's back.
+const savedDuplexPrefs = model.parseAudioPreferences(JSON.stringify({
+  bluetoothProfiles: { '00:11:22:33:44:55': 'headset-head-unit-msbc' }
+}))
+const savedDuplex = model.preferredAudioProfile(
+  savedDuplexPrefs, '00:11:22:33:44:55', model.audioProfileOptions(duplexState), '')
+assert.equal(savedDuplex, 'headset-head-unit-msbc')
+assert.equal(model.audioProfileHasInput(duplexState, savedDuplex), true)
+const savedAacPrefs = model.parseAudioPreferences(JSON.stringify({
+  bluetoothProfiles: { '00:11:22:33:44:55': 'a2dp-sink-aac' }
+}))
+const savedOutputOnly = model.preferredAudioProfile(
+  savedAacPrefs, '00:11:22:33:44:55', model.audioProfileOptions(duplexState), '')
+assert.equal(savedOutputOnly, 'a2dp-sink-aac')
+assert.equal(model.audioProfileHasInput(duplexState, savedOutputOnly), false)
 
 const device = { address: '00:11:22:33:44:55', deviceName: 'Bluetooth Headphones' }
 const detailedDevice = {
@@ -177,6 +242,14 @@ assert.equal(model.deviceIconGlyph('audio-card', 'MiTV-MSSP2', false), '󰍹')
 assert.equal(model.deviceIconGlyph('input-keyboard', 'Keychron K2', false), '󰌌')
 assert.equal(model.deviceIconGlyph('input-mouse', 'MX Master 3S', false), '󰍽')
 assert.equal(model.deviceIconGlyph('input-gaming', 'DualSense', false), '󰊴')
+// Glyph constants are verified against the Nerd Font cmap: the watch entry
+// previously encoded md-sword (U+f04e5) and rendered as a sword.
+assert.deepEqual(
+  [...model.deviceIconGlyph('watch', '', false)].map(c => c.codePointAt(0).toString(16)),
+  ['f0589'])
+assert.deepEqual(
+  [...model.deviceIconGlyph('tablet', '', false)].map(c => c.codePointAt(0).toString(16)),
+  ['f04f6'])
 assert.equal(model.deviceIconGlyph('', 'Unknown Device', true), '󰂱')
 assert.equal(model.deviceIconGlyph('', 'Unknown Device', false), '󰂯')
 
@@ -188,6 +261,24 @@ assert.match(panelSource, /Model\.deviceIconGlyph/)
 assert.match(panelSource, /pluginScript\("bluetooth-device-property"\)/)
 assert.match(panelSource, /id: devicePropertyProc/)
 assert.match(panelSource, /id: forgetDialog/)
+assert.match(panelSource, /queuePolicyApplications\(/)
+assert.match(panelSource, /applyPendingAudioPolicies\(\)/)
+assert.match(panelSource, /id: audioPolicyApplyTimer/)
+assert.match(panelSource, /detailsAudioPolicyIndex/)
+assert.match(panelSource, /id: policyManualButton/)
+assert.match(panelSource, /id: policyOutputButton/)
+assert.match(panelSource, /id: policyMicButton/)
+assert.match(panelSource, /"set-policy"/)
+assert.doesNotMatch(panelSource, /!Model\.isValidAudioPolicy\(policy\)/)
+assert.match(panelSource, /issuePolicyProfileSwitch\(/)
+assert.match(panelSource, /id: policyProfileProc/)
+assert.match(panelSource, /policyEntry\(entry,/)
+assert.match(panelSource, /stableTicks/)
+assert.match(panelSource, /cardSignature/)
+assert.match(panelSource, /pluginScript\("bluetooth-audio-profile-set"\)/)
+assert.doesNotMatch(panelSource, /pluginScript\("audio-profile-set"\)/)
+assert.match(panelSource, /connectPolicyHint/)
+assert.match(panelSource, /Model\.duplexProfileOption\(/)
 assert.doesNotMatch(panelSource, /device\.(?:name|trusted|blocked|wakeAllowed)\s*=/)
 assert.doesNotMatch(panelSource, /execDetached\(deviceCommand/)
 assert.doesNotMatch(panelSource, /\.isSource\b/)
@@ -219,10 +310,12 @@ bluetooth_property_error=$(mktemp)
 shared_preferences=$(mktemp)
 failed_preferences=$(mktemp)
 no_source_preferences=$(mktemp)
+policy_preferences=$(mktemp)
 shared_preferences_lock="${shared_preferences}.lock"
 failed_preferences_lock="${failed_preferences}.lock"
 no_source_preferences_lock="${no_source_preferences}.lock"
-trap 'rm -f "$profile_log" "$profile_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock"' EXIT
+policy_preferences_lock="${policy_preferences}.lock"
+trap 'rm -f "$profile_log" "$profile_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$policy_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock" "$policy_preferences_lock"' EXIT
 printf 'old\n' >"$profile_state"
 
 : >"$bluetooth_action_log"
@@ -364,6 +457,42 @@ fi
   || fail "unsupported Bluetooth wake property error"
 echo "PASS: result-aware Bluetooth device properties"
 
+: >"$bluetooth_property_log"
+OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  "$ROOT/scripts/audio-preferences" set-policy 00:11:22:33:44:55 output-mic
+jq -e '
+  .version == 1
+  and .defaults == {"output":"","input":""}
+  and .bluetoothProfiles == {}
+  and .bluetoothAudioPolicies == {"001122334455":"output-mic"}
+' "$policy_preferences" >/dev/null || fail "connect policy persisted"
+
+OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  "$ROOT/scripts/audio-preferences" set-policy AA-BB-CC-DD-EE-FF output
+jq -e '.bluetoothAudioPolicies == {
+  "001122334455": "output-mic", "aabbccddeeff": "output"
+}' "$policy_preferences" >/dev/null || fail "second connect policy persisted"
+
+OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  "$ROOT/scripts/audio-preferences" set-policy aa:bb:cc:dd:ee:ff manual
+jq -e '.bluetoothAudioPolicies == {"001122334455":"output-mic"}' \
+  "$policy_preferences" >/dev/null || fail "manual connect policy removed the stored entry"
+
+if OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  "$ROOT/scripts/audio-preferences" set-policy 11:22:33:44:55:66 duplex \
+    >/dev/null 2>&1; then
+  fail "invalid connect policy reported success"
+fi
+jq -e '.bluetoothAudioPolicies == {"001122334455":"output-mic"}' \
+  "$policy_preferences" >/dev/null || fail "invalid connect policy changed preferences"
+
+if OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  "$ROOT/scripts/audio-preferences" set-policy zz output \
+    >/dev/null 2>&1; then
+  fail "malformed connect-policy address reported success"
+fi
+echo "PASS: connect-time audio policies persist"
+
 AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
   AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
@@ -492,7 +621,7 @@ echo "PASS: unknown input state is preserved"
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.5.0"
+  and .version == "0.6.0"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

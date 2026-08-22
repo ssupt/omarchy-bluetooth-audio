@@ -13,6 +13,22 @@ on a connected device to make it the default output; a microphone exposed by
 the selected mode becomes the default input at the same time. Audio-mode choices
 are remembered independently for each Bluetooth device by WirePlumber.
 
+Devices can also opt into automatic routing for future connections. Each
+device's details offer an AUDIO ON CONNECT choice: Manual (the default,
+preserving the behavior above), Output, or Output + Microphone. The choice is
+stored per device and applied the next time that device connects.
+
+The Output + Microphone policy accounts for the device's remembered audio
+mode. When the mode is already a headset mode, the device becomes the default
+output and input once that mode is active. When the remembered mode is
+output-only, connecting replaces it with the device's best microphone mode
+through the same persisted selection the audio menu uses — so nothing later
+restores the output-only codec behind the policy's back. The choice stays in
+force while the policy is selected: picking another mode in the audio menu
+works for the current session, and the next connect follows the policy again.
+Devices that offer no microphone mode at all simply provide output, and the
+details page says so.
+
 Pairing and connection operations report the reason when BlueZ rejects them.
 Failed device rows keep a retry action, while an active pairing attempt can be
 cancelled directly from the panel.
@@ -29,10 +45,10 @@ provides per-application output routing and the full Devices/Bluetooth settings
 window. When that companion is enabled, a settings button in this panel opens
 its Bluetooth tab directly.
 
-Both plugins read and write codec and preferred-device choices through
-`~/.config/omarchy/audio-preferences.json`. The file is optional and each plugin
-continues to work on its own; live PipeWire state is used whenever a saved
-device or profile is unavailable.
+Both plugins read and write codec, preferred-device, and connect-policy
+choices through `~/.config/omarchy/audio-preferences.json`. The file is
+optional and each plugin continues to work on its own; live PipeWire state is
+used whenever a saved device or profile is unavailable.
 
 More plugins by `ssupt`: [omarchy-plugins](https://github.com/ssupt/omarchy-plugins).
 
@@ -65,6 +81,8 @@ bar position.
 - Open the gear on any device row, or right-click the row, for device details.
 - In device details, use `j`/`k`, the arrow keys, or Tab to move; press Enter
   to edit or toggle, and Escape to return.
+- In device details, press Enter (or ←/→) on AUDIO ON CONNECT to step through
+  Manual, Output, and Output + Microphone.
 - Failed pairing or connection actions expose a retry button on the device row.
 - Cancel an active pairing attempt with the row's cancel button.
 - Use `j`/`k` or the arrow keys to navigate devices.

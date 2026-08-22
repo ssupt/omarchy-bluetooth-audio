@@ -35,11 +35,30 @@ Panel {
   // sections, and forgetting destroys the BlueZ QObject altogether.
   property string deviceDetailsAddress: ""
   property int deviceDetailsIndex: 0
+  // Cursor stops inside the details page. The audio-policy row sits between
+  // the name field and the toggles; indices are named because inserting or
+  // reordering stops silently breaks every literal elsewhere.
+  readonly property int detailsRenameIndex: 0
+  readonly property int detailsAudioPolicyIndex: 1
+  readonly property int detailsTrustedIndex: 2
+  readonly property int detailsBlockedIndex: 3
+  readonly property int detailsWakeIndex: 4
+  readonly property int detailsForgetIndex: 5
   property bool forgetConfirmationOpen: false
   property var pendingDeviceProperty: null
   property var lastExitedDeviceProperty: null
   property string devicePropertyStderr: ""
   property string devicePropertyError: ""
+
+  // Connect-time audio policies. policyWatchedConnections is the set of
+  // addresses seen connected by the previous diff, so a device entering the
+  // connected list queues its stored policy exactly once per connection —
+  // battery or alias churn that merely rewrites the list must not re-trigger
+  // it. pendingPolicyApplications holds normalized address -> policy while
+  // the device's PipeWire endpoints are still appearing.
+  property var policyWatchedConnections: ({})
+  property var pendingPolicyApplications: ({})
+  property int policyApplicationAttempts: 0
 
   readonly property var adapter: Bluetooth.defaultAdapter
 
@@ -230,7 +249,7 @@ Panel {
       || deviceDetailsRow.bonded || deviceDetailsRow.trusted
       || deviceDetailsRow.blocked)
   readonly property int deviceDetailsActionCount: !deviceDetailsRow ? 0
-    : (deviceDetailsForgetAvailable ? 5 : 4)
+    : (deviceDetailsForgetAvailable ? 6 : 5)
   readonly property bool devicePropertyBusy: pendingDeviceProperty !== null
   readonly property bool deviceDetailsActionBusy: !!activeDeviceAction
     && Model.normalizedAddress(activeDeviceAction.address)
@@ -350,6 +369,59 @@ Panel {
   function audioProfileHasInput(address) {
     var state = audioProfileState(address)
     return Model.audioProfileHasInput(state, state ? state.activeProfile : "")
+  }
+
+  function deviceAudioPolicy(address) {
+    return Model.deviceAudioPolicy(audioPreferences, address)
+  }
+
+  // The write is detached and fast; FileView's change watcher reloads the
+  // file and every policy binding re-evaluates from disk state.
+  // "manual" must pass here even though it is never stored: selecting it
+  // removes the stored entry instead of adding one.
+  function setDeviceAudioPolicy(policy) {
+    if (!deviceDetailsAddress || Model.audioPolicyOrder().indexOf(policy) < 0) return
+    Quickshell.execDetached([
+      pluginScript("audio-preferences"),
+      "set-policy",
+      String(deviceDetailsAddress),
+      String(policy)
+    ])
+  }
+
+  function stepDeviceAudioPolicy(delta) {
+    if (!deviceDetailsAddress) return
+    var order = Model.audioPolicyOrder()
+    var index = order.indexOf(deviceAudioPolicy(deviceDetailsAddress))
+    if (index < 0) index = 0
+    index = ((index + delta) % order.length + order.length) % order.length
+    setDeviceAudioPolicy(order[index])
+  }
+
+  // What AUDIO ON CONNECT will actually do, given the device's real
+  // capabilities and remembered mode. Only a live card can answer whether a
+  // microphone exists at all, so disconnected devices get capability-neutral
+  // copy instead of claims the state cannot back.
+  readonly property string connectPolicyHint: {
+    if (!deviceDetailsRow) return ""
+    var policy = deviceAudioPolicy(deviceDetailsAddress)
+    if (policy === "manual")
+      return "Applied the next time this device connects."
+    if (policy === "output")
+      return "Makes this device the default output the next time it connects."
+
+    var state = audioProfileState(deviceDetailsAddress)
+    if (!state)
+      return "Makes this device the default output and input the next time it connects."
+    var duplex = Model.duplexProfileOption(state)
+    if (!duplex)
+      return "This device has no modes with a microphone; only its output is used on connect."
+    var saved = Model.preferredAudioProfile(audioPreferences, deviceDetailsAddress,
+      Model.audioProfileOptions(state), "")
+    if (saved !== "" && !audioProfileHasInput(state, saved))
+      return "Connects in “" + duplex.label
+        + "” so the microphone is available; this becomes the device's audio mode while the policy is selected."
+    return "Makes this device the default output and input the next time it connects."
   }
 
   function refreshAudioProfiles() {
@@ -689,17 +761,19 @@ Panel {
 
   function activateDeviceDetailsCursor() {
     if (!deviceDetailsRow || deviceDetailsControlsBusy) return
-    if (deviceDetailsIndex === 0) beginDeviceRename()
-    else if (deviceDetailsIndex === 1)
+    if (deviceDetailsIndex === detailsRenameIndex) beginDeviceRename()
+    else if (deviceDetailsIndex === detailsAudioPolicyIndex)
+      stepDeviceAudioPolicy(1)
+    else if (deviceDetailsIndex === detailsTrustedIndex)
       updateDeviceBoolean("trusted", !deviceDetailsRow.trusted,
         "Could not update whether this device is trusted.")
-    else if (deviceDetailsIndex === 2)
+    else if (deviceDetailsIndex === detailsBlockedIndex)
       updateDeviceBoolean("blocked", !deviceDetailsRow.blocked,
         "Could not update whether this device is blocked.")
-    else if (deviceDetailsIndex === 3)
+    else if (deviceDetailsIndex === detailsWakeIndex)
       updateDeviceBoolean("wakeAllowed", !deviceDetailsRow.wakeAllowed,
         "Could not change wake permission. This device or adapter may not support it.")
-    else if (deviceDetailsIndex === 4 && deviceDetailsForgetAvailable)
+    else if (deviceDetailsIndex === detailsForgetIndex && deviceDetailsForgetAvailable)
       requestForgetConfirmation()
   }
 
@@ -746,6 +820,160 @@ Panel {
     setDeviceActionFailure(device.address, "", "")
     if (typeof device.cancelPair === "function") device.cancelPair()
     if (deviceActionProc.running) deviceActionProc.signal(15)
+  }
+
+  // Diff the connected list against the previous pass. Devices already
+  // connected when the panel first sees them — including everything restored
+  // before the shell started — are marked watched without queueing, so a
+  // policy never fires for a connection the user did not just make.
+  function queuePolicyApplications(list) {
+    var watched = {}
+    var queued = cloneMap(pendingPolicyApplications)
+    var changed = false
+
+    for (var i = 0; i < list.length; i++) {
+      var device = list[i]
+      if (!device || !device.address) continue
+      var key = Model.normalizedAddress(device.address)
+      watched[key] = true
+      if (policyWatchedConnections[key] || queued[key]) continue
+      var policy = Model.deviceAudioPolicy(audioPreferences, device.address)
+      if (policy !== "manual") {
+        queued[key] = { policy: policy }
+        changed = true
+      }
+    }
+
+    policyWatchedConnections = watched
+    if (changed) {
+      pendingPolicyApplications = queued
+      policyApplicationAttempts = 0
+    }
+  }
+
+  // Persisted switch used by output-mic policies when the remembered mode
+  // is output-only. Deliberately bluetooth-audio-profile-set and not the
+  // raw card write: the policy replaces the remembered codec outright, so
+  // every store — this plugin's preferences, WirePlumber's device memory,
+  // and the live card — converges on the microphone mode instead of leaving
+  // a stale output-only preference behind that restores it right back.
+  function issuePolicyProfileSwitch(state, duplex) {
+    if (!state || !state.address || !duplex || !duplex.value) return false
+    if (policyProfileProc.running || audioProfileSetProc.running || pendingAudioProfile)
+      return false
+    policyProfileProc.address = String(state.address || "")
+    policyProfileProc.command = [
+      pluginScript("bluetooth-audio-profile-set"),
+      String(state.address),
+      String(duplex.value)
+    ]
+    policyProfileProc.running = true
+    return true
+  }
+
+  function applyPendingAudioPolicies() {
+    var keys = Object.keys(pendingPolicyApplications)
+    if (keys.length === 0) return
+    policyApplicationAttempts += 1
+
+    var next = {}
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i]
+      var entry = pendingPolicyApplications[key]
+      var device = deviceByAddress(key)
+      if (!device || !device.connected) continue
+
+      // Keyboards and mice never grow a PipeWire card; stop holding this
+      // timer open for hardware that cannot satisfy any audio policy.
+      var state = audioProfileState(key)
+      if (!state) {
+        if (policyApplicationAttempts < 16) next[key] = entry
+        continue
+      }
+
+      var sink = bluetoothAudioSink(device)
+      if (!sink) { next[key] = entry; continue }
+
+      if (entry.policy === "output") {
+        if (!entry.outputApplied) setDefaultAudioSink(sink)
+        continue
+      }
+
+      // Output-mic policy: the device must come up in a microphone-capable
+      // mode. A remembered output-only codec is replaced through the
+      // persisted selection path — one write everywhere, nothing left
+      // behind that would restore the old mode right back.
+      if (!entry.outputApplied) setDefaultAudioSink(sink)
+
+      if (audioProfileHasInput(key)) {
+        var source = bluetoothAudioSource(device)
+        if (source && !entry.sourceApplied) {
+          setDefaultAudioSource(source)
+          continue
+        }
+        if (!source && policyApplicationAttempts < 60) {
+          next[key] = policyEntry(entry, { outputApplied: true })
+          continue
+        }
+        continue
+      }
+
+      var duplex = Model.duplexProfileOption(state)
+      if (!duplex) continue
+
+      // A remembered duplex mode means WirePlumber is about to restore it
+      // on its own — wait rather than duplicate the write.
+      var saved = Model.preferredAudioProfile(audioPreferences, key,
+        Model.audioProfileOptions(state), "")
+      if (saved !== "" && audioProfileHasInput(state, saved)) {
+        if (policyApplicationAttempts < 60)
+          next[key] = policyEntry(entry, { outputApplied: true })
+        continue
+      }
+
+      // The bluez5 monitor spends the first seconds of a connection applying
+      // its bluez5.auto-connect properties — commonly A2DP-only, per system
+      // configuration — and tears down any headset mode selected inside that
+      // window before re-picking the A2DP codec. Wait until the card's
+      // profile state stops changing, then switch exactly once.
+      var signature = String(state.activeProfile || "")
+      var listed = state.profiles || []
+      for (var p = 0; p < listed.length; p++)
+        signature += "," + String(listed[p] && listed[p].value || "")
+      if (signature !== entry.cardSignature) {
+        next[key] = policyEntry(entry, { cardSignature: signature, stableTicks: 0 })
+        continue
+      }
+      var stableTicks = (entry.stableTicks || 0) + 1
+      if (stableTicks < 8) {
+        next[key] = policyEntry(entry, { cardSignature: signature, stableTicks: stableTicks })
+        continue
+      }
+
+      if (!entry.switchRequested && issuePolicyProfileSwitch(state, duplex)) {
+        console.info("bluetooth-audio: connect policy switching "
+          + key + " to " + duplex.value)
+        next[key] = policyEntry(entry, { outputApplied: true, switchRequested: true })
+        continue
+      }
+      if (policyApplicationAttempts < 60)
+        next[key] = policyEntry(entry, { outputApplied: true })
+    }
+
+    pendingPolicyApplications = next
+  }
+
+  // Entries are replaced wholesale each tick instead of mutated: cloneMap
+  // copies by reference, so in-place edits would leak between ticks.
+  function policyEntry(entry, patch) {
+    var next = { policy: entry.policy }
+    if (entry.outputApplied) next.outputApplied = true
+    if (entry.sourceApplied) next.sourceApplied = true
+    if (entry.switchRequested) next.switchRequested = true
+    if (entry.cardSignature !== undefined) next.cardSignature = entry.cardSignature
+    if (entry.stableTicks !== undefined) next.stableTicks = entry.stableTicks
+    for (var field in patch) next[field] = patch[field]
+    return next
   }
 
   function syncPendingActions() {
@@ -985,6 +1213,7 @@ Panel {
   onConnectedDevicesChanged: {
     reselectFocusedDevice()
     syncPendingActions()
+    queuePolicyApplications(connectedDevices)
     if (connectedDevices.length === 0) {
       audioProfiles = ({})
       audioProfileReadError = ""
@@ -1251,6 +1480,21 @@ Panel {
     }
   }
 
+  // Background profile switch issued by an output-mic connect policy. Kept
+  // separate from audioProfileSetProc so its outcome never writes the panel's
+  // user-facing mode error: a failed policy quietly degrades to output-only,
+  // and the details page explains why instead.
+  Process {
+    id: policyProfileProc
+    property string address: ""
+    onExited: function(exitCode) {
+      if (exitCode !== 0)
+        console.warn("bluetooth-audio: policy profile switch failed for "
+          + policyProfileProc.address + " exit " + exitCode)
+      audioProfileSettleTimer.restart()
+    }
+  }
+
   Timer {
     id: audioProfileRefreshTimer
     interval: 100
@@ -1281,6 +1525,17 @@ Panel {
       root.pendingAudioProfile = null
       root.audioProfileSetError = "Could not confirm the Bluetooth audio mode"
     }
+  }
+
+  // Connect policies must apply with the panel closed — that is their whole
+  // point — so this timer runs on the bar widget itself, not on panel state.
+  Timer {
+    id: audioPolicyApplyTimer
+    interval: 500
+    running: Object.keys(root.pendingPolicyApplications).length > 0
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.applyPendingAudioPolicies()
   }
 
   Timer {
@@ -1405,7 +1660,14 @@ Panel {
         }
         if (root.deviceDetailsOpen) {
           if (dy !== 0) root.moveDeviceDetailsCursor(dy)
-          else if (dx !== 0) root.moveDeviceDetailsCursor(dx)
+          else if (dx !== 0) {
+            // Left/Right steps through the audio-policy options when the
+            // cursor sits on that row; everywhere else they move stops.
+            if (root.deviceDetailsIndex === root.detailsAudioPolicyIndex)
+              root.stepDeviceAudioPolicy(dx)
+            else
+              root.moveDeviceDetailsCursor(dx)
+          }
           return
         }
         if (!root.cursorActive) { root.cursorActive = true; return }
@@ -1676,11 +1938,12 @@ Panel {
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         function cursorItem() {
-          if (root.deviceDetailsIndex === 0) return detailsNameField
-          if (root.deviceDetailsIndex === 1) return trustedToggle
-          if (root.deviceDetailsIndex === 2) return blockedToggle
-          if (root.deviceDetailsIndex === 3) return wakeToggle
-          if (root.deviceDetailsIndex === 4) return forgetDeviceButton
+          if (root.deviceDetailsIndex === root.detailsRenameIndex) return detailsNameField
+          if (root.deviceDetailsIndex === root.detailsAudioPolicyIndex) return policyManualButton
+          if (root.deviceDetailsIndex === root.detailsTrustedIndex) return trustedToggle
+          if (root.deviceDetailsIndex === root.detailsBlockedIndex) return blockedToggle
+          if (root.deviceDetailsIndex === root.detailsWakeIndex) return wakeToggle
+          if (root.deviceDetailsIndex === root.detailsForgetIndex) return forgetDeviceButton
           return null
         }
 
@@ -1810,10 +2073,10 @@ Panel {
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.body
               hasCursor: !activeFocus && root.deviceDetailsOpen
-                && !root.forgetConfirmationOpen && root.deviceDetailsIndex === 0
+                && !root.forgetConfirmationOpen && root.deviceDetailsIndex === root.detailsRenameIndex
 
-              onHoveredChanged: if (hovered) root.setDeviceDetailsCursor(0)
-              onActiveFocusChanged: if (activeFocus) root.setDeviceDetailsCursor(0)
+              onHoveredChanged: if (hovered) root.setDeviceDetailsCursor(root.detailsRenameIndex)
+              onActiveFocusChanged: if (activeFocus) root.setDeviceDetailsCursor(root.detailsRenameIndex)
               onAccepted: root.commitDeviceRename()
               Keys.onPressed: function(event) {
                 if (event.key === Qt.Key_Escape) {
@@ -1826,6 +2089,97 @@ Panel {
             Text {
               width: parent.width
               text: "Press Enter to rename. Leave empty to restore the device's original name."
+              color: Qt.darker(root.bar.foreground, 1.5)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          Column {
+            visible: !!root.deviceDetailsRow
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              text: "AUDIO ON CONNECT"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              readonly property string activePolicy: root.deviceAudioPolicy(root.deviceDetailsAddress)
+
+              Button {
+                id: policyManualButton
+                selected: parent.activePolicy === "manual"
+                text: "Manual"
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(6)
+                verticalPadding: Style.space(2)
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                enabled: !!root.deviceDetailsRow && !root.deviceDetailsControlsBusy
+                opacity: enabled ? 1 : 0.55
+                hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
+                  && root.deviceDetailsIndex === root.detailsAudioPolicyIndex && selected
+                onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex) }
+                onClicked: {
+                  root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex)
+                  root.setDeviceAudioPolicy("manual")
+                }
+              }
+
+              Button {
+                id: policyOutputButton
+                selected: parent.activePolicy === "output"
+                text: "Output"
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(6)
+                verticalPadding: Style.space(2)
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                enabled: !!root.deviceDetailsRow && !root.deviceDetailsControlsBusy
+                opacity: enabled ? 1 : 0.55
+                hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
+                  && root.deviceDetailsIndex === root.detailsAudioPolicyIndex && selected
+                onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex) }
+                onClicked: {
+                  root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex)
+                  root.setDeviceAudioPolicy("output")
+                }
+              }
+
+              Button {
+                id: policyMicButton
+                selected: parent.activePolicy === "output-mic"
+                text: "Output + Mic"
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(6)
+                verticalPadding: Style.space(2)
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                enabled: !!root.deviceDetailsRow && !root.deviceDetailsControlsBusy
+                opacity: enabled ? 1 : 0.55
+                hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
+                  && root.deviceDetailsIndex === root.detailsAudioPolicyIndex && selected
+                onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex) }
+                onClicked: {
+                  root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex)
+                  root.setDeviceAudioPolicy("output-mic")
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              text: root.connectPolicyHint
               color: Qt.darker(root.bar.foreground, 1.5)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.caption
@@ -1846,10 +2200,10 @@ Panel {
             accent: Color.accent
             fontFamily: root.bar.fontFamily
             hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-              && root.deviceDetailsIndex === 1
-            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(1) }
+              && root.deviceDetailsIndex === root.detailsTrustedIndex
+            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsTrustedIndex) }
             onClicked: {
-              root.setDeviceDetailsCursor(1)
+              root.setDeviceDetailsCursor(root.detailsTrustedIndex)
               root.updateDeviceBoolean("trusted", !checked,
                 "Could not update whether this device is trusted.")
             }
@@ -1868,10 +2222,10 @@ Panel {
             accent: Color.accent
             fontFamily: root.bar.fontFamily
             hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-              && root.deviceDetailsIndex === 2
-            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(2) }
+              && root.deviceDetailsIndex === root.detailsBlockedIndex
+            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsBlockedIndex) }
             onClicked: {
-              root.setDeviceDetailsCursor(2)
+              root.setDeviceDetailsCursor(root.detailsBlockedIndex)
               root.updateDeviceBoolean("blocked", !checked,
                 "Could not update whether this device is blocked.")
             }
@@ -1890,10 +2244,10 @@ Panel {
             accent: Color.accent
             fontFamily: root.bar.fontFamily
             hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-              && root.deviceDetailsIndex === 3
-            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(3) }
+              && root.deviceDetailsIndex === root.detailsWakeIndex
+            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsWakeIndex) }
             onClicked: {
-              root.setDeviceDetailsCursor(3)
+              root.setDeviceDetailsCursor(root.detailsWakeIndex)
               root.updateDeviceBoolean("wakeAllowed", !checked,
                 "Could not change wake permission. This device or adapter may not support it.")
             }
@@ -1954,10 +2308,10 @@ Panel {
             accent: root.bar.urgent
             fontFamily: root.bar.fontFamily
             hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-              && root.deviceDetailsIndex === 4
-            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(4) }
+              && root.deviceDetailsIndex === root.detailsForgetIndex
+            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsForgetIndex) }
             onClicked: {
-              root.setDeviceDetailsCursor(4)
+              root.setDeviceDetailsCursor(root.detailsForgetIndex)
               root.requestForgetConfirmation()
             }
           }
@@ -2211,6 +2565,7 @@ Panel {
         options: row.profileOptions
         hasCursor: row.rowSelected && root.focusedAction === "profile"
         enabled: !audioProfileSetProc.running && !root.pendingAudioProfile
+          && !policyProfileProc.running
         opacity: enabled ? 1 : 0.5
         foreground: root.bar.foreground
         fontFamily: root.bar.fontFamily

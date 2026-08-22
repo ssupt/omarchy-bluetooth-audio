@@ -57,14 +57,40 @@ function parseAudioPreferences(raw) {
     if (key !== "" && typeof profile === "string" && profile !== "") profiles[key] = profile
   }
 
+  var rawPolicies = parsed.bluetoothAudioPolicies
+  if (!rawPolicies || typeof rawPolicies !== "object" || Array.isArray(rawPolicies)) rawPolicies = {}
+  var policies = {}
+  for (var policyAddress in rawPolicies) {
+    var policyKey = normalizedAddress(policyAddress)
+    var policy = rawPolicies[policyAddress]
+    if (policyKey !== "" && isValidAudioPolicy(policy)) policies[policyKey] = policy
+  }
+
   return {
     version: 1,
     defaults: {
       output: typeof defaults.output === "string" ? defaults.output : "",
       input: typeof defaults.input === "string" ? defaults.input : ""
     },
-    bluetoothProfiles: profiles
+    bluetoothProfiles: profiles,
+    bluetoothAudioPolicies: policies
   }
+}
+
+// "manual" is the absence of a policy and is deliberately not stored: an
+// absent entry and an explicit manual choice must behave identically.
+function isValidAudioPolicy(policy) {
+  return policy === "output" || policy === "output-mic"
+}
+
+function audioPolicyOrder() {
+  return ["manual", "output", "output-mic"]
+}
+
+function deviceAudioPolicy(preferences, address) {
+  var policies = preferences && preferences.bluetoothAudioPolicies
+  var policy = policies ? policies[normalizedAddress(address)] : ""
+  return isValidAudioPolicy(policy) ? policy : "manual"
 }
 
 function preferredAudioProfile(preferences, address, options, activeProfile) {
@@ -239,6 +265,21 @@ function audioProfileHasInput(state, profileName) {
   return false
 }
 
+// Best microphone-capable mode, in the priority order pactl reported. An
+// output-mic connect policy falls back to this when the remembered mode is
+// output-only; null means the hardware offers no input at all.
+function duplexProfileOption(state) {
+  if (!state || !Array.isArray(state.profiles)) return null
+  for (var i = 0; i < state.profiles.length; i++) {
+    var profile = state.profiles[i]
+    if (!profile) continue
+    var value = String(profile.value || profile.name || "")
+    if (value !== "" && (profile.hasInput === true || Number(profile.sources || 0) > 0))
+      return { value: value, label: String(profile.label || profile.description || value) }
+  }
+  return null
+}
+
 function sortedByLabel(devices) {
   var list = toArray(devices)
   list.sort(function(a, b) { return deviceLabel(a).localeCompare(deviceLabel(b)) })
@@ -388,7 +429,7 @@ function deviceIconGlyph(iconName, name, isConnected) {
   }
   if (icon.indexOf("tablet") !== -1 || icon.indexOf("touchpad") !== -1
       || label.indexOf("tablet") !== -1 || label.indexOf("touchpad") !== -1) {
-    return "󰟦"
+    return "󰓶"
   }
   if (icon.indexOf("phone") !== -1 || icon.indexOf("smartphone") !== -1 || icon.indexOf("telephony") !== -1
       || label.indexOf("phone") !== -1 || label.indexOf("iphone") !== -1 || label.indexOf("galaxy s") !== -1
@@ -403,7 +444,7 @@ function deviceIconGlyph(iconName, name, isConnected) {
     return "󰄀"
   }
   if (icon.indexOf("watch") !== -1 || icon.indexOf("wearable") !== -1 || label.indexOf("watch") !== -1) {
-    return "󰓥"
+    return "󰖉"
   }
   if (icon.indexOf("printer") !== -1) {
     return "󰐪"
@@ -425,6 +466,9 @@ if (typeof module !== "undefined") {
     isAddressLike: isAddressLike,
     normalizedAddress: normalizedAddress,
     parseAudioPreferences: parseAudioPreferences,
+    isValidAudioPolicy: isValidAudioPolicy,
+    audioPolicyOrder: audioPolicyOrder,
+    deviceAudioPolicy: deviceAudioPolicy,
     preferredAudioProfile: preferredAudioProfile,
     currentAudioProfile: currentAudioProfile,
     preferredAudioNodeName: preferredAudioNodeName,
@@ -440,6 +484,7 @@ if (typeof module !== "undefined") {
     audioProfileOptions: audioProfileOptions,
     audioProfileCodec: audioProfileCodec,
     audioProfileHasInput: audioProfileHasInput,
+    duplexProfileOption: duplexProfileOption,
     sortedByLabel: sortedByLabel,
     deviceRow: deviceRow,
     deviceLists: deviceLists,
