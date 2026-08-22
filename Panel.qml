@@ -248,8 +248,13 @@ Panel {
     && (deviceDetailsRow.connected || deviceDetailsRow.paired
       || deviceDetailsRow.bonded || deviceDetailsRow.trusted
       || deviceDetailsRow.blocked)
+  // Policies target audio hardware; judged from BlueZ's icon class because
+  // PipeWire card state only exists while connected.
+  readonly property bool deviceDetailsIsAudio: !!deviceDetailsRow
+    && Model.isAudioDevice(String(deviceDetailsRow.icon || ""),
+      String(deviceDetailsRow.name || deviceDetailsRow.deviceName || ""))
   readonly property int deviceDetailsActionCount: !deviceDetailsRow ? 0
-    : (deviceDetailsForgetAvailable ? 6 : 5)
+    : (deviceDetailsForgetAvailable ? 6 : 5) - (deviceDetailsIsAudio ? 0 : 1)
   readonly property bool devicePropertyBusy: pendingDeviceProperty !== null
   readonly property bool deviceDetailsActionBusy: !!activeDeviceAction
     && Model.normalizedAddress(activeDeviceAction.address)
@@ -668,7 +673,18 @@ Panel {
 
   function moveDeviceDetailsCursor(delta) {
     if (deviceDetailsActionCount <= 0) return
-    setDeviceDetailsCursor(deviceDetailsIndex + delta)
+    var target = deviceDetailsIndex + delta
+    // The policy row is hidden for non-audio devices; step over the hole
+    // instead of letting the cursor rest on an invisible stop.
+    var guard = 0
+    while (target >= 0 && target < deviceDetailsActionCount
+        && !detailsStopAvailable(target) && guard++ < 6)
+      target += delta
+    setDeviceDetailsCursor(target)
+  }
+
+  function detailsStopAvailable(index) {
+    return index !== detailsAudioPolicyIndex || deviceDetailsIsAudio
   }
 
   function beginDeviceRename() {
@@ -762,7 +778,8 @@ Panel {
   function activateDeviceDetailsCursor() {
     if (!deviceDetailsRow || deviceDetailsControlsBusy) return
     if (deviceDetailsIndex === detailsRenameIndex) beginDeviceRename()
-    else if (deviceDetailsIndex === detailsAudioPolicyIndex)
+    else if (deviceDetailsIndex === detailsAudioPolicyIndex
+        && detailsStopAvailable(detailsAudioPolicyIndex))
       stepDeviceAudioPolicy(1)
     else if (deviceDetailsIndex === detailsTrustedIndex)
       updateDeviceBoolean("trusted", !deviceDetailsRow.trusted,
@@ -2097,7 +2114,7 @@ Panel {
           }
 
           Column {
-            visible: !!root.deviceDetailsRow
+            visible: !!root.deviceDetailsRow && root.deviceDetailsIsAudio
             width: parent.width
             spacing: Style.space(6)
 

@@ -280,6 +280,23 @@ function duplexProfileOption(state) {
   return null
 }
 
+// Whether connect-time audio policies make sense at all. PipeWire card
+// state only exists while connected, so offline decisions rely on BlueZ's
+// coarse icon class first and the same label hints the glyph picker uses
+// for devices that report a generic icon.
+function isAudioDevice(iconName, name) {
+  var icon = String(iconName || "").toLowerCase().trim()
+  if (icon.indexOf("audio") !== -1) return true
+
+  var label = String(name || "").toLowerCase().trim()
+  var hints = ["headset", "headphone", "earbud", "earphone", "airpod",
+    "buds", "momentum", "speaker", "soundbar"]
+  for (var i = 0; i < hints.length; i++) {
+    if (label.indexOf(hints[i]) !== -1) return true
+  }
+  return false
+}
+
 function sortedByLabel(devices) {
   var list = toArray(devices)
   list.sort(function(a, b) { return deviceLabel(a).localeCompare(deviceLabel(b)) })
@@ -485,6 +502,7 @@ if (typeof module !== "undefined") {
     audioProfileCodec: audioProfileCodec,
     audioProfileHasInput: audioProfileHasInput,
     duplexProfileOption: duplexProfileOption,
+    isAudioDevice: isAudioDevice,
     sortedByLabel: sortedByLabel,
     deviceRow: deviceRow,
     deviceLists: deviceLists,

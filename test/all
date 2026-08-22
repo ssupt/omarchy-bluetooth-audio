@@ -116,6 +116,17 @@ assert.deepEqual(duplex, {
 })
 assert.equal(model.duplexProfileOption(micLessState), null)
 assert.equal(model.duplexProfileOption(null), null)
+
+// Connect policies only apply to audio hardware, judged offline from the
+// BlueZ icon class and the same label hints the glyph picker uses.
+assert.equal(model.isAudioDevice('audio-headset', 'Desk headset'), true)
+assert.equal(model.isAudioDevice('audio-card', ''), true)
+assert.equal(model.isAudioDevice('', 'Galaxy Buds FEee'), true)
+assert.equal(model.isAudioDevice('', 'MOMENTUM 4'), true)
+assert.equal(model.isAudioDevice('input-keyboard', 'Keychron K2'), false)
+assert.equal(model.isAudioDevice('input-mouse', 'MX Master 3S'), false)
+assert.equal(model.isAudioDevice('watch', 'Generic Watch'), false)
+assert.equal(model.isAudioDevice('', ''), false)
 assert.equal(model.audioProfileHasInput(duplexState, 'a2dp-sink-aac'), false)
 assert.equal(model.audioProfileHasInput(duplexState, 'headset-head-unit-msbc'), true)
 // A saved duplex preference must be detected so the applier waits for
@@ -279,6 +290,9 @@ assert.match(panelSource, /pluginScript\("bluetooth-audio-profile-set"\)/)
 assert.doesNotMatch(panelSource, /pluginScript\("audio-profile-set"\)/)
 assert.match(panelSource, /connectPolicyHint/)
 assert.match(panelSource, /Model\.duplexProfileOption\(/)
+assert.match(panelSource, /deviceDetailsIsAudio/)
+assert.match(panelSource, /detailsStopAvailable\(/)
+assert.match(panelSource, /Model\.isAudioDevice\(/)
 assert.doesNotMatch(panelSource, /device\.(?:name|trusted|blocked|wakeAllowed)\s*=/)
 assert.doesNotMatch(panelSource, /execDetached\(deviceCommand/)
 assert.doesNotMatch(panelSource, /\.isSource\b/)
