@@ -744,6 +744,32 @@ Panel {
     devicePropertyProc.running = true
   }
 
+  // With the companion plugin enabled, a rename must also land in its
+  // device-alias store so the Advanced Audio window shows the same label.
+  // That store keys by PipeWire node name, so only live endpoints can be
+  // mirrored — the same devices its own rename flow operates on. An empty
+  // alias deletes the entries, matching the restore-original-name behavior
+  // of the BlueZ write above.
+  function syncAudioControlAliases(address, alias) {
+    if (!audioControlInstalled || !address) return
+    var device = deviceByAddress(address)
+    if (!device) return
+
+    var names = []
+    var sink = bluetoothAudioSink(device)
+    if (sink && sink.name) names.push(String(sink.name))
+    var source = bluetoothAudioSource(device)
+    if (source && source.name) names.push(String(source.name))
+
+    for (var i = 0; i < names.length; i++)
+      Quickshell.execDetached([
+        audioControlScript("audio-app-rules"),
+        "set-alias",
+        names[i],
+        String(alias)
+      ])
+  }
+
   function commitDeviceRename() {
     var device = deviceByAddress(deviceDetailsAddress)
     if (!device || deviceDetailsControlsBusy) return
@@ -752,6 +778,7 @@ Panel {
     detailsNameField.text = expected
     detailsNameField.focus = false
     updateDeviceProperty("name", requested, expected, "Could not rename this device.")
+    syncAudioControlAliases(device.address, requested)
     if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 

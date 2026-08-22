@@ -43,7 +43,8 @@ This is the Bluetooth-panel companion to
 [Advanced Audio Control](https://github.com/ssupt/omarchy-audio-control), which
 provides per-application output routing and the full Devices/Bluetooth settings
 window. When that companion is enabled, a settings button in this panel opens
-its Bluetooth tab directly.
+its Bluetooth tab directly, and renaming a device here also updates the name
+shown in the companion's device list.
 
 Both plugins read and write codec, preferred-device, and connect-policy
 choices through `~/.config/omarchy/audio-preferences.json`. The file is
