@@ -1,6 +1,5 @@
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import Quickshell.Bluetooth
@@ -49,16 +48,7 @@ Panel {
   property var lastExitedDeviceProperty: null
   property string devicePropertyStderr: ""
   property string devicePropertyError: ""
-
-  // Connect-time audio policies. policyWatchedConnections is the set of
-  // addresses seen connected by the previous diff, so a device entering the
-  // connected list queues its stored policy exactly once per connection —
-  // battery or alias churn that merely rewrites the list must not re-trigger
-  // it. pendingPolicyApplications holds normalized address -> policy while
-  // the device's PipeWire endpoints are still appearing.
-  property var policyWatchedConnections: ({})
-  property var pendingPolicyApplications: ({})
-  property int policyApplicationAttempts: 0
+  property var pendingAudioPolicy: null
 
   readonly property var adapter: Bluetooth.defaultAdapter
 
@@ -89,6 +79,7 @@ Panel {
   }
   property var audioControlAliases: ({})
   property var audioPreferences: Model.parseAudioPreferences("")
+  property bool audioPreferencesReady: false
   readonly property var audioPluginRegistry: bar && bar.shell ? bar.shell.pluginRegistry : null
   property bool audioControlInstalled: false
   onAudioPluginRegistryChanged: Qt.callLater(function() { root.refreshAudioControlInstalled() })
@@ -104,6 +95,12 @@ Panel {
   property var pendingAudioProfile: null
   property var unconfirmedAudioProfile: null
   property bool audioProfileMenuOpen: false
+  readonly property bool userAudioProfileChangeBusy: audioProfileSetProc.running
+    || pendingAudioProfile !== null
+  readonly property bool audioProfileChangeBusy: userAudioProfileChangeBusy
+    || policyEngine.profileSwitchBusy
+  readonly property bool audioProfilesNeeded: connectedDevices.length > 0
+    && (opened || policyEngine.hasPending)
 
   function pluginScript(name) {
     var url = String(Qt.resolvedUrl("scripts/" + name))
@@ -112,10 +109,6 @@ Panel {
 
   function audioControlScript(name) {
     return audioControlManifestPath.replace(/\/manifest\.json$/, "") + "/scripts/" + name
-  }
-
-  function deviceLabel(device) {
-    return Model.deviceLabel(device)
   }
 
   // The name this panel displays for a device. With the companion enabled
@@ -134,10 +127,11 @@ Panel {
       var source = bluetoothAudioSource(device)
       if (source && source.name) keys.push(String(source.name))
     }
-    var mac = String(address).trim().toUpperCase().replace(/[^0-9A-F]/g, "")
+    var mac = Model.normalizedAddress(address).toUpperCase()
     if (mac.length === 12) {
-      keys.push("bluez_output." + mac.match(/../g).join("_") + ".1")
-      keys.push("bluez_input." + String(address).trim())
+      var octets = mac.match(/../g)
+      keys.push("bluez_output." + octets.join("_") + ".1")
+      keys.push("bluez_input." + octets.join(":"))
     }
     for (var i = 0; i < keys.length; i++) {
       var alias = audioControlAliases[keys[i]]
@@ -150,18 +144,6 @@ Panel {
     if (!device) return ""
     var alias = audioControlAliasFor(device.address)
     return alias !== "" ? alias : Model.deviceLabel(device)
-  }
-
-  function isUuidLike(value) {
-    return Model.isUuidLike(value)
-  }
-
-  function isAddressLike(value) {
-    return Model.isAddressLike(value)
-  }
-
-  function hasHumanName(device) {
-    return Model.hasHumanName(device)
   }
 
   readonly property var deviceGroups: Model.deviceLists(devices)
@@ -293,15 +275,22 @@ Panel {
   readonly property bool deviceDetailsIsAudio: !!deviceDetailsRow
     && Model.isAudioDevice(String(deviceDetailsRow.icon || ""),
       String(deviceDetailsRow.name || deviceDetailsRow.deviceName || ""))
-  readonly property int deviceDetailsActionCount: !deviceDetailsRow ? 0
-    : (deviceDetailsForgetAvailable ? 6 : 5) - (deviceDetailsIsAudio ? 0 : 1)
+  readonly property var deviceDetailsStops: !deviceDetailsRow ? []
+    : Model.deviceDetailsStops(deviceDetailsIsAudio, deviceDetailsForgetAvailable)
   readonly property bool devicePropertyBusy: pendingDeviceProperty !== null
+  readonly property bool audioPolicyPreferenceBusy: pendingAudioPolicy !== null
+  readonly property bool deviceActionBusy: deviceActionProc.running
   readonly property bool deviceDetailsActionBusy: !!activeDeviceAction
     && Model.normalizedAddress(activeDeviceAction.address)
       === Model.normalizedAddress(deviceDetailsAddress)
   readonly property bool deviceDetailsControlsBusy: devicePropertyBusy
-    || deviceDetailsActionBusy || pendingAction(deviceDetailsAddress) !== ""
-  onDeviceDetailsActionCountChanged: if (deviceDetailsOpen)
+    || audioPolicyPreferenceBusy || deviceDetailsActionBusy
+    || pendingAction(deviceDetailsAddress) !== ""
+  readonly property string deviceDetailsBusyText: devicePropertyBusy
+    ? "Saving device setting…"
+    : (audioPolicyPreferenceBusy ? "Saving audio policy…"
+      : "Bluetooth operation in progress…")
+  onDeviceDetailsStopsChanged: if (deviceDetailsOpen)
     setDeviceDetailsCursor(deviceDetailsIndex)
 
   // Live BlueZ device behind a row. Rows carry primitives only, so actions
@@ -362,6 +351,7 @@ Panel {
 
   function loadAudioPreferences(raw) {
     audioPreferences = Model.parseAudioPreferences(raw)
+    audioPreferencesReady = true
   }
 
   function refreshAudioControlInstalled() {
@@ -411,27 +401,34 @@ Panel {
       && String(state ? state.activeProfile || "" : "") !== String(options[0].value)
   }
 
-  function audioProfileHasInput(address) {
+  function activeAudioProfileHasInput(address) {
     var state = audioProfileState(address)
     return Model.audioProfileHasInput(state, state ? state.activeProfile : "")
   }
 
   function deviceAudioPolicy(address) {
+    if (pendingAudioPolicy
+        && Model.normalizedAddress(pendingAudioPolicy.address)
+          === Model.normalizedAddress(address))
+      return pendingAudioPolicy.policy
     return Model.deviceAudioPolicy(audioPreferences, address)
   }
 
-  // The write is detached and fast; FileView's change watcher reloads the
-  // file and every policy binding re-evaluates from disk state.
-  // "manual" must pass here even though it is never stored: selecting it
-  // removes the stored entry instead of adding one.
   function setDeviceAudioPolicy(policy) {
-    if (!deviceDetailsAddress || Model.audioPolicyOrder().indexOf(policy) < 0) return
-    Quickshell.execDetached([
+    if (!deviceDetailsAddress || pendingAudioPolicy
+        || Model.audioPolicyOrder().indexOf(policy) < 0) return
+    pendingAudioPolicy = {
+      address: String(deviceDetailsAddress),
+      policy: String(policy)
+    }
+    devicePropertyError = ""
+    audioPolicyPreferenceProc.command = [
       pluginScript("audio-preferences"),
       "set-policy",
       String(deviceDetailsAddress),
       String(policy)
-    ])
+    ]
+    audioPolicyPreferenceProc.running = true
   }
 
   function stepDeviceAudioPolicy(delta) {
@@ -451,7 +448,7 @@ Panel {
     if (!deviceDetailsRow) return ""
     var policy = deviceAudioPolicy(deviceDetailsAddress)
     if (policy === "manual")
-      return "Applied the next time this device connects."
+      return "Leaves audio routing unchanged when this device connects."
     if (policy === "output")
       return "Makes this device the default output the next time it connects."
 
@@ -463,14 +460,14 @@ Panel {
       return "This device has no modes with a microphone; only its output is used on connect."
     var saved = Model.preferredAudioProfile(audioPreferences, deviceDetailsAddress,
       Model.audioProfileOptions(state), "")
-    if (saved !== "" && !audioProfileHasInput(state, saved))
+    if (saved !== "" && !Model.audioProfileHasInput(state, saved))
       return "Connects in “" + duplex.label
         + "” so the microphone is available; this becomes the device's audio mode while the policy is selected."
     return "Makes this device the default output and input the next time it connects."
   }
 
   function refreshAudioProfiles() {
-    if (!opened || connectedDevices.length === 0 || audioProfilesProc.running) return
+    if (!audioProfilesNeeded || audioProfilesProc.running) return
     audioProfilesProc.running = true
   }
 
@@ -582,7 +579,7 @@ Panel {
     // High-fidelity Bluetooth profiles expose output only. Communication
     // profiles also expose a matching microphone; when present, selecting the
     // device for audio makes that source the default as well.
-    var source = audioProfileHasInput(device.address) ? bluetoothAudioSource(device) : null
+    var source = activeAudioProfileHasInput(device.address) ? bluetoothAudioSource(device) : null
     if (source) setDefaultAudioSource(source)
   }
 
@@ -672,6 +669,10 @@ Panel {
     runDeviceAction(device, "forget", "forgetting")
   }
 
+  function restorePanelFocus() {
+    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
   function openDeviceDetails(device) {
     if (!device || !device.address) return
     closeAudioProfileMenus(-1)
@@ -684,9 +685,8 @@ Panel {
     Qt.callLater(function() {
       if (!root.deviceDetailsOpen) return
       var details = root.deviceDetailsRow
-      detailsNameField.text = details
-        ? (root.deviceDisplayName(details) || String(details.deviceName || "")) : ""
-      detailsScroll.contentY = 0
+      deviceDetailsView.reset(details
+        ? (root.deviceDisplayName(details) || String(details.deviceName || "")) : "")
       keyCatcher.forceActiveFocus()
     })
   }
@@ -695,53 +695,55 @@ Panel {
     if (!deviceDetailsOpen) return
     forgetConfirmationOpen = false
     devicePropertyError = ""
-    if (detailsNameField.activeFocus) detailsNameField.focus = false
+    deviceDetailsView.clearNameFocus()
     deviceDetailsAddress = ""
     deviceDetailsIndex = 0
     reselectFocusedDevice()
-    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    restorePanelFocus()
   }
 
   function setDeviceDetailsCursor(index) {
-    var count = deviceDetailsActionCount
-    if (count <= 0) {
+    var stops = deviceDetailsStops
+    if (!stops || stops.length === 0) {
       deviceDetailsIndex = 0
       return
     }
-    deviceDetailsIndex = Math.max(0, Math.min(count - 1, index))
-    Qt.callLater(function() { detailsScroll.ensureCursorVisible() })
+
+    var target = Number(index)
+    if (stops.indexOf(target) < 0) {
+      target = stops[stops.length - 1]
+      for (var i = 0; i < stops.length; i++) {
+        if (stops[i] >= index) { target = stops[i]; break }
+      }
+    }
+    deviceDetailsIndex = target
+    Qt.callLater(function() { deviceDetailsView.ensureCursorVisible() })
   }
 
   function moveDeviceDetailsCursor(delta) {
-    if (deviceDetailsActionCount <= 0) return
-    var target = deviceDetailsIndex + delta
-    // The policy row is hidden for non-audio devices; step over the hole
-    // instead of letting the cursor rest on an invisible stop.
-    var guard = 0
-    while (target >= 0 && target < deviceDetailsActionCount
-        && !detailsStopAvailable(target) && guard++ < 6)
-      target += delta
-    setDeviceDetailsCursor(target)
+    var stops = deviceDetailsStops
+    if (!stops || stops.length === 0) return
+    var position = stops.indexOf(deviceDetailsIndex)
+    if (position < 0) position = 0
+    position = Math.max(0, Math.min(stops.length - 1, position + delta))
+    setDeviceDetailsCursor(stops[position])
   }
 
   function detailsStopAvailable(index) {
-    return index !== detailsAudioPolicyIndex || deviceDetailsIsAudio
+    return deviceDetailsStops.indexOf(index) >= 0
   }
 
   function beginDeviceRename() {
     if (!deviceDetailsRow || deviceDetailsControlsBusy) return
-    detailsNameField.text = String(root.deviceDisplayName(deviceDetailsRow)
-      || deviceDetailsRow.deviceName || "")
-    detailsNameField.selectAll()
-    detailsNameField.forceActiveFocus()
+    deviceDetailsView.beginRename(String(root.deviceDisplayName(deviceDetailsRow)
+      || deviceDetailsRow.deviceName || ""))
   }
 
   function cancelDeviceRename() {
     var details = deviceDetailsRow
-    detailsNameField.text = details
-      ? (root.deviceDisplayName(details) || String(details.deviceName || "")) : ""
-    detailsNameField.focus = false
-    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    deviceDetailsView.finishRename(details
+      ? (root.deviceDisplayName(details) || String(details.deviceName || "")) : "")
+    restorePanelFocus()
   }
 
   function liveDeviceProperty(device, propertyName) {
@@ -763,6 +765,7 @@ Panel {
 
     if (liveDeviceProperty(device, propertyName) === expected) {
       devicePropertyError = ""
+      if (propertyName === "name") syncAudioControlAliases(device.address, String(value))
       return
     }
 
@@ -776,6 +779,7 @@ Panel {
       address: String(device.address),
       dbusPath: String(details.dbusPath),
       propertyName: String(propertyName),
+      value: value,
       expected: expected,
       errorMessage: String(errorMessage)
     }
@@ -816,13 +820,11 @@ Panel {
   function commitDeviceRename() {
     var device = deviceByAddress(deviceDetailsAddress)
     if (!device || deviceDetailsControlsBusy) return
-    var requested = String(detailsNameField.text || "").trim()
+    var requested = deviceDetailsView.renameText().trim()
     var expected = requested !== "" ? requested : String(device.deviceName || "").trim()
-    detailsNameField.text = expected
-    detailsNameField.focus = false
+    deviceDetailsView.finishRename(expected)
     updateDeviceProperty("name", requested, expected, "Could not rename this device.")
-    syncAudioControlAliases(device.address, requested)
-    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    restorePanelFocus()
   }
 
   function updateDeviceBoolean(propertyName, value, errorMessage) {
@@ -837,13 +839,16 @@ Panel {
       && liveDeviceProperty(device, operation.propertyName) === operation.expected
     pendingDeviceProperty = null
 
+    if (matches && operation.propertyName === "name")
+      syncAudioControlAliases(operation.address, String(operation.value))
+
     if (Model.normalizedAddress(deviceDetailsAddress)
         !== Model.normalizedAddress(operation.address)) return
     devicePropertyError = matches ? ""
       : (device ? operation.errorMessage : "This device is no longer available.")
-    if (operation.propertyName === "name" && deviceDetailsRow && !detailsNameField.activeFocus)
-      detailsNameField.text = String(root.deviceDisplayName(deviceDetailsRow)
-      || deviceDetailsRow.deviceName || "")
+    if (operation.propertyName === "name" && deviceDetailsRow)
+      deviceDetailsView.updateNameIfIdle(String(root.deviceDisplayName(deviceDetailsRow)
+        || deviceDetailsRow.deviceName || ""))
   }
 
   function activateDeviceDetailsCursor() {
@@ -873,12 +878,12 @@ Panel {
       openDeviceDetails(device)
     if (!deviceDetailsForgetAvailable && !device) return
     forgetConfirmationOpen = true
-    forgetDialog.selectedIndex = 0
+    deviceDetailsView.resetConfirmation()
   }
 
   function cancelForgetConfirmation() {
     forgetConfirmationOpen = false
-    if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    restorePanelFocus()
   }
 
   function confirmForgetDevice() {
@@ -910,158 +915,15 @@ Panel {
     if (deviceActionProc.running) deviceActionProc.signal(15)
   }
 
-  // Diff the connected list against the previous pass. Devices already
-  // connected when the panel first sees them — including everything restored
-  // before the shell started — are marked watched without queueing, so a
-  // policy never fires for a connection the user did not just make.
-  function queuePolicyApplications(list) {
-    var watched = {}
-    var queued = cloneMap(pendingPolicyApplications)
-    var changed = false
-
-    for (var i = 0; i < list.length; i++) {
-      var device = list[i]
-      if (!device || !device.address) continue
-      var key = Model.normalizedAddress(device.address)
-      watched[key] = true
-      if (policyWatchedConnections[key] || queued[key]) continue
-      var policy = Model.deviceAudioPolicy(audioPreferences, device.address)
-      if (policy !== "manual") {
-        queued[key] = { policy: policy }
-        changed = true
-      }
-    }
-
-    policyWatchedConnections = watched
-    if (changed) {
-      pendingPolicyApplications = queued
-      policyApplicationAttempts = 0
-    }
-  }
-
-  // Persisted switch used by output-mic policies when the remembered mode
-  // is output-only. Deliberately bluetooth-audio-profile-set and not the
-  // raw card write: the policy replaces the remembered codec outright, so
-  // every store — this plugin's preferences, WirePlumber's device memory,
-  // and the live card — converges on the microphone mode instead of leaving
-  // a stale output-only preference behind that restores it right back.
-  function issuePolicyProfileSwitch(state, duplex) {
-    if (!state || !state.address || !duplex || !duplex.value) return false
-    if (policyProfileProc.running || audioProfileSetProc.running || pendingAudioProfile)
-      return false
-    policyProfileProc.address = String(state.address || "")
-    policyProfileProc.command = [
-      pluginScript("bluetooth-audio-profile-set"),
-      String(state.address),
-      String(duplex.value)
-    ]
-    policyProfileProc.running = true
+  // Bar widgets are mirrored per monitor. Only the first live mirror applies
+  // automatic routing, otherwise every monitor would race the same profile and
+  // default-device commands for a single connection.
+  function isAudioPolicyCoordinator() {
+    if (!bar || typeof bar.moduleWidgets !== "function") return true
+    var items = bar.moduleWidgets(moduleName) || []
+    for (var i = 0; i < items.length; i++)
+      if (items[i]) return items[i] === root
     return true
-  }
-
-  function applyPendingAudioPolicies() {
-    var keys = Object.keys(pendingPolicyApplications)
-    if (keys.length === 0) return
-    policyApplicationAttempts += 1
-
-    var next = {}
-    for (var i = 0; i < keys.length; i++) {
-      var key = keys[i]
-      var entry = pendingPolicyApplications[key]
-      var device = deviceByAddress(key)
-      if (!device || !device.connected) continue
-
-      // Keyboards and mice never grow a PipeWire card; stop holding this
-      // timer open for hardware that cannot satisfy any audio policy.
-      var state = audioProfileState(key)
-      if (!state) {
-        if (policyApplicationAttempts < 16) next[key] = entry
-        continue
-      }
-
-      var sink = bluetoothAudioSink(device)
-      if (!sink) { next[key] = entry; continue }
-
-      if (entry.policy === "output") {
-        if (!entry.outputApplied) setDefaultAudioSink(sink)
-        continue
-      }
-
-      // Output-mic policy: the device must come up in a microphone-capable
-      // mode. A remembered output-only codec is replaced through the
-      // persisted selection path — one write everywhere, nothing left
-      // behind that would restore the old mode right back.
-      if (!entry.outputApplied) setDefaultAudioSink(sink)
-
-      if (audioProfileHasInput(key)) {
-        var source = bluetoothAudioSource(device)
-        if (source && !entry.sourceApplied) {
-          setDefaultAudioSource(source)
-          continue
-        }
-        if (!source && policyApplicationAttempts < 60) {
-          next[key] = policyEntry(entry, { outputApplied: true })
-          continue
-        }
-        continue
-      }
-
-      var duplex = Model.duplexProfileOption(state)
-      if (!duplex) continue
-
-      // A remembered duplex mode means WirePlumber is about to restore it
-      // on its own — wait rather than duplicate the write.
-      var saved = Model.preferredAudioProfile(audioPreferences, key,
-        Model.audioProfileOptions(state), "")
-      if (saved !== "" && audioProfileHasInput(state, saved)) {
-        if (policyApplicationAttempts < 60)
-          next[key] = policyEntry(entry, { outputApplied: true })
-        continue
-      }
-
-      // The bluez5 monitor spends the first seconds of a connection applying
-      // its bluez5.auto-connect properties — commonly A2DP-only, per system
-      // configuration — and tears down any headset mode selected inside that
-      // window before re-picking the A2DP codec. Wait until the card's
-      // profile state stops changing, then switch exactly once.
-      var signature = String(state.activeProfile || "")
-      var listed = state.profiles || []
-      for (var p = 0; p < listed.length; p++)
-        signature += "," + String(listed[p] && listed[p].value || "")
-      if (signature !== entry.cardSignature) {
-        next[key] = policyEntry(entry, { cardSignature: signature, stableTicks: 0 })
-        continue
-      }
-      var stableTicks = (entry.stableTicks || 0) + 1
-      if (stableTicks < 8) {
-        next[key] = policyEntry(entry, { cardSignature: signature, stableTicks: stableTicks })
-        continue
-      }
-
-      if (!entry.switchRequested && issuePolicyProfileSwitch(state, duplex)) {
-        console.info("bluetooth-audio: connect policy switching "
-          + key + " to " + duplex.value)
-        next[key] = policyEntry(entry, { outputApplied: true, switchRequested: true })
-        continue
-      }
-      if (policyApplicationAttempts < 60)
-        next[key] = policyEntry(entry, { outputApplied: true })
-    }
-
-    pendingPolicyApplications = next
-  }
-
-  // Entries are replaced wholesale each tick instead of mutated: cloneMap
-  // copies by reference, so in-place edits would leak between ticks.
-  function policyEntry(entry, patch) {
-    var next = { policy: entry.policy }
-    if (entry.outputApplied) next.outputApplied = true
-    if (entry.sourceApplied) next.sourceApplied = true
-    if (entry.switchRequested) next.switchRequested = true
-    if (entry.cardSignature !== undefined) next.cardSignature = entry.cardSignature
-    if (entry.stableTicks !== undefined) next.stableTicks = entry.stableTicks
-    for (var field in patch) next[field] = patch[field]
-    return next
   }
 
   function syncPendingActions() {
@@ -1301,7 +1163,7 @@ Panel {
   onConnectedDevicesChanged: {
     reselectFocusedDevice()
     syncPendingActions()
-    queuePolicyApplications(connectedDevices)
+    policyEngine.observeDevices(devices)
     if (connectedDevices.length === 0) {
       audioProfiles = ({})
       audioProfileReadError = ""
@@ -1310,13 +1172,21 @@ Panel {
       unconfirmedAudioProfile = null
       audioProfilePendingTimeout.stop()
     }
-    else if (opened) audioProfileRefreshTimer.restart()
+    else if (audioProfilesNeeded) audioProfileRefreshTimer.restart()
   }
-  onKnownDevicesChanged: { reselectFocusedDevice(); syncPendingActions() }
-  onDiscoveredDevicesChanged: { reselectFocusedDevice(); syncPendingActions() }
+  onKnownDevicesChanged: {
+    reselectFocusedDevice()
+    syncPendingActions()
+    policyEngine.observeDevices(devices)
+  }
+  onDiscoveredDevicesChanged: {
+    reselectFocusedDevice()
+    syncPendingActions()
+    policyEngine.observeDevices(devices)
+  }
   onVisibleSectionsChanged: clampCursor()
   onPipewireNodesChanged: {
-    if (opened) audioProfileSettleTimer.restart()
+    if (audioProfilesNeeded) audioProfileSettleTimer.restart()
     if (focusedAction === "audio"
         && !audioUseActionAvailable(deviceAt(focusSection, selectedIndex))) focusedAction = ""
   }
@@ -1431,7 +1301,10 @@ Panel {
     if (adapter !== null && adapter.discovering) adapter.discovering = false
   }
 
-  Component.onCompleted: refreshAudioControlInstalled()
+  Component.onCompleted: {
+    refreshAudioControlInstalled()
+    policyEngine.observeDevices(devices)
+  }
 
   Connections {
     target: root.audioPluginRegistry
@@ -1439,12 +1312,30 @@ Panel {
   }
 
   FileView {
+    id: audioPreferencesView
     path: root.audioPreferencesPath
     watchChanges: true
     printErrors: false
     onLoaded: root.loadAudioPreferences(text())
     onLoadFailed: root.loadAudioPreferences("")
     onFileChanged: reload()
+  }
+
+  Process {
+    id: audioPolicyPreferenceProc
+    onExited: function(exitCode) {
+      var operation = root.pendingAudioPolicy
+      if (!operation) return
+      root.pendingAudioPolicy = null
+
+      if (exitCode === 0) {
+        audioPreferencesView.reload()
+        return
+      }
+      if (Model.normalizedAddress(root.deviceDetailsAddress)
+          === Model.normalizedAddress(operation.address))
+        root.devicePropertyError = "Could not save this device's audio policy."
+    }
   }
 
   FileView {
@@ -1577,19 +1468,11 @@ Panel {
     }
   }
 
-  // Background profile switch issued by an output-mic connect policy. Kept
-  // separate from audioProfileSetProc so its outcome never writes the panel's
-  // user-facing mode error: a failed policy quietly degrades to output-only,
-  // and the details page explains why instead.
-  Process {
-    id: policyProfileProc
-    property string address: ""
-    onExited: function(exitCode) {
-      if (exitCode !== 0)
-        console.warn("bluetooth-audio: policy profile switch failed for "
-          + policyProfileProc.address + " exit " + exitCode)
-      audioProfileSettleTimer.restart()
-    }
+  BluetoothAudioPolicyEngine {
+    id: policyEngine
+    controller: root
+    preferencesReady: root.audioPreferencesReady
+    onRefreshRequested: audioProfileRefreshTimer.restart()
   }
 
   Timer {
@@ -1608,8 +1491,8 @@ Panel {
 
   Timer {
     interval: 2000
-    running: root.opened && root.connectedDevices.length > 0
-      && !root.audioProfileMenuOpen && !audioProfileSetProc.running
+    running: root.audioProfilesNeeded && !root.audioProfileMenuOpen
+      && !root.audioProfileChangeBusy
     repeat: true
     onTriggered: root.refreshAudioProfiles()
   }
@@ -1622,17 +1505,6 @@ Panel {
       root.pendingAudioProfile = null
       root.audioProfileSetError = "Could not confirm the Bluetooth audio mode"
     }
-  }
-
-  // Connect policies must apply with the panel closed — that is their whole
-  // point — so this timer runs on the bar widget itself, not on panel state.
-  Timer {
-    id: audioPolicyApplyTimer
-    interval: 500
-    running: Object.keys(root.pendingPolicyApplications).length > 0
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.applyPendingAudioPolicies()
   }
 
   Timer {
@@ -1744,15 +1616,15 @@ Panel {
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
     contentHeight: panel.fittedContentHeight(root.deviceDetailsOpen
-      ? detailsColumn.implicitHeight : column.implicitHeight)
+      ? deviceDetailsView.implicitHeight : column.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.audioProfileMenuOpen || detailsNameField.activeFocus
+      blocked: root.audioProfileMenuOpen || deviceDetailsView.editingName
       onMoveRequested: function(dx, dy) {
         if (root.forgetConfirmationOpen) {
-          forgetDialog.selectedIndex = forgetDialog.selectedIndex === 0 ? 1 : 0
+          deviceDetailsView.toggleConfirmationSelection()
           return
         }
         if (root.deviceDetailsOpen) {
@@ -1773,7 +1645,7 @@ Panel {
       }
       onActivateRequested: {
         if (root.forgetConfirmationOpen) {
-          if (forgetDialog.selectedIndex === 0) root.cancelForgetConfirmation()
+          if (!deviceDetailsView.confirmSelected) root.cancelForgetConfirmation()
           else root.confirmForgetDevice()
         } else if (root.deviceDetailsOpen) root.activateDeviceDetailsCursor()
         else if (root.cursorActive) root.activateCursor()
@@ -1785,7 +1657,7 @@ Panel {
       }
       onTabRequested: function(direction) {
         if (root.forgetConfirmationOpen)
-          forgetDialog.selectedIndex = forgetDialog.selectedIndex === 0 ? 1 : 0
+          deviceDetailsView.toggleConfirmationSelection()
         else if (root.deviceDetailsOpen) root.moveDeviceDetailsCursor(direction)
         else root.switchPanel(direction)
       }
@@ -1917,10 +1789,11 @@ Panel {
           Repeater {
             id: connectedRepeater
             model: root.connectedRows
-            DeviceRow {
+            BluetoothDeviceRow {
               required property var modelData
               required property int index
               width: connectedList.width
+              controller: root
               dev: modelData
               rowIndex: index
               sectionName: "connected"
@@ -1988,8 +1861,9 @@ Panel {
                 fontFamily: root.bar.fontFamily
               }
 
-              DeviceRow {
+              BluetoothDeviceRow {
                 width: parent.width
+                controller: root
                 dev: modelData.dev
                 rowIndex: modelData.indexInSection
                 sectionName: modelData.section
@@ -2022,777 +1896,13 @@ Panel {
         }
       }
 
-      Flickable {
-        id: detailsScroll
+      BluetoothDeviceDetails {
+        id: deviceDetailsView
         anchors.fill: parent
         visible: root.deviceDetailsOpen
-        contentWidth: width
-        contentHeight: detailsColumn.implicitHeight
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-        interactive: contentHeight > height
-
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-
-        function cursorItem() {
-          if (root.deviceDetailsIndex === root.detailsRenameIndex) return detailsNameField
-          if (root.deviceDetailsIndex === root.detailsAudioPolicyIndex) return policyManualButton
-          if (root.deviceDetailsIndex === root.detailsTrustedIndex) return trustedToggle
-          if (root.deviceDetailsIndex === root.detailsBlockedIndex) return blockedToggle
-          if (root.deviceDetailsIndex === root.detailsWakeIndex) return wakeToggle
-          if (root.deviceDetailsIndex === root.detailsForgetIndex) return forgetDeviceButton
-          return null
-        }
-
-        function ensureCursorVisible() {
-          var target = cursorItem()
-          if (!target || !target.visible || height <= 0) return
-          var point = target.mapToItem(detailsColumn, 0, 0)
-          var margin = Style.space(8)
-          if (point.y < contentY + margin) contentY = Math.max(0, point.y - margin)
-          else if (point.y + target.height > contentY + height - margin)
-            contentY = Math.min(Math.max(0, contentHeight - height),
-              point.y + target.height - height + margin)
-        }
-
-        Column {
-          id: detailsColumn
-          width: detailsScroll.width
-          spacing: Style.space(12)
-
-          Item {
-            width: parent.width
-            implicitHeight: Math.max(backDetailsButton.implicitHeight,
-              detailsDeviceIcon.height, detailsHeading.implicitHeight)
-
-            Button {
-              id: backDetailsButton
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              text: "←"
-              tooltipText: "Back to Bluetooth devices"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-              fontSize: Style.font.heading
-              horizontalPadding: Style.space(6)
-              verticalPadding: Style.space(2)
-              onClicked: root.closeDeviceDetails()
-            }
-
-            BluetoothDeviceIcon {
-              id: detailsDeviceIcon
-              anchors.left: backDetailsButton.right
-              anchors.leftMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              width: Style.space(34)
-              height: Style.space(34)
-              iconName: root.deviceDetailsRow ? root.deviceDetailsRow.icon : ""
-              deviceName: root.deviceDetailsRow
-                ? String(root.deviceDetailsRow.name || root.deviceDetailsRow.deviceName || "") : ""
-              connected: root.deviceDetailsRow ? root.deviceDetailsRow.connected : false
-              foreground: root.deviceDetailsRow && root.deviceDetailsRow.blocked
-                ? root.bar.urgent : root.bar.foreground
-              iconSize: Style.font.display
-            }
-
-            Column {
-              id: detailsHeading
-              anchors.left: detailsDeviceIcon.right
-              anchors.leftMargin: Style.space(10)
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(1)
-
-              Text {
-                width: parent.width
-                text: root.deviceDetailsRow
-                  ? (root.deviceDisplayName(root.deviceDetailsRow) || "Bluetooth device")
-                  : "Device unavailable"
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.title
-                font.bold: true
-                elide: Text.ElideRight
-              }
-
-              Text {
-                width: parent.width
-                text: !root.deviceDetailsRow ? "NO LONGER VISIBLE"
-                  : root.deviceDetailsRow.blocked ? "BLOCKED"
-                  : root.deviceDetailsRow.connected ? "CONNECTED"
-                  : (root.deviceDetailsRow.paired || root.deviceDetailsRow.bonded) ? "PAIRED"
-                  : "AVAILABLE"
-                color: root.deviceDetailsRow && root.deviceDetailsRow.blocked
-                  ? root.bar.urgent : Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 1.0
-                elide: Text.ElideRight
-              }
-            }
-          }
-
-          PanelSeparator {
-            foreground: root.bar.foreground
-          }
-
-          Text {
-            visible: !root.deviceDetailsRow
-            width: parent.width
-            text: "This Bluetooth device disappeared. It may be out of range or no longer remembered."
-            color: Qt.darker(root.bar.foreground, 1.4)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.body
-            wrapMode: Text.WordWrap
-          }
-
-          Column {
-            visible: !!root.deviceDetailsRow
-            width: parent.width
-            spacing: Style.space(6)
-
-            PanelSectionHeader {
-              text: "DEVICE NAME"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-            }
-
-            TextField {
-              id: detailsNameField
-              width: parent.width
-              enabled: !!root.deviceDetailsRow && !root.deviceDetailsControlsBusy
-              opacity: enabled ? 1 : 0.55
-              placeholderText: root.deviceDetailsRow
-                ? String(root.deviceDetailsRow.deviceName || "Device name") : "Device name"
-              foreground: root.bar.foreground
-              accent: Color.accent
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.body
-              hasCursor: !activeFocus && root.deviceDetailsOpen
-                && !root.forgetConfirmationOpen && root.deviceDetailsIndex === root.detailsRenameIndex
-
-              onHoveredChanged: if (hovered) root.setDeviceDetailsCursor(root.detailsRenameIndex)
-              onActiveFocusChanged: if (activeFocus) root.setDeviceDetailsCursor(root.detailsRenameIndex)
-              onAccepted: root.commitDeviceRename()
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Escape) {
-                  root.cancelDeviceRename()
-                  event.accepted = true
-                }
-              }
-            }
-
-            Text {
-              width: parent.width
-              text: "Press Enter to rename. Leave empty to restore the device's original name."
-              color: Qt.darker(root.bar.foreground, 1.5)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-          }
-
-          Column {
-            visible: !!root.deviceDetailsRow && root.deviceDetailsIsAudio
-            width: parent.width
-            spacing: Style.space(6)
-
-            PanelSectionHeader {
-              text: "AUDIO ON CONNECT"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-            }
-
-            Row {
-              width: parent.width
-              spacing: Style.space(6)
-
-              readonly property string activePolicy: root.deviceAudioPolicy(root.deviceDetailsAddress)
-
-              Button {
-                id: policyManualButton
-                selected: parent.activePolicy === "manual"
-                text: "Manual"
-                fontSize: Style.font.caption
-                horizontalPadding: Style.space(6)
-                verticalPadding: Style.space(2)
-                foreground: root.bar.foreground
-                accent: Color.accent
-                fontFamily: root.bar.fontFamily
-                enabled: !!root.deviceDetailsRow && !root.deviceDetailsControlsBusy
-                opacity: enabled ? 1 : 0.55
-                hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-                  && root.deviceDetailsIndex === root.detailsAudioPolicyIndex && selected
-                onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex) }
-                onClicked: {
-                  root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex)
-                  root.setDeviceAudioPolicy("manual")
-                }
-              }
-
-              Button {
-                id: policyOutputButton
-                selected: parent.activePolicy === "output"
-                text: "Output"
-                fontSize: Style.font.caption
-                horizontalPadding: Style.space(6)
-                verticalPadding: Style.space(2)
-                foreground: root.bar.foreground
-                accent: Color.accent
-                fontFamily: root.bar.fontFamily
-                enabled: !!root.deviceDetailsRow && !root.deviceDetailsControlsBusy
-                opacity: enabled ? 1 : 0.55
-                hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-                  && root.deviceDetailsIndex === root.detailsAudioPolicyIndex && selected
-                onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex) }
-                onClicked: {
-                  root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex)
-                  root.setDeviceAudioPolicy("output")
-                }
-              }
-
-              Button {
-                id: policyMicButton
-                selected: parent.activePolicy === "output-mic"
-                text: "Output + Mic"
-                fontSize: Style.font.caption
-                horizontalPadding: Style.space(6)
-                verticalPadding: Style.space(2)
-                foreground: root.bar.foreground
-                accent: Color.accent
-                fontFamily: root.bar.fontFamily
-                enabled: !!root.deviceDetailsRow && !root.deviceDetailsControlsBusy
-                opacity: enabled ? 1 : 0.55
-                hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-                  && root.deviceDetailsIndex === root.detailsAudioPolicyIndex && selected
-                onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex) }
-                onClicked: {
-                  root.setDeviceDetailsCursor(root.detailsAudioPolicyIndex)
-                  root.setDeviceAudioPolicy("output-mic")
-                }
-              }
-            }
-
-            Text {
-              width: parent.width
-              text: root.connectPolicyHint
-              color: Qt.darker(root.bar.foreground, 1.5)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-          }
-
-          Toggle {
-            id: trustedToggle
-            visible: !!root.deviceDetailsRow
-            width: parent.width
-            label: "Trusted"
-            description: "Permit this device to reconnect without asking for authorization."
-            checked: !!root.deviceDetailsRow && root.deviceDetailsRow.trusted
-            enabled: !root.deviceDetailsControlsBusy
-            opacity: enabled ? 1 : 0.55
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-              && root.deviceDetailsIndex === root.detailsTrustedIndex
-            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsTrustedIndex) }
-            onClicked: {
-              root.setDeviceDetailsCursor(root.detailsTrustedIndex)
-              root.updateDeviceBoolean("trusted", !checked,
-                "Could not update whether this device is trusted.")
-            }
-          }
-
-          Toggle {
-            id: blockedToggle
-            visible: !!root.deviceDetailsRow
-            width: parent.width
-            label: "Blocked"
-            description: "Prevent connections from this device. Blocking also disconnects it."
-            checked: !!root.deviceDetailsRow && root.deviceDetailsRow.blocked
-            enabled: !root.deviceDetailsControlsBusy
-            opacity: enabled ? 1 : 0.55
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-              && root.deviceDetailsIndex === root.detailsBlockedIndex
-            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsBlockedIndex) }
-            onClicked: {
-              root.setDeviceDetailsCursor(root.detailsBlockedIndex)
-              root.updateDeviceBoolean("blocked", !checked,
-                "Could not update whether this device is blocked.")
-            }
-          }
-
-          Toggle {
-            id: wakeToggle
-            visible: !!root.deviceDetailsRow
-            width: parent.width
-            label: "Allow wake"
-            description: "Let this device wake the computer when the device and adapter support it."
-            checked: !!root.deviceDetailsRow && root.deviceDetailsRow.wakeAllowed
-            enabled: !root.deviceDetailsControlsBusy
-            opacity: enabled ? 1 : 0.55
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-              && root.deviceDetailsIndex === root.detailsWakeIndex
-            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsWakeIndex) }
-            onClicked: {
-              root.setDeviceDetailsCursor(root.detailsWakeIndex)
-              root.updateDeviceBoolean("wakeAllowed", !checked,
-                "Could not change wake permission. This device or adapter may not support it.")
-            }
-          }
-
-          Column {
-            visible: !!root.deviceDetailsRow
-            width: parent.width
-            spacing: Style.space(3)
-
-            PanelSectionHeader {
-              text: "MAC ADDRESS"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-            }
-
-            Text {
-              width: parent.width
-              text: root.deviceDetailsRow ? String(root.deviceDetailsRow.address || "—") : "—"
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.body
-              font.letterSpacing: 0.8
-              elide: Text.ElideRight
-            }
-          }
-
-          Text {
-            visible: root.deviceDetailsControlsBusy
-            width: parent.width
-            text: root.devicePropertyBusy ? "Saving device setting…" : "Bluetooth operation in progress…"
-            color: Qt.darker(root.bar.foreground, 1.4)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.bodySmall
-          }
-
-          Text {
-            visible: root.devicePropertyError !== ""
-            width: parent.width
-            text: root.devicePropertyError
-            color: root.bar.urgent
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
-
-          Button {
-            id: forgetDeviceButton
-            visible: root.deviceDetailsForgetAvailable
-            width: parent.width
-            text: "Forget device"
-            iconText: "󰅙"
-            leftAlign: true
-            bordered: true
-            enabled: !root.devicePropertyBusy && !deviceActionProc.running
-            opacity: enabled ? 1 : 0.55
-            foreground: root.bar.urgent
-            accent: root.bar.urgent
-            fontFamily: root.bar.fontFamily
-            hasCursor: root.deviceDetailsOpen && !root.forgetConfirmationOpen
-              && root.deviceDetailsIndex === root.detailsForgetIndex
-            onHovered: function(on) { if (on) root.setDeviceDetailsCursor(root.detailsForgetIndex) }
-            onClicked: {
-              root.setDeviceDetailsCursor(root.detailsForgetIndex)
-              root.requestForgetConfirmation()
-            }
-          }
-        }
-      }
-
-      ConfirmDialog {
-        id: forgetDialog
-        anchors.fill: parent
-        z: 20
-        opened: root.forgetConfirmationOpen
-        message: "Forget “" + (root.deviceDetailsRow
-          ? (root.deviceDisplayName(root.deviceDetailsRow) || "this device") : "this device")
-          + "”? You will need to pair it again before reconnecting."
-        cancelText: "Cancel"
-        confirmText: "Forget"
-        background: Color.popups.background
-        foreground: root.bar.foreground
-        onCanceled: root.cancelForgetConfirmation()
-        onConfirmed: root.confirmForgetDevice()
+        controller: root
       }
     }
   }
 
-  // Device-type icon rendered with the panel's themed font glyphs for
-  // maximum sharpness, visual consistency with the rest of the Omarchy shell,
-  // and reliable high-contrast foreground colorization.
-  component BluetoothDeviceIcon: Item {
-    id: bluetoothIcon
-    property string iconName: ""
-    property string deviceName: ""
-    property bool connected: false
-    property color foreground: Color.foreground
-    property real iconSize: Style.font.heading
-
-    implicitWidth: Style.space(26)
-    implicitHeight: Style.space(26)
-
-    readonly property string glyph: Model.deviceIconGlyph(
-      iconName, deviceName, connected)
-
-    Text {
-      anchors.centerIn: parent
-      text: bluetoothIcon.glyph
-      color: bluetoothIcon.foreground
-      font.family: root.bar.fontFamily
-      font.pixelSize: bluetoothIcon.iconSize
-    }
-  }
-
-  // Two-line device row showing name + live status. Pending state is owned
-  // by the panel so it survives rows moving between sections.
-  component DeviceRow: CursorSurface {
-    id: row
-    required property var dev
-    required property int rowIndex
-    required property string sectionName
-    required property bool isDiscovered
-
-    readonly property bool isConnected: dev && dev.connected
-    readonly property int devState: dev && dev.state !== undefined ? dev.state : -1
-    readonly property string action: root.pendingAction(dev ? dev.address : "")
-    readonly property var actionFailure: root.deviceActionFailure(dev ? dev.address : "")
-    readonly property string actionFailureMessage: actionFailure
-      ? String(actionFailure.message || "") : ""
-    readonly property string recoveryAction: root.recoveryAction(dev ? dev.address : "")
-    readonly property bool recoveryVisible: recoveryAction !== ""
-    readonly property bool cancellingPair: root.deviceActionCancelRequested
-      && root.activeDeviceAction && dev
-      && Model.normalizedAddress(root.activeDeviceAction.address) === Model.normalizedAddress(dev.address)
-    readonly property string actionTooltip: {
-      if (!dev) return ""
-      if (isConnected) return "Disconnect"
-      if (isDiscovered) return "Pair"
-      return "Connect"
-    }
-
-    readonly property var profileState: root.audioProfileState(dev ? dev.address : "")
-    readonly property var profileOptions: Model.audioProfileOptions(profileState)
-    readonly property bool profileMenuAvailable: root.audioProfileActionAvailable(dev)
-    readonly property string pendingProfileName: {
-      if (!root.pendingAudioProfile || !dev) return ""
-      return root.pendingAudioProfile.address === Model.normalizedAddress(dev.address)
-        ? String(root.pendingAudioProfile.profile || "") : ""
-    }
-    readonly property string currentProfileName: Model.currentAudioProfile(
-      root.audioPreferences, dev ? dev.address : "", profileOptions,
-      profileState ? profileState.activeProfile : "", pendingProfileName)
-    readonly property string activeCodec: Model.audioProfileCodec(
-      profileState, profileState ? profileState.activeProfile : "")
-    readonly property var deviceAudioSink: root.bluetoothAudioSink(dev)
-    readonly property var deviceAudioSource: root.audioProfileHasInput(dev ? dev.address : "")
-      ? root.bluetoothAudioSource(dev) : null
-    readonly property bool useAudioAvailable: isConnected && !!deviceAudioSink
-    readonly property bool usingForAudio: useAudioAvailable
-      && (root.defaultAudioSink
-        ? Model.sameAudioNode(deviceAudioSink, root.defaultAudioSink)
-        : String(deviceAudioSink.name || "") === root.currentAudioSinkName)
-
-    readonly property bool rowSelected: root.cursorActive && root.focusSection === sectionName && root.selectedIndex === rowIndex
-    readonly property bool showDetailsButton: !recoveryVisible && (rowMouse.containsMouse || rowSelected)
-    readonly property bool showUseAudioButton: !recoveryVisible && useAudioAvailable && (rowMouse.containsMouse || rowSelected)
-
-    hasCursor: rowSelected && root.focusedAction === ""
-    current: isConnected
-    foreground: root.bar.foreground
-    fill: root.hoverFill
-    currentFill: root.selectedFill
-
-    readonly property string statusText: {
-      if (!dev) return ""
-      if (cancellingPair) return "Cancelling pairing…"
-      if (action === "forgetting") return "Forgetting…"
-      if (action === "disconnecting" || devState === 2) return "Disconnecting…"
-      if (actionFailureMessage !== "") return actionFailureMessage
-      if (dev.blocked) return "Blocked"
-      if (isConnected) {
-        var details = []
-        if (usingForAudio) details.push("Default audio")
-        if (activeCodec !== "") details.push(activeCodec)
-        if (dev.batteryAvailable) details.push(Math.round(dev.battery * 100) + "%")
-        if (details.length > 0) return details.join(" · ")
-        return sectionName === "connected" ? "" : "Connected"
-      }
-      if (action === "connecting" || devState === 3 || dev.pairing === true) return "Connecting…"
-      if (isDiscovered) return ""
-      return ""
-    }
-
-    readonly property color statusColor: {
-      if (actionFailureMessage !== "") return root.bar.urgent
-      if (dev && dev.blocked) return root.bar.urgent
-      if (isConnected) return root.bar.foreground
-      if (action !== "" || devState === 3 || dev.pairing === true) return root.bar.foreground
-      return Qt.darker(root.bar.foreground, 1.5)
-    }
-
-    implicitHeight: rowContent.implicitHeight + Style.spacing.rowPaddingX
-
-    MouseArea {
-      id: rowMouse
-      anchors.fill: parent
-      hoverEnabled: true
-      acceptedButtons: Qt.LeftButton | Qt.RightButton
-      cursorShape: row.dev ? Qt.PointingHandCursor : Qt.ArrowCursor
-
-      onContainsMouseChanged: if (containsMouse) {
-        root.cursorActive = true
-        root.focusSection = row.sectionName
-        root.selectedIndex = row.rowIndex
-        root.focusedAction = ""
-      }
-
-      onClicked: function(mouse) {
-        var dev = root.deviceFor(row)
-        if (!dev) return
-        if (mouse.button === Qt.RightButton) {
-          root.openDeviceDetails(dev)
-          return
-        }
-        if (row.isConnected) root.disconnectDevice(dev)
-        else root.connectDevice(dev)
-      }
-    }
-
-    PanelToolTip {
-      visible: row.actionTooltip !== "" && rowMouse.containsMouse && root.focusedAction === ""
-      text: row.actionTooltip
-      fontFamily: root.bar.fontFamily
-    }
-
-    Item {
-      id: rowContent
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(10)
-      implicitHeight: Math.max(deviceIcon.implicitHeight, info.implicitHeight,
-        profileDropdown.implicitHeight, detailsBtn.implicitHeight,
-        useAudioBtn.implicitHeight, recoveryBtn.implicitHeight)
-
-      BluetoothDeviceIcon {
-        id: deviceIcon
-        width: Style.space(26)
-        height: Style.space(26)
-        iconName: row.dev ? String(row.dev.icon || "") : ""
-        deviceName: row.dev ? String(row.dev.name || row.dev.deviceName || "") : ""
-        connected: row.isConnected
-        foreground: row.statusColor
-        iconSize: Style.font.heading
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
-      }
-
-      Column {
-        id: info
-        spacing: Style.space(1)
-        anchors.left: deviceIcon.right
-        anchors.leftMargin: Style.space(10)
-        anchors.right: useAudioBtn.visible ? useAudioBtn.left
-          : (detailsBtn.visible ? detailsBtn.left
-          : (profileDropdown.visible ? profileDropdown.left
-          : (recoveryBtn.visible ? recoveryBtn.left : parent.right)))
-        anchors.rightMargin: profileDropdown.visible || detailsBtn.visible
-          || useAudioBtn.visible || recoveryBtn.visible ? Style.space(8) : 0
-        anchors.verticalCenter: parent.verticalCenter
-
-        Text {
-          text: root.deviceDisplayName(row.dev) || "Device"
-          color: root.bar.foreground
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
-          width: parent.width
-        }
-        Text {
-          visible: row.statusText !== ""
-          text: row.statusText
-          color: row.statusColor
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-          width: parent.width
-        }
-      }
-
-      AudioDropdown {
-        id: profileDropdown
-        width: Style.spacing.controlHeight
-        anchors.right: recoveryBtn.visible ? recoveryBtn.left : parent.right
-        anchors.rightMargin: recoveryBtn.visible ? Style.space(6) : 0
-        anchors.verticalCenter: parent.verticalCenter
-        visible: row.profileMenuAvailable && !row.recoveryVisible
-        rowHeight: Style.spacing.controlHeight
-        popupRowHeight: Style.space(36)
-        popupDirection: {
-          var position = root.bar ? root.bar.position : "left"
-          if (position === "top") return "down"
-          if (position === "bottom") return "up"
-          return position === "right" ? "left" : "right"
-        }
-        popupSideAlignment: "center"
-        popupAnchorHeight: row.height
-        popupWidth: Style.space(300)
-        popupGap: Style.space(6)
-        chevronOnly: true
-        triggerChrome: hasCursor
-        tooltipText: "Preferred audio mode"
-        value: row.currentProfileName
-        options: row.profileOptions
-        hasCursor: row.rowSelected && root.focusedAction === "profile"
-        enabled: !audioProfileSetProc.running && !root.pendingAudioProfile
-          && !policyProfileProc.running
-        opacity: enabled ? 1 : 0.5
-        foreground: root.bar.foreground
-        fontFamily: root.bar.fontFamily
-
-        onHovered: function(isHovered) {
-          if (!isHovered) {
-            if (rowMouse.containsMouse && root.focusedAction === "profile") root.focusedAction = ""
-            return
-          }
-          root.cursorActive = true
-          root.focusSection = row.sectionName
-          root.selectedIndex = row.rowIndex
-          root.focusedAction = "profile"
-        }
-        onChanged: function(profile) { root.setAudioProfile(row.dev.address, profile) }
-        onPopupOpenChanged: {
-          if (popupOpen) root.closeAudioProfileMenus(row.rowIndex)
-          root.audioProfileMenuOpen = popupOpen
-          if (!popupOpen && root.opened)
-            Qt.callLater(function() { keyCatcher.forceActiveFocus() })
-        }
-      }
-
-      PanelActionButton {
-        id: detailsBtn
-        anchors.right: profileDropdown.visible ? profileDropdown.left
-          : (recoveryBtn.visible ? recoveryBtn.left : parent.right)
-        anchors.rightMargin: profileDropdown.visible || recoveryBtn.visible ? Style.space(6) : 0
-        anchors.verticalCenter: parent.verticalCenter
-        visible: row.showDetailsButton
-        iconText: "󰒓"
-        tooltipText: "Device details"
-        foreground: root.bar.foreground
-        hoverColor: root.bar.foreground
-        fontFamily: root.bar.fontFamily
-        hasCursor: row.rowSelected && root.focusedAction === "details"
-        onHovered: function(isHovered) {
-          if (!isHovered) {
-            if (rowMouse.containsMouse && root.focusedAction === "details") root.focusedAction = ""
-            return
-          }
-          root.cursorActive = true
-          root.focusSection = row.sectionName
-          root.selectedIndex = row.rowIndex
-          root.focusedAction = "details"
-        }
-        onClicked: {
-          var dev = root.deviceFor(row)
-          if (!dev) return
-          root.openDeviceDetails(dev)
-        }
-      }
-
-      PanelActionButton {
-        id: useAudioBtn
-        anchors.right: detailsBtn.visible ? detailsBtn.left
-          : (profileDropdown.visible ? profileDropdown.left
-          : (recoveryBtn.visible ? recoveryBtn.left : parent.right))
-        anchors.rightMargin: detailsBtn.visible || profileDropdown.visible
-          || recoveryBtn.visible ? Style.space(6) : 0
-        anchors.verticalCenter: parent.verticalCenter
-        visible: row.showUseAudioButton
-        iconText: row.usingForAudio ? "󰄬" : "󰓃"
-        tooltipText: row.usingForAudio ? "Default audio device"
-          : (row.deviceAudioSource ? "Use for audio input and output" : "Use for audio output")
-        foreground: row.usingForAudio
-          ? Style.selectedStateColor(root.bar.foreground, Color.accent)
-          : root.bar.foreground
-        hoverColor: root.bar.foreground
-        fontFamily: root.bar.fontFamily
-        hasCursor: row.rowSelected && root.focusedAction === "audio"
-        onHovered: function(isHovered) {
-          if (!isHovered) {
-            if (rowMouse.containsMouse && root.focusedAction === "audio") root.focusedAction = ""
-            return
-          }
-          root.cursorActive = true
-          root.focusSection = row.sectionName
-          root.selectedIndex = row.rowIndex
-          root.focusedAction = "audio"
-        }
-        onClicked: {
-          var dev = root.deviceFor(row)
-          if (!dev) return
-          root.useDeviceForAudio(dev)
-        }
-      }
-
-      PanelActionButton {
-        id: recoveryBtn
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        visible: row.recoveryVisible
-        enabled: row.recoveryAction === "cancel" || !deviceActionProc.running
-        iconText: row.recoveryAction === "cancel" ? "󰅙" : "󰑐"
-        tooltipText: row.recoveryAction === "cancel" ? "Cancel pairing"
-          : (row.actionFailureMessage !== ""
-            ? "Retry · " + row.actionFailureMessage : "Retry")
-        foreground: root.bar.foreground
-        hoverColor: row.recoveryAction === "retry" ? root.bar.urgent : root.bar.foreground
-        fontFamily: root.bar.fontFamily
-        hasCursor: row.rowSelected && root.focusedAction === row.recoveryAction
-        onHovered: function(isHovered) {
-          if (!isHovered) {
-            if (rowMouse.containsMouse && root.focusedAction === row.recoveryAction)
-              root.focusedAction = ""
-            return
-          }
-          root.cursorActive = true
-          root.focusSection = row.sectionName
-          root.selectedIndex = row.rowIndex
-          root.focusedAction = row.recoveryAction
-        }
-        onClicked: {
-          var dev = root.deviceFor(row)
-          if (!dev) return
-          if (row.recoveryAction === "cancel") root.cancelPairing(dev)
-          else root.retryDeviceAction(dev)
-        }
-      }
-    }
-
-    function toggleProfileMenu() { profileDropdown.toggle() }
-    function closeProfileMenu() { profileDropdown.close() }
-
-    onProfileMenuAvailableChanged: if (!profileMenuAvailable) closeProfileMenu()
-    onRecoveryVisibleChanged: if (recoveryVisible) closeProfileMenu()
-    onRecoveryActionChanged: if (rowSelected
-      && (root.focusedAction === "retry" || root.focusedAction === "cancel")
-      && root.focusedAction !== recoveryAction) root.focusedAction = ""
-    Component.onDestruction: if (profileDropdown.popupOpen) root.audioProfileMenuOpen = false
-  }
 }

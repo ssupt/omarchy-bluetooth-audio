@@ -18,21 +18,43 @@ default_preferences() {
   printf '%s\n' '{"version":1,"defaults":{"output":"","input":""},"bluetoothProfiles":{},"bluetoothAudioPolicies":{}}'
 }
 
+normalize_address() {
+  local normalized=${1,,}
+  if [[ $normalized =~ ^[0-9a-f]{12}$ ]]; then
+    :
+  elif [[ $normalized =~ ^([0-9a-f]{2}[:_-]){5}[0-9a-f]{2}$ ]]; then
+    normalized=${normalized//:/}
+    normalized=${normalized//_/}
+    normalized=${normalized//-/}
+  else
+    return 1
+  fi
+  printf '%s\n' "$normalized"
+}
+
 read_preferences() {
   if [[ -s $preferences_file ]] && jq -e 'type == "object"' "$preferences_file" >/dev/null 2>&1; then
     jq -c '
+      def normalize_bluetooth_keys:
+        with_entries(
+          .key |= ascii_downcase
+          | select(.key | test("^([0-9a-f]{12}|[0-9a-f]{2}([:_-][0-9a-f]{2}){5})$"))
+          | .key |= gsub("[:_-]"; "")
+        );
+
       .version = 1
       | .defaults = (if (.defaults | type) == "object" then .defaults else {} end)
       | .defaults.output = (if (.defaults.output | type) == "string" then .defaults.output else "" end)
       | .defaults.input = (if (.defaults.input | type) == "string" then .defaults.input else "" end)
-      | .bluetoothProfiles = (if (.bluetoothProfiles | type) == "object" then .bluetoothProfiles else {} end)
+      | .bluetoothProfiles = (
+          (if (.bluetoothProfiles | type) == "object" then .bluetoothProfiles else {} end)
+          | normalize_bluetooth_keys
+          | with_entries(select((.value | type) == "string" and .value != ""))
+        )
       | .bluetoothAudioPolicies = (
           (if (.bluetoothAudioPolicies | type) == "object" then .bluetoothAudioPolicies else {} end)
-          | with_entries(
-              .key |= (ascii_downcase | gsub("[^0-9a-f]"; ""))
-              | select(.key | test("^[0-9a-f]{12}$"))
-              | select(.value == "output" or .value == "output-mic")
-            )
+          | normalize_bluetooth_keys
+          | with_entries(select(.value == "output" or .value == "output-mic"))
         )
     ' "$preferences_file"
   else
@@ -76,20 +98,17 @@ case "$action" in
     ;;
   set-profile)
     (( $# == 3 )) || usage
-    address=${2,,}
-    address=${address//[^0-9a-f]/}
+    address=$(normalize_address "$2") || usage
     profile=$3
-    [[ $address =~ ^[0-9a-f]{12}$ && -n $profile ]] || usage
+    [[ -n $profile ]] || usage
     write_preferences \
       '.version = 1 | .bluetoothProfiles[$address] = $profile' \
       --arg address "$address" --arg profile "$profile"
     ;;
   set-policy)
     (( $# == 3 )) || usage
-    address=${2,,}
-    address=${address//[^0-9a-f]/}
+    address=$(normalize_address "$2") || usage
     policy=$3
-    [[ $address =~ ^[0-9a-f]{12}$ ]] || usage
     # Manual is the default, so storing it would only obscure the devices
     # that actually opted into automatic routing.
     if [[ $policy == manual ]]; then

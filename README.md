@@ -103,5 +103,11 @@ selected profile per device and restores it on later connections.
 omarchy-plugin-validate .
 ```
 
+`Panel.qml` owns shell integration and user actions. Background connect-policy
+transitions live in `BluetoothAudioPolicyEngine.qml`; the device row, details
+page, and glyph are separate QML components; and `Model.js` contains the pure,
+Node-tested projections and state helpers. System changes remain isolated in
+the scripts under `scripts/`.
+
 The panel is kept as a focused clone of the current native Bluetooth widget so
 it retains Omarchy's discovery, connection, and multi-monitor behavior.

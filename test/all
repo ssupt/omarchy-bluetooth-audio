@@ -15,11 +15,25 @@ for script in "$ROOT"/scripts/* "$TEST_DIR"/mocks/*; do
 done
 echo "PASS: helper syntax"
 
-node - "$ROOT/Model.js" "$ROOT/Panel.qml" <<'JS'
+node - "$ROOT/Model.js" "$ROOT" <<'JS'
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
+const path = require('node:path')
 const model = require(process.argv[2])
-const panelSource = fs.readFileSync(process.argv[3], 'utf8')
+const sourceRoot = process.argv[3]
+const qmlSources = [
+  'Panel.qml',
+  'BluetoothAudioPolicyEngine.qml',
+  'BluetoothDeviceDetails.qml',
+  'BluetoothDeviceIcon.qml',
+  'BluetoothDeviceRow.qml'
+]
+const sources = Object.fromEntries(qmlSources.map(file => [
+  file, fs.readFileSync(path.join(sourceRoot, file), 'utf8')
+]))
+const panelSource = qmlSources.map(file => sources[file]).join('\n')
+const controllerSource = sources['Panel.qml']
+const policySource = sources['BluetoothAudioPolicyEngine.qml']
 
 assert.match(panelSource, /audioControlInstalled/)
 assert.match(panelSource, /var payload = '\{"tab":"bluetooth"\}'/)
@@ -49,7 +63,12 @@ assert.equal(model.audioProfileState(profiles, 'AA:BB:CC:DD:EE:FF'), null)
 
 const audioPreferences = model.parseAudioPreferences(JSON.stringify({
   defaults: { output: 'bluez_output.00_11_22_33_44_55.1' },
-  bluetoothProfiles: { '00:11:22:33:44:55': 'headset-head-unit-msbc' }
+  bluetoothProfiles: {
+    '00:11:22:33:44:55': 'headset-head-unit-msbc',
+    bad: 'invalid',
+    deadbeef: 'too-short',
+    '112233445566': 7
+  }
 }))
 assert.deepEqual(audioPreferences, {
   version: 1,
@@ -70,6 +89,14 @@ assert.equal(model.currentAudioProfile(
   audioPreferences, '00:11:22:33:44:55', state.profiles, state.activeProfile,
   'headset-head-unit-msbc'
 ), 'headset-head-unit-msbc')
+assert.equal(model.normalizedAddress('00:11:22:33:44:55'), '001122334455')
+assert.equal(model.normalizedAddress('00-11-22-33-44-55'), '001122334455')
+assert.equal(model.normalizedAddress('deadbeef'), '')
+assert.equal(model.normalizedAddress('not-an-address'), '')
+assert.equal(model.textContainsAddress(
+  'bluez_output.00_11_22_33_44_55.1', '00:11:22:33:44:55'), true)
+assert.equal(model.textContainsAddress(
+  'bluez_output.00_11_22_33_44_56.1', '00:11:22:33:44:55'), false)
 
 assert.deepEqual(model.audioPolicyOrder(), ['manual', 'output', 'output-mic'])
 const parsedPolicies = model.parseAudioPreferences(JSON.stringify({
@@ -77,6 +104,7 @@ const parsedPolicies = model.parseAudioPreferences(JSON.stringify({
     'AA:BB:CC:DD:EE:FF': 'output',
     '00-11-22-33-44-55': 'output-mic',
     '001122334455': 'manual',
+    'zz001122334455': 'output',
     'zz': 'output',
     '112233445566': 'bogus',
     '998877665544': 7
@@ -202,6 +230,25 @@ const blockedDevice = {
   address: '11:22:33:44:55:66', name: 'Blocked keyboard', blocked: true
 }
 assert.deepEqual(model.deviceLists([blockedDevice]).known, [blockedDevice])
+assert.deepEqual(model.deviceDetailsStops(true, true), [0, 1, 2, 3, 4, 5])
+assert.deepEqual(model.deviceDetailsStops(true, false), [0, 1, 2, 3, 4])
+assert.deepEqual(model.deviceDetailsStops(false, true), [0, 2, 3, 4, 5])
+assert.deepEqual(model.deviceDetailsStops(false, false), [0, 2, 3, 4])
+
+let connectionObservation = model.observeDeviceConnections({}, [{
+  address: device.address, connected: true
+}])
+assert.deepEqual(connectionObservation.connected, [])
+connectionObservation = model.observeDeviceConnections(connectionObservation.states, [{
+  address: device.address, connected: false
+}])
+assert.deepEqual(connectionObservation.connected, [])
+connectionObservation = model.observeDeviceConnections(connectionObservation.states, [{
+  address: device.address, connected: true
+}])
+assert.deepEqual(connectionObservation.connected, [{
+  key: '001122334455', address: device.address
+}])
 const sink = {
   id: 40,
   name: 'bluez_output.00_11_22_33_44_55.1',
@@ -282,31 +329,43 @@ assert.equal(model.deviceIconGlyph('', 'Unknown Device', false), '󰂯')
 assert.match(panelSource, /pluginScript\("bluetooth-device-action"\)/)
 assert.match(panelSource, /device\.cancelPair\(\)/)
 assert.match(panelSource, /deviceActionProc\.signal\(15\)/)
-assert.match(panelSource, /root\.retryDeviceAction\(dev\)/)
+assert.match(panelSource, /controller\.retryDeviceAction\(device\)/)
 assert.match(panelSource, /Model\.deviceIconGlyph/)
 assert.match(panelSource, /pluginScript\("bluetooth-device-property"\)/)
 assert.match(panelSource, /id: devicePropertyProc/)
 assert.match(panelSource, /id: forgetDialog/)
-assert.match(panelSource, /queuePolicyApplications\(/)
-assert.match(panelSource, /applyPendingAudioPolicies\(\)/)
-assert.match(panelSource, /id: audioPolicyApplyTimer/)
+assert.match(controllerSource, /BluetoothAudioPolicyEngine/)
+assert.match(controllerSource, /policyEngine\.observeDevices\(devices\)/)
+assert.match(controllerSource, /audioProfilesNeeded: connectedDevices\.length > 0/)
+assert.match(controllerSource, /opened \|\| policyEngine\.hasPending/)
+assert.match(policySource, /function applyPending\(\)/)
+assert.match(policySource, /running: engine\.hasPending/)
 assert.match(panelSource, /detailsAudioPolicyIndex/)
 assert.match(panelSource, /id: policyManualButton/)
 assert.match(panelSource, /id: policyOutputButton/)
 assert.match(panelSource, /id: policyMicButton/)
 assert.match(panelSource, /"set-policy"/)
+assert.match(controllerSource, /id: audioPolicyPreferenceProc/)
 assert.doesNotMatch(panelSource, /!Model\.isValidAudioPolicy\(policy\)/)
-assert.match(panelSource, /issuePolicyProfileSwitch\(/)
-assert.match(panelSource, /id: policyProfileProc/)
-assert.match(panelSource, /policyEntry\(entry,/)
-assert.match(panelSource, /stableTicks/)
-assert.match(panelSource, /cardSignature/)
+assert.match(policySource, /requestProfileSwitch\(/)
+assert.match(policySource, /id: profileSwitchProc/)
+assert.match(policySource, /withPatch\(entry,/)
+assert.match(policySource, /stableTicks/)
+assert.match(policySource, /cardSignature/)
+assert.match(policySource, /Model\.audioProfileHasInput\(state, saved\)/)
+assert.ok(
+  policySource.indexOf('if (entry.policy === "output")')
+    < policySource.indexOf('var state = controller.audioProfileState(key)'),
+  'output-only policy must not depend on profile inventory'
+)
+assert.match(policySource, /if \(attempts < 60\) next\[key\] = entry/)
 assert.match(panelSource, /pluginScript\("bluetooth-audio-profile-set"\)/)
 assert.doesNotMatch(panelSource, /pluginScript\("audio-profile-set"\)/)
 assert.match(panelSource, /connectPolicyHint/)
 assert.match(panelSource, /Model\.duplexProfileOption\(/)
 assert.match(panelSource, /deviceDetailsIsAudio/)
 assert.match(panelSource, /detailsStopAvailable\(/)
+assert.match(controllerSource, /Model\.deviceDetailsStops\(/)
 assert.match(panelSource, /Model\.isAudioDevice\(/)
 assert.match(panelSource, /syncAudioControlAliases\(/)
 assert.match(panelSource, /audioControlScript\("audio-app-rules"\)/)
@@ -317,6 +376,14 @@ assert.match(panelSource, /audio-rules\.json/)
 assert.doesNotMatch(panelSource, /device\.(?:name|trusted|blocked|wakeAllowed)\s*=/)
 assert.doesNotMatch(panelSource, /execDetached\(deviceCommand/)
 assert.doesNotMatch(panelSource, /\.isSource\b/)
+
+const renameCommit = controllerSource.match(
+  /function commitDeviceRename\(\) \{[\s\S]*?\n  \}/)[0]
+const propertyConfirmation = controllerSource.match(
+  /function confirmDeviceProperty\(\) \{[\s\S]*?\n  \}/)[0]
+assert.doesNotMatch(renameCommit, /syncAudioControlAliases/)
+assert.match(propertyConfirmation, /if \(matches && operation\.propertyName === "name"\)/)
+assert.match(propertyConfirmation, /syncAudioControlAliases/)
 console.log('PASS: Bluetooth model and panel wiring')
 JS
 
@@ -346,11 +413,13 @@ shared_preferences=$(mktemp)
 failed_preferences=$(mktemp)
 no_source_preferences=$(mktemp)
 policy_preferences=$(mktemp)
+sanitized_preferences=$(mktemp)
 shared_preferences_lock="${shared_preferences}.lock"
 failed_preferences_lock="${failed_preferences}.lock"
 no_source_preferences_lock="${no_source_preferences}.lock"
 policy_preferences_lock="${policy_preferences}.lock"
-trap 'rm -f "$profile_log" "$profile_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$policy_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock" "$policy_preferences_lock"' EXIT
+sanitized_preferences_lock="${sanitized_preferences}.lock"
+trap 'rm -f "$profile_log" "$profile_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$policy_preferences" "$sanitized_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock" "$policy_preferences_lock" "$sanitized_preferences_lock"' EXIT
 printf 'old\n' >"$profile_state"
 
 : >"$bluetooth_action_log"
@@ -492,6 +561,14 @@ fi
   || fail "unsupported Bluetooth wake property error"
 echo "PASS: result-aware Bluetooth device properties"
 
+printf '%s\n' '{"bluetoothProfiles":{"00:11:22:33:44:55":"a2dp-sink-aac","bad":"invalid","zz001122334455":"invalid","112233445566":7},"bluetoothAudioPolicies":{"AA-BB-CC-DD-EE-FF":"output","deadbeef":"output","zz001122334455":"output"}}' >"$sanitized_preferences"
+OMARCHY_AUDIO_PREFERENCES_FILE="$sanitized_preferences" \
+  "$ROOT/scripts/audio-preferences" show | jq -e '
+    .bluetoothProfiles == {"001122334455":"a2dp-sink-aac"}
+    and .bluetoothAudioPolicies == {"aabbccddeeff":"output"}
+  ' >/dev/null || fail "malformed Bluetooth preferences sanitized"
+echo "PASS: Bluetooth preferences sanitize malformed entries"
+
 : >"$bluetooth_property_log"
 OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
   "$ROOT/scripts/audio-preferences" set-policy 00:11:22:33:44:55 output-mic
@@ -522,7 +599,7 @@ jq -e '.bluetoothAudioPolicies == {"001122334455":"output-mic"}' \
   "$policy_preferences" >/dev/null || fail "invalid connect policy changed preferences"
 
 if OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
-  "$ROOT/scripts/audio-preferences" set-policy zz output \
+  "$ROOT/scripts/audio-preferences" set-policy zz001122334455 output \
     >/dev/null 2>&1; then
   fail "malformed connect-policy address reported success"
 fi
@@ -656,7 +733,7 @@ echo "PASS: unknown input state is preserved"
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.6.0"
+  and .version == "0.6.1"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

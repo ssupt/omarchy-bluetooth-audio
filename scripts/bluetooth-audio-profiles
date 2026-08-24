@@ -13,7 +13,9 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 "$script_dir/audio-profiles" | jq -c '
   def normalized_address:
-    ascii_downcase | gsub("[^0-9a-f]"; "");
+    ascii_downcase
+    | select(test("^([0-9a-f]{12}|[0-9a-f]{2}([:_-][0-9a-f]{2}){5})$"))
+    | gsub("[:_-]"; "");
 
   def codec:
     try ((.label // "") | capture("codec (?<codec>[^)]+)"; "i").codec) catch ""
@@ -52,7 +54,6 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
           profiles: $profiles
         }
       }
-    | select(.key != "")
   ]
   | from_entries
 ' || exit 1

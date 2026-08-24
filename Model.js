@@ -33,7 +33,24 @@ function isAddressLike(value) {
 }
 
 function normalizedAddress(value) {
-  return String(value || "").trim().toLowerCase().replace(/[^0-9a-f]/g, "")
+  var text = String(value || "").trim().toLowerCase()
+  if (/^[0-9a-f]{12}$/.test(text)) return text
+  if (/^[0-9a-f]{2}(?:[:_-][0-9a-f]{2}){5}$/.test(text))
+    return text.replace(/[:_-]/g, "")
+  return ""
+}
+
+function textContainsAddress(value, address) {
+  var expected = normalizedAddress(address)
+  if (expected === "") return false
+
+  var text = String(value || "")
+  var matcher = /(^|[^0-9a-f])([0-9a-f]{12}|[0-9a-f]{2}(?:[:_-][0-9a-f]{2}){5})(?=$|[^0-9a-f])/ig
+  var match
+  while ((match = matcher.exec(text)) !== null) {
+    if (normalizedAddress(match[2]) === expected) return true
+  }
+  return false
 }
 
 function parseAudioPreferences(raw) {
@@ -185,7 +202,7 @@ function bluetoothNodeMatchesDevice(node, device, direction) {
 
   var address = normalizedAddress(device.address)
   var text = nodeText(node)
-  if (address !== "" && normalizedAddress(text).indexOf(address) !== -1) return true
+  if (textContainsAddress(text, address)) return true
 
   // PipeWire may retain the hardware name after the user assigns a BlueZ
   // alias, so match either label when node metadata lacks an address.
@@ -379,6 +396,43 @@ function deviceLists(devices) {
   }
 }
 
+// Tracks actual disconnected -> connected edges without treating devices that
+// are already connected when the shell starts as new connections. Missing
+// devices remain known as disconnected so a later reappearance can still be
+// recognized as a reconnect.
+function observeDeviceConnections(previous, devices) {
+  var before = previous && typeof previous === "object" ? previous : {}
+  var values = toArray(devices)
+  var states = {}
+  var connected = []
+
+  for (var i = 0; i < values.length; i++) {
+    var device = values[i]
+    var key = normalizedAddress(device ? device.address : "")
+    if (key === "") continue
+    var isConnected = !!device.connected
+    if (isConnected && before[key] === false)
+      connected.push({ key: key, address: String(device.address) })
+    states[key] = isConnected
+  }
+
+  for (var oldKey in before)
+    if (states[oldKey] === undefined) states[oldKey] = false
+
+  return { states: states, connected: connected }
+}
+
+// Device-detail cursor stops use stable semantic indices. Audio policy is an
+// optional middle row and Forget is an optional final row, so callers must not
+// treat the indices as a contiguous 0..count-1 range.
+function deviceDetailsStops(isAudio, canForget) {
+  var stops = [0]
+  if (isAudio) stops.push(1)
+  stops.push(2, 3, 4)
+  if (canForget) stops.push(5)
+  return stops
+}
+
 function cloneMap(map) {
   var next = ({})
   for (var key in map || {}) next[key] = map[key]
@@ -508,6 +562,7 @@ if (typeof module !== "undefined") {
     isUuidLike: isUuidLike,
     isAddressLike: isAddressLike,
     normalizedAddress: normalizedAddress,
+    textContainsAddress: textContainsAddress,
     parseAudioPreferences: parseAudioPreferences,
     isValidAudioPolicy: isValidAudioPolicy,
     audioPolicyOrder: audioPolicyOrder,
@@ -532,6 +587,8 @@ if (typeof module !== "undefined") {
     sortedByLabel: sortedByLabel,
     deviceRow: deviceRow,
     deviceLists: deviceLists,
+    observeDeviceConnections: observeDeviceConnections,
+    deviceDetailsStops: deviceDetailsStops,
     cloneMap: cloneMap,
     pendingAction: pendingAction,
     withPendingAction: withPendingAction,
