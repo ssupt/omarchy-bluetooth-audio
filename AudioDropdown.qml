@@ -79,6 +79,7 @@ Item {
   }
 
   onEnabledChanged: if (!enabled) close()
+  onOptionsChanged: if (!canOpen()) close()
 
   implicitWidth: Style.spacing.dropdownWidth
   implicitHeight: showLabel && label !== "" ? rowHeight + Style.spacing.huge : rowHeight
@@ -187,8 +188,8 @@ Item {
         readonly property real _windowWidth: _windowContent ? _windowContent.width : 0
         readonly property real _windowHeight: _windowContent ? _windowContent.height : 0
         readonly property real _edgeMargin: Style.spacing.sm
-        readonly property real rowsHeight: root.options.length * root.popupRowHeight
-          + Math.max(0, root.options.length - 1) * Style.spacing.labelGap
+        readonly property real rowsHeight: (root.options || []).length * root.popupRowHeight
+          + Math.max(0, (root.options || []).length - 1) * Style.spacing.labelGap
         readonly property real cappedRowsHeight: root.popupRowHeight * 8
           + 7 * Style.spacing.labelGap
         readonly property real _idealX: (root.popupDirection === "right" ? trigger.width + root.popupGap
@@ -276,7 +277,8 @@ Item {
             else if (event.key === Qt.Key_Down || event.text === "j") {
               optionList.pointerActive = false
               optionList.hoveredIndex = -1
-              optionList.currentIndex = Math.min(root.options.length - 1, optionList.currentIndex + 1)
+              optionList.currentIndex = Math.min((root.options || []).length - 1,
+                optionList.currentIndex + 1)
               event.accepted = true
             } else if (event.key === Qt.Key_Up || event.text === "k") {
               optionList.pointerActive = false
@@ -294,14 +296,16 @@ Item {
           currentIndex: -1
 
           function indexOfValue(v) {
-            for (var i = 0; i < root.options.length; i++)
-              if (root.optionValue(root.options[i]) === v) return i
+            var values = root.options || []
+            for (var i = 0; i < values.length; i++)
+              if (root.optionValue(values[i]) === v) return i
             return -1
           }
 
           function selectCurrent() {
-            if (currentIndex < 0 || currentIndex >= root.options.length) return
-            var v = root.optionValue(root.options[currentIndex])
+            var values = root.options || []
+            if (currentIndex < 0 || currentIndex >= values.length) return
+            var v = root.optionValue(values[currentIndex])
             root.changed(v)
             popup.close()
           }

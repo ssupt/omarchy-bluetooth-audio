@@ -70,12 +70,26 @@ const audioPreferences = model.parseAudioPreferences(JSON.stringify({
     '112233445566': 7
   }
 }))
+assert.equal(model.isAudioPreferencesDocument('{}'), true)
+assert.equal(model.isAudioPreferencesDocument(''), true)
+assert.equal(model.isAudioPreferencesDocument('not json'), false)
+assert.equal(model.isAudioPreferencesDocument('[]'), false)
 assert.deepEqual(audioPreferences, {
   version: 1,
   defaults: { output: 'bluez_output.00_11_22_33_44_55.1', input: '' },
   bluetoothProfiles: { '001122334455': 'headset-head-unit-msbc' },
   bluetoothAudioPolicies: {}
 })
+assert.deepEqual(model.parseAudioPreferences(JSON.stringify({
+  defaults: { output: 'unsafe\nnode' },
+  bluetoothProfiles: { '00:11:22:33:44:55': 'unsafe\u202eprofile' }
+})), {
+  version: 1,
+  defaults: { output: '', input: '' },
+  bluetoothProfiles: {},
+  bluetoothAudioPolicies: {}
+})
+assert.equal(model.isAudioPreferencesDocument('x'.repeat(1048577)), false)
 assert.equal(model.preferredAudioProfile(
   audioPreferences, '00-11-22-33-44-55', state.profiles, state.activeProfile
 ), 'headset-head-unit-msbc')
@@ -97,6 +111,10 @@ assert.equal(model.textContainsAddress(
   'bluez_output.00_11_22_33_44_55.1', '00:11:22:33:44:55'), true)
 assert.equal(model.textContainsAddress(
   'bluez_output.00_11_22_33_44_56.1', '00:11:22:33:44:55'), false)
+assert.equal(model.textContainsAddress(
+  'service:0000110b-0000-1000-8000-00805f9b34fb', '00:80:5f:9b:34:fb'), false)
+assert.equal(model.textContainsAnyAddress(
+  'service:0000110b-0000-1000-8000-00805f9b34fb'), false)
 
 assert.deepEqual(model.audioPolicyOrder(), ['manual', 'output', 'output-mic'])
 const parsedPolicies = model.parseAudioPreferences(JSON.stringify({
@@ -123,6 +141,22 @@ assert.equal(model.deviceAudioPolicy(null, ''), 'manual')
 assert.equal(model.isValidAudioPolicy('output'), true)
 assert.equal(model.isValidAudioPolicy('output-mic'), true)
 assert.equal(model.isValidAudioPolicy('manual'), false)
+const policyOverrides = model.parseAudioPolicyOverrides(JSON.stringify({
+  bluetoothAudioPolicies: {
+    'AA:BB:CC:DD:EE:FF': 'manual',
+    '11:22:33:44:55:66': 'output',
+    broken: 'output-mic'
+  }
+}))
+assert.deepEqual(policyOverrides, {
+  aabbccddeeff: 'manual',
+  '112233445566': 'output'
+})
+assert.deepEqual(model.mergeAudioPreferences(parsedPolicies, policyOverrides)
+  .bluetoothAudioPolicies, {
+  '001122334455': 'output-mic',
+  '112233445566': 'output'
+})
 
 const duplexState = {
   activeProfile: 'a2dp-sink-aac',
@@ -168,12 +202,22 @@ assert.deepEqual(parsedAliases, {
   'bluez_output.80_C3_BA_67_04_C0.1': 'Desk headset',
   'bluez_input.80:C3:BA:67:04:C0': 'Desk mic'
 })
+assert.deepEqual(model.deviceAliasKeysForAddress(
+  parsedAliases, '80:C3:BA:67:04:C0'), [
+    'bluez_output.80_C3_BA_67_04_C0.1',
+    'bluez_input.80:C3:BA:67:04:C0'
+  ])
+assert.deepEqual(model.deviceAliasKeysForAddress(
+  parsedAliases, '80:C3:BA:67:04:C1'), [])
+assert.deepEqual(model.deviceAliasKeysForAddress({
+  'service.0000110b-0000-1000-8000-00805f9b34fb': 'Not a device'
+}, '00:80:5f:9b:34:fb'), [])
 assert.deepEqual(model.parseDeviceAliases('not json'), {})
 assert.deepEqual(model.parseDeviceAliases('{"devices":{"aliases":{}}}'), {})
 assert.equal(model.audioProfileHasInput(duplexState, 'a2dp-sink-aac'), false)
 assert.equal(model.audioProfileHasInput(duplexState, 'headset-head-unit-msbc'), true)
-// A saved duplex preference must be detected so the applier waits for
-// WirePlumber's restore instead of switching codecs behind the user's back.
+// A saved duplex preference remains the target if WirePlumber does not restore
+// it by itself; an output-only preference falls back to the best duplex mode.
 const savedDuplexPrefs = model.parseAudioPreferences(JSON.stringify({
   bluetoothProfiles: { '00:11:22:33:44:55': 'headset-head-unit-msbc' }
 }))
@@ -181,6 +225,11 @@ const savedDuplex = model.preferredAudioProfile(
   savedDuplexPrefs, '00:11:22:33:44:55', model.audioProfileOptions(duplexState), '')
 assert.equal(savedDuplex, 'headset-head-unit-msbc')
 assert.equal(model.audioProfileHasInput(duplexState, savedDuplex), true)
+assert.deepEqual(model.preferredDuplexProfileOption(
+  savedDuplexPrefs, '00:11:22:33:44:55', duplexState
+), {
+  value: 'headset-head-unit-msbc', label: 'Headset + microphone · mSBC'
+})
 const savedAacPrefs = model.parseAudioPreferences(JSON.stringify({
   bluetoothProfiles: { '00:11:22:33:44:55': 'a2dp-sink-aac' }
 }))
@@ -188,6 +237,11 @@ const savedOutputOnly = model.preferredAudioProfile(
   savedAacPrefs, '00:11:22:33:44:55', model.audioProfileOptions(duplexState), '')
 assert.equal(savedOutputOnly, 'a2dp-sink-aac')
 assert.equal(model.audioProfileHasInput(duplexState, savedOutputOnly), false)
+assert.deepEqual(model.preferredDuplexProfileOption(
+  savedAacPrefs, '00:11:22:33:44:55', duplexState
+), {
+  value: 'headset-head-unit-cvsd', label: 'Headset + microphone · CVSD'
+})
 
 const device = { address: '00:11:22:33:44:55', deviceName: 'Bluetooth Headphones' }
 const detailedDevice = {
@@ -209,6 +263,8 @@ const detailedDevice = {
 }
 assert.equal(model.deviceLabel(detailedDevice), 'Desk headset')
 assert.equal(model.hasHumanName({ name: '00112233-4455-6677-8899-aabbccddeeff', deviceName: 'Keyboard' }), true)
+assert.equal(model.isAddressLike('00_11_22_33_44_55'), true)
+assert.equal(model.isAddressLike('001122334455'), true)
 assert.deepEqual(model.deviceRow(detailedDevice), {
   address: 'AA:BB:CC:DD:EE:FF',
   dbusPath: '/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF',
@@ -230,6 +286,21 @@ const blockedDevice = {
   address: '11:22:33:44:55:66', name: 'Blocked keyboard', blocked: true
 }
 assert.deepEqual(model.deviceLists([blockedDevice]).known, [blockedDevice])
+const anonymousRememberedDevice = {
+  address: '22:33:44:55:66:77', name: '22:33:44:55:66:77', paired: true
+}
+const anonymousDiscoveryNoise = {
+  address: '33:44:55:66:77:88', name: '33:44:55:66:77:88'
+}
+const anonymousUnderscoreNoise = {
+  address: '44:55:66:77:88:99', name: '44_55_66_77_88_99'
+}
+assert.deepEqual(model.deviceLists([
+  anonymousRememberedDevice, anonymousDiscoveryNoise, anonymousUnderscoreNoise
+]).known, [anonymousRememberedDevice])
+assert.deepEqual(model.deviceLists([
+  anonymousRememberedDevice, anonymousDiscoveryNoise, anonymousUnderscoreNoise
+]).discovered, [])
 assert.deepEqual(model.deviceDetailsStops(true, true), [0, 1, 2, 3, 4, 5])
 assert.deepEqual(model.deviceDetailsStops(true, false), [0, 1, 2, 3, 4])
 assert.deepEqual(model.deviceDetailsStops(false, true), [0, 2, 3, 4, 5])
@@ -246,6 +317,21 @@ assert.deepEqual(connectionObservation.connected, [])
 connectionObservation = model.observeDeviceConnections(connectionObservation.states, [{
   address: device.address, connected: true
 }])
+assert.deepEqual(connectionObservation.connected, [{
+  key: '001122334455', address: device.address
+}])
+connectionObservation = model.observeDeviceConnections(connectionObservation.states, [
+  { address: device.address, connected: true },
+  { address: 'AA:BB:CC:DD:EE:FF', connected: true }
+], true)
+assert.deepEqual(connectionObservation.connected, [{
+  key: 'aabbccddeeff', address: 'AA:BB:CC:DD:EE:FF'
+}])
+connectionObservation = model.observeDeviceConnections(connectionObservation.states, [], true)
+assert.deepEqual(connectionObservation.states, {})
+connectionObservation = model.observeDeviceConnections(connectionObservation.states, [{
+  address: device.address, connected: true
+}], true)
 assert.deepEqual(connectionObservation.connected, [{
   key: '001122334455', address: device.address
 }])
@@ -279,6 +365,66 @@ assert.equal(model.bluetoothSinkMatchesDevice({
   ready: true,
   properties: { 'node.description': 'Hardware headset' }
 }, detailedDevice), true)
+assert.equal(model.bluetoothSinkMatchesDevice({
+  id: 42,
+  name: 'bluez_output.unknown',
+  isSink: true,
+  isStream: false,
+  audio: {},
+  ready: true,
+  properties: { 'node.description': 'Hardware headset' }
+}, detailedDevice, [
+  detailedDevice,
+  {
+    address: 'CC:DD:EE:FF:00:11',
+    name: 'Travel headset',
+    deviceName: 'Hardware headset'
+  }
+]), false)
+assert.equal(model.bluetoothSinkMatchesDevice(sink, device, [
+  device,
+  { address: '11:22:33:44:55:66', deviceName: 'Bluetooth Headphones' }
+]), true)
+assert.equal(model.bluetoothSinkMatchesDevice({
+  id: 43,
+  name: 'bluez_output.00_11_22_33_44_55.1',
+  description: 'Desk headset',
+  isSink: true,
+  isStream: false,
+  audio: {},
+  ready: true,
+  properties: { 'api.bluez5.address': '00:11:22:33:44:55' }
+}, detailedDevice), false)
+assert.equal(model.bluetoothSinkMatchesDevice({
+  id: 44,
+  name: 'bluez_output.unknown',
+  description: 'Desk headset Pro',
+  isSink: true,
+  isStream: false,
+  audio: {},
+  ready: true,
+  properties: {}
+}, detailedDevice), false)
+assert.equal(model.bluetoothSinkMatchesDevice({
+  id: 45,
+  name: 'bluez_output.unknown',
+  description: '耳机',
+  isSink: true,
+  isStream: false,
+  audio: {},
+  ready: true,
+  properties: {}
+}, { address: 'CC:DD:EE:FF:00:11', name: '耳机' }), true)
+assert.equal(model.bluetoothSinkMatchesDevice({
+  id: 46,
+  name: 'bluez_output.unknown',
+  description: 'Hardware headset',
+  isSink: true,
+  isStream: false,
+  audio: {},
+  ready: true,
+  properties: { 'media.name': '0000110b-0000-1000-8000-00805f9b34fb' }
+}, detailedDevice), true)
 assert.equal(model.bluetoothSourceMatchesDevice({
   ...source,
   name: 'bluez_output.00_11_22_33_44_55.1.monitor'
@@ -297,6 +443,7 @@ assert.deepEqual(model.deviceActionFailure(failures, '00-11-22-33-44-55'), {
 })
 assert.equal(model.deviceActionReachedState('connect', { connected: true }), true)
 assert.equal(model.deviceActionReachedState('disconnect', { connected: false }), true)
+assert.equal(model.deviceActionReachedState('disconnect', null), true)
 assert.equal(model.deviceActionReachedState('forget', {
   paired: false, bonded: false, trusted: false
 }), true)
@@ -307,6 +454,12 @@ assert.equal(model.deviceActionReachedState('pair', { connected: false }), false
 failures = model.withDeviceActionFailure(
   failures, '00:11:22:33:44:55', '', '')
 assert.equal(model.deviceActionFailure(failures, '00:11:22:33:44:55'), null)
+let pendingActions = model.withPendingAction(
+  {}, '00:11:22:33:44:55', 'connecting')
+assert.equal(model.pendingAction(pendingActions, '00-11-22-33-44-55'), 'connecting')
+pendingActions = model.withPendingAction(
+  pendingActions, '001122334455', '')
+assert.equal(model.pendingAction(pendingActions, '00:11:22:33:44:55'), '')
 
 assert.equal(model.deviceIconGlyph('audio-headset', 'Galaxy Buds FEee', true), '󰋋')
 assert.equal(model.deviceIconGlyph('audio-headset', 'MOMENTUM 4', false), '󰋋')
@@ -330,6 +483,10 @@ assert.match(panelSource, /pluginScript\("bluetooth-device-action"\)/)
 assert.match(panelSource, /device\.cancelPair\(\)/)
 assert.match(panelSource, /deviceActionProc\.signal\(15\)/)
 assert.match(panelSource, /controller\.retryDeviceAction\(device\)/)
+assert.match(controllerSource, /function adoptPendingAction\(/)
+assert.match(controllerSource, /function deviceActionOwner\(/)
+assert.match(controllerSource, /function adoptInterruptedDeviceAction\(/)
+assert.match(controllerSource, /localDeviceActionBusy/)
 assert.match(panelSource, /Model\.deviceIconGlyph/)
 assert.match(panelSource, /pluginScript\("bluetooth-device-property"\)/)
 assert.match(panelSource, /id: devicePropertyProc/)
@@ -339,26 +496,50 @@ assert.match(controllerSource, /policyEngine\.observeDevices\(devices\)/)
 assert.match(controllerSource, /audioProfilesNeeded: connectedDevices\.length > 0/)
 assert.match(controllerSource, /opened \|\| policyEngine\.hasPending/)
 assert.match(policySource, /function applyPending\(\)/)
-assert.match(policySource, /running: engine\.hasPending/)
+assert.match(policySource, /engine\.automaticRetries && engine\.hasPending/)
 assert.match(panelSource, /detailsAudioPolicyIndex/)
 assert.match(panelSource, /id: policyManualButton/)
 assert.match(panelSource, /id: policyOutputButton/)
 assert.match(panelSource, /id: policyMicButton/)
 assert.match(panelSource, /"set-policy"/)
 assert.match(controllerSource, /id: audioPolicyPreferenceProc/)
+for (const processId of [
+  'audioPolicyPreferenceProc',
+  'deviceActionProc',
+  'devicePropertyProc',
+  'audioProfileSetProc'
+]) {
+  const processStart = controllerSource.indexOf('id: ' + processId)
+  assert.notEqual(processStart, -1)
+  const nextProcess = controllerSource.indexOf('\n  Process {', processStart)
+  const processBody = controllerSource.slice(processStart,
+    nextProcess < 0 ? controllerSource.length : nextProcess)
+  assert.match(processBody, /property bool collecting: false/)
+  assert.match(processBody, /property bool stderrComplete: false/)
+  assert.match(processBody,
+    /if \(!collecting \|\| !stderrComplete \|\| !exitComplete\) return/)
+  assert.match(controllerSource,
+    new RegExp(processId + '\\.prepare\\(\\)'))
+}
 assert.doesNotMatch(panelSource, /!Model\.isValidAudioPolicy\(policy\)/)
 assert.match(policySource, /requestProfileSwitch\(/)
-assert.match(policySource, /id: profileSwitchProc/)
+assert.match(policySource, /signal profileSwitchRequested/)
+assert.match(policySource, /function finishProfileSwitch\(/)
+assert.match(controllerSource, /id: policyProfileSwitchProc/)
+assert.match(controllerSource, /audioProfileSetStderr/)
+assert.match(controllerSource, /activeAudioProfileOperation/)
+assert.match(controllerSource,
+  /var operation = root\.activeAudioProfileOperation[\s\S]*?if \(!operation\)/)
 assert.match(policySource, /withPatch\(entry,/)
 assert.match(policySource, /stableTicks/)
 assert.match(policySource, /cardSignature/)
-assert.match(policySource, /Model\.audioProfileHasInput\(state, saved\)/)
+assert.match(policySource, /Model\.preferredDuplexProfileOption\(/)
 assert.ok(
   policySource.indexOf('if (entry.policy === "output")')
     < policySource.indexOf('var state = controller.audioProfileState(key)'),
   'output-only policy must not depend on profile inventory'
 )
-assert.match(policySource, /if \(attempts < 60\) next\[key\] = entry/)
+assert.match(policySource, /attempts < maximumAttempts/)
 assert.match(panelSource, /pluginScript\("bluetooth-audio-profile-set"\)/)
 assert.doesNotMatch(panelSource, /pluginScript\("audio-profile-set"\)/)
 assert.match(panelSource, /connectPolicyHint/)
@@ -368,6 +549,10 @@ assert.match(panelSource, /detailsStopAvailable\(/)
 assert.match(controllerSource, /Model\.deviceDetailsStops\(/)
 assert.match(panelSource, /Model\.isAudioDevice\(/)
 assert.match(panelSource, /syncAudioControlAliases\(/)
+assert.match(panelSource, /deviceAliasKeysForAddress\(/)
+assert.match(panelSource, /reconcileAudioControlAliases\(/)
+assert.match(panelSource,
+  /onPipewireNodesChanged:[\s\S]*?audioControlAliasSyncTimer\.restart\(\)/)
 assert.match(panelSource, /audioControlScript\("audio-app-rules"\)/)
 assert.match(panelSource, /"set-alias"/)
 assert.match(panelSource, /parseDeviceAliases\(/)
@@ -384,8 +569,29 @@ const propertyConfirmation = controllerSource.match(
 assert.doesNotMatch(renameCommit, /syncAudioControlAliases/)
 assert.match(propertyConfirmation, /if \(matches && operation\.propertyName === "name"\)/)
 assert.match(propertyConfirmation, /syncAudioControlAliases/)
+assert.match(controllerSource,
+  /operation\.propertyName === "name"[\s\S]*?deviceDetailsView\.updateNameIfIdle/)
 console.log('PASS: Bluetooth model and panel wiring')
 JS
+
+qml_test_runner=/usr/lib/qt6/bin/qmltestrunner
+[[ -x $qml_test_runner ]] || fail "Qt 6 QML test runner is unavailable"
+env -u QT_QPA_PLATFORMTHEME -u DISPLAY -u WAYLAND_DISPLAY \
+  QT_QPA_PLATFORM=offscreen \
+  "$qml_test_runner" -silent -input "$TEST_DIR/tst_policy.qml" \
+  || fail "Bluetooth policy state machine"
+echo "PASS: Bluetooth policy state machine"
+
+ucm_profiles=$(
+  AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards-ucm.json" \
+    PATH="$TEST_DIR/mocks:$PATH" \
+    "$ROOT/scripts/audio-profiles"
+)
+jq -e '
+  .[0].name == "alsa_card.ucm-example"
+  and [.[0].profiles[].value] == ["HiFi", "off"]
+' <<<"$ucm_profiles" >/dev/null || fail "UCM audio profile filtering"
+echo "PASS: UCM audio profile filtering"
 
 bluetooth_profiles=$(
   AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
@@ -403,8 +609,29 @@ jq -e '
 ' <<<"$bluetooth_profiles" >/dev/null || fail "Bluetooth codec discovery"
 echo "PASS: Bluetooth codec discovery"
 
+fallback_card_fixture=$(mktemp)
+trap 'rm -f "$fallback_card_fixture"' EXIT
+jq 'map(if .name == "bluez_card.00_11_22_33_44_55" then
+  .properties |= (."api.bluez5.address" = ""
+    | ."device.string" = "0")
+  else . end)' "$TEST_DIR/fixtures/cards.json" >"$fallback_card_fixture"
+fallback_bluetooth_profiles=$(
+  AUDIO_CONTROL_CARD_FIXTURE="$fallback_card_fixture" \
+    PATH="$TEST_DIR/mocks:$PATH" \
+    "$ROOT/scripts/bluetooth-audio-profiles"
+)
+jq -e '
+  ."001122334455".card == "bluez_card.00_11_22_33_44_55"
+  and ."001122334455".address == "00:11:22:33:44:55"
+' \
+  <<<"$fallback_bluetooth_profiles" >/dev/null \
+  || fail "Bluetooth card address fallback"
+echo "PASS: Bluetooth card path address fallback"
+
 profile_log=$(mktemp)
 profile_state=$(mktemp)
+profile_recreate_state=$(mktemp)
+profile_runtime=$(mktemp -d)
 bluetooth_action_log=$(mktemp)
 bluetooth_action_error=$(mktemp)
 bluetooth_property_log=$(mktemp)
@@ -413,13 +640,23 @@ shared_preferences=$(mktemp)
 failed_preferences=$(mktemp)
 no_source_preferences=$(mktemp)
 policy_preferences=$(mktemp)
+policy_overrides=$(mktemp)
+migration_overrides=$(mktemp)
+corrupt_policy_overrides=$(mktemp)
 sanitized_preferences=$(mktemp)
+corrupt_preferences=$(mktemp)
+profile_fail_once_state=$(mktemp)
 shared_preferences_lock="${shared_preferences}.lock"
 failed_preferences_lock="${failed_preferences}.lock"
 no_source_preferences_lock="${no_source_preferences}.lock"
 policy_preferences_lock="${policy_preferences}.lock"
+policy_overrides_lock="${policy_overrides}.lock"
+migration_overrides_lock="${migration_overrides}.lock"
+corrupt_policy_overrides_lock="${corrupt_policy_overrides}.lock"
 sanitized_preferences_lock="${sanitized_preferences}.lock"
-trap 'rm -f "$profile_log" "$profile_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$policy_preferences" "$sanitized_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock" "$policy_preferences_lock" "$sanitized_preferences_lock"' EXIT
+corrupt_preferences_lock="${corrupt_preferences}.lock"
+trap 'rm -f "$fallback_card_fixture" "$profile_log" "$profile_state" "$profile_recreate_state" "$profile_fail_once_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$policy_preferences" "$policy_overrides" "$migration_overrides" "$corrupt_policy_overrides" "$sanitized_preferences" "$corrupt_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock" "$policy_preferences_lock" "$policy_overrides_lock" "$migration_overrides_lock" "$corrupt_policy_overrides_lock" "$sanitized_preferences_lock" "$corrupt_preferences_lock" "$profile_runtime/omarchy-audio-mutation-${UID}.lock"; rmdir "$profile_runtime"' EXIT
+export XDG_RUNTIME_DIR="$profile_runtime"
 printf 'old\n' >"$profile_state"
 
 : >"$bluetooth_action_log"
@@ -469,6 +706,22 @@ if rg -q '^connect ' "$bluetooth_action_log"; then
 fi
 
 : >"$bluetooth_action_log"
+BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_POWERED=0 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" connect 00:11:22:33:44:55
+expected_power_on_connect_log=$(cat <<'EOF'
+show
+power on
+info 00:11:22:33:44:55
+connect 00:11:22:33:44:55
+trust 00:11:22:33:44:55
+EOF
+)
+[[ $(<"$bluetooth_action_log") == "$expected_power_on_connect_log" ]] \
+  || fail "powered-on Bluetooth connection sequence"
+
+: >"$bluetooth_action_log"
 if BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
   BLUETOOTH_ACTION_POWERED=0 \
   BLUETOOTH_ACTION_POWER_FAIL=1 \
@@ -502,6 +755,20 @@ BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
   "$ROOT/scripts/bluetooth-device-action" forget 00:11:22:33:44:55
 rg -q '^remove 00:11:22:33:44:55$' "$bluetooth_action_log" \
   || fail "failed disconnect prevented forgetting the Bluetooth device"
+
+: >"$bluetooth_action_log"
+BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_POWERED=0 \
+  BLUETOOTH_ACTION_POWER_FAIL=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" forget 00:11:22:33:44:55
+expected_powered_off_forget_log=$(cat <<'EOF'
+disconnect 00:11:22:33:44:55
+remove 00:11:22:33:44:55
+EOF
+)
+[[ $(<"$bluetooth_action_log") == "$expected_powered_off_forget_log" ]] \
+  || fail "forgetting a device unnecessarily powered the adapter on"
 
 : >"$bluetooth_action_log"
 BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
@@ -559,52 +826,162 @@ fi
 [[ $(<"$bluetooth_property_error") == \
   "This device or Bluetooth adapter does not support wake permission." ]] \
   || fail "unsupported Bluetooth wake property error"
+
+: >"$bluetooth_property_log"
+if BLUETOOTH_PROPERTY_LOG="$bluetooth_property_log" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-property" \
+    name /org/bluez/hci0/dev_00_11_22_33_44_55 $'unsafe\nname' \
+      > /dev/null 2>"$bluetooth_property_error"; then
+  fail "Bluetooth device name with control characters was accepted"
+fi
+[[ ! -s $bluetooth_property_log && $(<"$bluetooth_property_error") == \
+  "Bluetooth device names cannot contain control characters." ]] \
+  || fail "Bluetooth device name validation"
 echo "PASS: result-aware Bluetooth device properties"
 
 printf '%s\n' '{"bluetoothProfiles":{"00:11:22:33:44:55":"a2dp-sink-aac","bad":"invalid","zz001122334455":"invalid","112233445566":7},"bluetoothAudioPolicies":{"AA-BB-CC-DD-EE-FF":"output","deadbeef":"output","zz001122334455":"output"}}' >"$sanitized_preferences"
 OMARCHY_AUDIO_PREFERENCES_FILE="$sanitized_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$migration_overrides" \
   "$ROOT/scripts/audio-preferences" show | jq -e '
     .bluetoothProfiles == {"001122334455":"a2dp-sink-aac"}
     and .bluetoothAudioPolicies == {"aabbccddeeff":"output"}
   ' >/dev/null || fail "malformed Bluetooth preferences sanitized"
 echo "PASS: Bluetooth preferences sanitize malformed entries"
 
+OMARCHY_AUDIO_PREFERENCES_FILE="$sanitized_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$migration_overrides" \
+  "$ROOT/scripts/audio-preferences" migrate-policies
+jq -e '.bluetoothAudioPolicies == {"aabbccddeeff":"output"}' \
+  "$migration_overrides" >/dev/null \
+  || fail "legacy connect policies were not migrated to protected storage"
+echo "PASS: legacy connect policies migrate to protected storage"
+
+printf '%s\n' '{broken json' >"$corrupt_preferences"
+if OMARCHY_AUDIO_PREFERENCES_FILE="$corrupt_preferences" \
+  "$ROOT/scripts/audio-preferences" set-default output test-output \
+    >/dev/null 2>&1; then
+  fail "corrupt audio preferences were overwritten"
+fi
+[[ $(<"$corrupt_preferences") == '{broken json' ]] \
+  || fail "corrupt audio preferences changed after a rejected write"
+echo "PASS: corrupt audio preferences are preserved"
+
 : >"$bluetooth_property_log"
 OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$policy_overrides" \
   "$ROOT/scripts/audio-preferences" set-policy 00:11:22:33:44:55 output-mic
 jq -e '
   .version == 1
-  and .defaults == {"output":"","input":""}
-  and .bluetoothProfiles == {}
   and .bluetoothAudioPolicies == {"001122334455":"output-mic"}
-' "$policy_preferences" >/dev/null || fail "connect policy persisted"
+' "$policy_overrides" >/dev/null || fail "connect policy persisted"
 
 OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$policy_overrides" \
   "$ROOT/scripts/audio-preferences" set-policy AA-BB-CC-DD-EE-FF output
 jq -e '.bluetoothAudioPolicies == {
   "001122334455": "output-mic", "aabbccddeeff": "output"
-}' "$policy_preferences" >/dev/null || fail "second connect policy persisted"
+}' "$policy_overrides" >/dev/null || fail "second connect policy persisted"
 
 OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$policy_overrides" \
   "$ROOT/scripts/audio-preferences" set-policy aa:bb:cc:dd:ee:ff manual
-jq -e '.bluetoothAudioPolicies == {"001122334455":"output-mic"}' \
-  "$policy_preferences" >/dev/null || fail "manual connect policy removed the stored entry"
+OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$policy_overrides" \
+  "$ROOT/scripts/audio-preferences" show | jq -e \
+    '.bluetoothAudioPolicies == {"001122334455":"output-mic"}' >/dev/null \
+  || fail "manual connect policy did not override the stored legacy state"
 
 if OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$policy_overrides" \
   "$ROOT/scripts/audio-preferences" set-policy 11:22:33:44:55:66 duplex \
     >/dev/null 2>&1; then
   fail "invalid connect policy reported success"
 fi
-jq -e '.bluetoothAudioPolicies == {"001122334455":"output-mic"}' \
-  "$policy_preferences" >/dev/null || fail "invalid connect policy changed preferences"
+OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$policy_overrides" \
+  "$ROOT/scripts/audio-preferences" show | jq -e \
+    '.bluetoothAudioPolicies == {"001122334455":"output-mic"}' >/dev/null \
+  || fail "invalid connect policy changed preferences"
 
 if OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$policy_overrides" \
   "$ROOT/scripts/audio-preferences" set-policy zz001122334455 output \
     >/dev/null 2>&1; then
   fail "malformed connect-policy address reported success"
 fi
+
+if OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  "$ROOT/scripts/audio-preferences" set-default output $'unsafe\nnode' \
+    >/dev/null 2>&1; then
+  fail "audio preference identifier with control characters was accepted"
+fi
+
+printf '%s\n' '{broken policy json' >"$corrupt_policy_overrides"
+if OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$corrupt_policy_overrides" \
+  "$ROOT/scripts/audio-preferences" set-policy 11:22:33:44:55:66 output \
+    >/dev/null 2>&1; then
+  fail "corrupt Bluetooth audio policies were overwritten"
+fi
+[[ $(<"$corrupt_policy_overrides") == '{broken policy json' ]] \
+  || fail "corrupt Bluetooth audio policies changed after a rejected write"
 echo "PASS: connect-time audio policies persist"
 
+OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  "$ROOT/scripts/audio-preferences" set-default output concurrent-output &
+preference_writer_one=$!
+OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  "$ROOT/scripts/audio-preferences" set-profile AA:BB:CC:DD:EE:FF concurrent-profile &
+preference_writer_two=$!
+wait "$preference_writer_one" || fail "concurrent default preference writer"
+wait "$preference_writer_two" || fail "concurrent profile preference writer"
+OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$policy_overrides" \
+  "$ROOT/scripts/audio-preferences" show | jq -e '
+  .defaults.output == "concurrent-output"
+  and .bluetoothProfiles.aabbccddeeff == "concurrent-profile"
+  and .bluetoothAudioPolicies == {"001122334455":"output-mic"}
+' >/dev/null || fail "concurrent audio preferences lost an update"
+[[ $(stat -c %a "$policy_preferences") == 600 ]] \
+  || fail "audio preferences permissions"
+[[ $(stat -c %a "$policy_overrides") == 600 ]] \
+  || fail "Bluetooth audio policy permissions"
+echo "PASS: concurrent audio preferences are serialized"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 a2dp-sink-aac
+[[ ! -s $profile_log && $(<"$profile_state") == old ]] \
+  || fail "already-active profile recreated audio endpoints"
+echo "PASS: already-active profile is a no-op"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+partial_profile_status=0
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  OMARCHY_AUDIO_PREFERENCES_FILE="$corrupt_preferences" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-audio-profile-set" \
+    00:11:22:33:44:55 headset-head-unit-msbc \
+      >/dev/null 2>&1 || partial_profile_status=$?
+[[ $partial_profile_status == 2 && $(<"$profile_state") == new ]] \
+  || fail "applied but unsaved Bluetooth profile result"
+[[ $(<"$corrupt_preferences") == '{broken json' ]] \
+  || fail "unsaved Bluetooth profile overwrote corrupt preferences"
+echo "PASS: applied profile reports unsaved preference separately"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
 AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
   AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
@@ -621,7 +998,6 @@ set-card-profile bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
 set-sink-mute 101 true
 set-sink-volume 101 42%
 set-sink-mute 101 false
-set-source-mute 200 true
 set-source-volume 200 36%
 set-source-mute 200 true
 set-sink-input-mute 300 false
@@ -643,12 +1019,306 @@ AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
   AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
   AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_READ_DELAY=0.2 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc &
+first_profile_writer=$!
+first_profile_switch_started=false
+for (( lock_attempt = 0; lock_attempt < 100; lock_attempt++ )); do
+  if rg -q '^set-card-profile .* headset-head-unit-msbc$' "$profile_log"; then
+    first_profile_switch_started=true
+    break
+  fi
+  sleep 0.02
+done
+[[ $first_profile_switch_started == true ]] \
+  || fail "serialized audio profile transition did not start"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc &
+second_profile_writer=$!
+wait "$first_profile_writer" || fail "first serialized audio profile transition"
+wait "$second_profile_writer" || fail "second serialized audio profile transition"
+[[ $(rg -c '^set-card-profile .* headset-head-unit-msbc$' "$profile_log") == 1 ]] \
+  || fail "concurrent audio profile transitions were not serialized"
+echo "PASS: concurrent audio mutations are serialized"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
   AUDIO_CONTROL_PROFILE_LEGACY_CARD_FIELD=1 \
   PATH="$TEST_DIR/mocks:$PATH" \
   "$ROOT/scripts/audio-profile-set" \
     bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
 [[ $(<"$profile_log") == "$expected_profile_log" ]] || fail "legacy PulseAudio card association"
 echo "PASS: legacy PulseAudio card association"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_MULTIPLE_SINKS=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+expected_multiple_sink_log=$(cat <<'EOF'
+set-sink-mute 100 true
+set-sink-input-mute 300 true
+set-card-profile bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+set-sink-mute 101 true
+set-sink-mute 103 true
+set-sink-volume 101 42% 30%
+set-sink-mute 101 false
+set-sink-volume 103 17%
+set-sink-mute 103 true
+set-source-volume 200 36%
+set-source-mute 200 true
+set-sink-input-mute 300 false
+EOF
+)
+[[ $(<"$profile_log") == "$expected_multiple_sink_log" ]] \
+  || fail "per-endpoint audio state preservation"
+echo "PASS: per-endpoint audio state is preserved"
+
+: >"$profile_log"
+: >"$profile_recreate_state"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_RECREATE_STATE="$profile_recreate_state" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+[[ $(rg -c '^set-sink-mute 101 true$' "$profile_log") == 2 ]] \
+  || fail "recreated endpoint identity was mistaken for an already-muted node"
+echo "PASS: recreated endpoints are muted by serial identity"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_RECREATE_STREAM=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+if rg -q '^set-sink-input-mute 300 false$' "$profile_log"; then
+  fail "a replacement playback stream inherited the vanished stream's mute state"
+fi
+echo "PASS: replacement playback streams keep their own mute state"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_MOVE_STREAM=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+[[ $(rg -c '^set-sink-input-mute 300 true$' "$profile_log") == 1 \
+    && $(rg -c '^set-sink-input-mute 301 false$' "$profile_log") == 1 ]] \
+  || fail "a renumbered playback stream did not regain its mute state"
+echo "PASS: surviving playback streams follow serial identity"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_STREAM_MUTED=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+if rg -q '^set-sink-input-mute ' "$profile_log"; then
+  fail "an already-muted playback stream was changed unnecessarily"
+fi
+echo "PASS: unchanged muted playback streams are left alone"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_OLD_SOURCE_UNMUTED=1 \
+  AUDIO_CONTROL_PROFILE_NEW_SOURCE_UNMUTED=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+first_source_mute_line=$(rg -n -m1 '^set-source-mute 200 true$' "$profile_log" \
+  | cut -d: -f1)
+card_switch_line=$(rg -n -m1 '^set-card-profile ' "$profile_log" | cut -d: -f1)
+new_source_mute_line=$(rg -n '^set-source-mute 200 true$' "$profile_log" \
+  | tail -1 | cut -d: -f1)
+source_restore_line=$(rg -n -m1 '^set-source-volume 200 ' "$profile_log" | cut -d: -f1)
+[[ -n $first_source_mute_line && -n $new_source_mute_line \
+    && $first_source_mute_line -lt $card_switch_line \
+    && $new_source_mute_line -gt $card_switch_line \
+    && $new_source_mute_line -lt $source_restore_line ]] \
+  || fail "audio inputs were not muted across the profile transition"
+rg -q '^set-source-mute 200 false$' "$profile_log" \
+  || fail "audio input mute state was not restored"
+echo "PASS: audio input privacy is preserved during transitions"
+
+: >"$profile_log"
+: >"$profile_fail_once_state"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_NEW_SOURCE_UNMUTED=1 \
+  AUDIO_CONTROL_PROFILE_FAIL_ONCE_COMMAND=set-source-mute \
+  AUDIO_CONTROL_PROFILE_FAIL_ONCE_STATE="$profile_fail_once_state" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc >/dev/null 2>&1; then
+  fail "new endpoint mute failure reported success"
+fi
+[[ $(<"$profile_state") == old ]] \
+  || fail "new endpoint mute failure did not roll back the card"
+[[ $(rg -c '^set-card-profile ' "$profile_log") == 2 ]] \
+  || fail "new endpoint mute failure did not attempt the previous profile"
+echo "PASS: new endpoint preparation failure rolls back"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_NO_NEW_SOURCE=1 \
+  AUDIO_CONTROL_PROFILE_READ_DELAY=0.2 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc >/dev/null 2>&1 &
+profile_transition_pid=$!
+profile_transition_started=false
+for (( wait_attempt = 0; wait_attempt < 100; wait_attempt++ )); do
+  if [[ $(<"$profile_state") == new ]]; then
+    profile_transition_started=true
+    break
+  fi
+  sleep 0.02
+done
+if [[ $profile_transition_started != true ]]; then
+  kill -TERM "$profile_transition_pid" >/dev/null 2>&1 || true
+  wait "$profile_transition_pid" >/dev/null 2>&1 || true
+  fail "could not observe the cancellable profile transition"
+fi
+kill -TERM "$profile_transition_pid"
+cancelled_profile_status=0
+wait "$profile_transition_pid" || cancelled_profile_status=$?
+[[ $cancelled_profile_status -ne 0 && $(<"$profile_state") == old ]] \
+  || fail "cancelled profile transition did not roll back the card"
+[[ $(rg -c '^set-card-profile ' "$profile_log") == 2 ]] \
+  || fail "cancelled profile transition did not attempt the previous profile"
+echo "PASS: cancelled profile transition rolls back"
+
+: >"$profile_log"
+: >"$failed_preferences"
+printf 'old\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_NO_NEW_SOURCE=1 \
+  AUDIO_CONTROL_PROFILE_READ_DELAY=0.2 \
+  OMARCHY_AUDIO_PREFERENCES_FILE="$failed_preferences" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-audio-profile-set" \
+    00:11:22:33:44:55 headset-head-unit-msbc >/dev/null 2>&1 &
+profile_wrapper_pid=$!
+profile_transition_started=false
+for (( wait_attempt = 0; wait_attempt < 100; wait_attempt++ )); do
+  if [[ $(<"$profile_state") == new ]]; then
+    profile_transition_started=true
+    break
+  fi
+  sleep 0.02
+done
+if [[ $profile_transition_started != true ]]; then
+  kill -TERM "$profile_wrapper_pid" >/dev/null 2>&1 || true
+  wait "$profile_wrapper_pid" >/dev/null 2>&1 || true
+  fail "could not observe the cancellable Bluetooth profile wrapper"
+fi
+kill -TERM "$profile_wrapper_pid"
+cancelled_profile_status=0
+wait "$profile_wrapper_pid" || cancelled_profile_status=$?
+[[ $cancelled_profile_status -ne 0 && $(<"$profile_state") == old ]] \
+  || fail "cancelled Bluetooth profile wrapper did not roll back the card"
+[[ $(rg -c '^set-card-profile ' "$profile_log") == 2 && ! -s $failed_preferences ]] \
+  || fail "cancelled Bluetooth profile wrapper did not contain its child transaction"
+echo "PASS: cancelled Bluetooth profile wrapper rolls back"
+
+: >"$profile_log"
+: >"$profile_fail_once_state"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_FAIL_ONCE_COMMAND=set-source-volume \
+  AUDIO_CONTROL_PROFILE_FAIL_ONCE_STATE="$profile_fail_once_state" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc >/dev/null 2>&1; then
+  fail "profile restoration failure reported success"
+fi
+[[ $(<"$profile_state") == old ]] \
+  || fail "profile restoration failure did not roll back the card"
+[[ $(rg -c '^set-card-profile ' "$profile_log") == 2 ]] \
+  || fail "profile restoration failure did not attempt the previous profile"
+echo "PASS: profile restoration failure rolls back"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_FAIL_STREAM_UNMUTE=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc >/dev/null 2>&1; then
+  fail "playback stream restoration failure reported success"
+fi
+[[ $(<"$profile_state") == old \
+    && $(rg -c '^set-card-profile ' "$profile_log") == 2 ]] \
+  || fail "playback stream restoration failure did not roll back the card"
+echo "PASS: playback stream restoration failure rolls back"
+
+: >"$profile_log"
+printf 'new\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 a2dp-sink-aac >/dev/null 2>&1; then
+  fail "output-only profile succeeded while its old input remained"
+fi
+[[ $(<"$profile_state") == new \
+    && $(rg -c '^set-card-profile ' "$profile_log") == 2 ]] \
+  || fail "lingering input did not roll back the output-only profile"
+echo "PASS: zero-endpoint profile directions must settle"
 
 : >"$profile_log"
 printf 'old\n' >"$profile_state"
@@ -668,12 +1338,38 @@ expected_failure_log=$(cat <<'EOF'
 set-sink-mute 100 true
 set-sink-input-mute 300 true
 set-card-profile bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
-set-sink-input-mute 300 false
+set-card-profile bluez_card.00_11_22_33_44_55 a2dp-sink-aac
+set-sink-mute 100 true
+set-sink-volume 100 42%
 set-sink-mute 100 false
+set-source-volume 200 36%
+set-source-mute 200 true
+set-sink-input-mute 300 false
 EOF
 )
 [[ $(<"$profile_log") == "$expected_failure_log" ]] || fail "failed profile transition cleanup"
 echo "PASS: failed profile transition rollback"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_IGNORE_SET=1 \
+  OMARCHY_AUDIO_PREFERENCES_FILE="$failed_preferences" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  timeout 6 "$ROOT/scripts/bluetooth-audio-profile-set" \
+    00:11:22:33:44:55 headset-head-unit-msbc >/dev/null 2>&1; then
+  fail "unconfirmed Bluetooth profile change reported success"
+fi
+[[ $(<"$profile_state") == old ]] \
+  || fail "unconfirmed Bluetooth profile change did not retain the old card state"
+[[ ! -s $failed_preferences ]] \
+  || fail "unconfirmed Bluetooth profile change was persisted"
+[[ $(rg -c '^set-card-profile ' "$profile_log") == 2 ]] \
+  || fail "unconfirmed Bluetooth profile change did not attempt rollback"
+echo "PASS: profile activation is confirmed before persistence"
 
 : >"$profile_log"
 printf 'old\n' >"$profile_state"
@@ -697,6 +1393,22 @@ if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
   AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
   AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_INVALID_STREAM=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc >/dev/null 2>&1; then
+  fail "profile change continued with an invalid playback stream inventory"
+fi
+[[ ! -s $profile_log && $(<"$profile_state") == old ]] \
+  || fail "hardware changed with an invalid playback stream inventory"
+echo "PASS: playback stream inventory fails closed"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
   AUDIO_CONTROL_PROFILE_NO_NEW_SOURCE=1 \
   OMARCHY_AUDIO_PREFERENCES_FILE="$failed_preferences" \
   PATH="$TEST_DIR/mocks:$PATH" \
@@ -706,11 +1418,42 @@ if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
 fi
 rg -q '^set-sink-mute 101 true$' "$profile_log" \
   || fail "new output was not muted while waiting for the duplex input"
-if rg -q '^set-source-' "$profile_log"; then
-  fail "missing duplex input received state changes"
-fi
+expected_incomplete_rollback_log=$(cat <<'EOF'
+set-sink-mute 100 true
+set-sink-input-mute 300 true
+set-card-profile bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+set-sink-mute 101 true
+set-card-profile bluez_card.00_11_22_33_44_55 a2dp-sink-aac
+set-sink-mute 100 true
+set-sink-volume 100 42%
+set-sink-mute 100 false
+set-source-volume 200 36%
+set-source-mute 200 true
+set-sink-input-mute 300 false
+EOF
+)
+[[ $(<"$profile_log") == "$expected_incomplete_rollback_log" \
+    && $(<"$profile_state") == old ]] \
+  || fail "incomplete duplex profile did not restore the previous profile"
 [[ ! -s $failed_preferences ]] || fail "incomplete duplex profile was persisted"
-echo "PASS: duplex transition waits for input"
+echo "PASS: incomplete duplex transition rolls back"
+
+: >"$profile_log"
+printf 'old\n' >"$profile_state"
+bounded_wait_status=0
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_NO_NEW_SOURCE=1 \
+  AUDIO_CONTROL_PROFILE_READ_DELAY=0.2 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  timeout 6 "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc \
+      >/dev/null 2>&1 || bounded_wait_status=$?
+[[ $bounded_wait_status -ne 0 && $bounded_wait_status -ne 124 ]] \
+  || fail "profile endpoint wait was not bounded by wall-clock time"
+echo "PASS: profile endpoint wait is wall-clock bounded"
 
 : >"$profile_log"
 printf 'old\n' >"$profile_state"
@@ -719,13 +1462,17 @@ AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
   AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
   AUDIO_CONTROL_PROFILE_NO_OLD_SOURCE=1 \
+  AUDIO_CONTROL_PROFILE_NEW_SOURCE_UNMUTED=1 \
   OMARCHY_AUDIO_PREFERENCES_FILE="$no_source_preferences" \
   PATH="$TEST_DIR/mocks:$PATH" \
   "$ROOT/scripts/bluetooth-audio-profile-set" \
     00:11:22:33:44:55 headset-head-unit-msbc
-if rg -q '^set-source-' "$profile_log"; then
-  fail "new audio input was assigned an invented mute state"
+if rg -q '^set-source-volume ' "$profile_log"; then
+  fail "new audio input was assigned an invented volume"
 fi
+[[ $(rg -c '^set-source-mute 200 true$' "$profile_log") == 1 \
+    && $(rg -c '^set-source-mute 200 false$' "$profile_log") == 1 ]] \
+  || fail "new audio input did not regain its first observed mute state"
 jq -e '.bluetoothProfiles == {"001122334455":"headset-head-unit-msbc"}' \
   "$no_source_preferences" >/dev/null || fail "source-less profile transition preference"
 echo "PASS: unknown input state is preserved"
@@ -733,7 +1480,7 @@ echo "PASS: unknown input state is preserved"
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.6.1"
+  and .version == "0.6.2"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

@@ -46,10 +46,13 @@ window. When that companion is enabled, a settings button in this panel opens
 its Bluetooth tab directly, and renaming a device here also updates the name
 shown in the companion's device list.
 
-Both plugins read and write codec, preferred-device, and connect-policy
-choices through `~/.config/omarchy/audio-preferences.json`. The file is
-optional and each plugin continues to work on its own; live PipeWire state is
-used whenever a saved device or profile is unavailable.
+Both plugins share codec and preferred-device choices through
+`~/.config/omarchy/audio-preferences.json`. Connect policies are kept in
+`~/.config/omarchy/bluetooth-audio-policies.json`, an atomic plugin-owned
+sidecar, so a companion version that normalizes the shared schema cannot erase
+them. Policies from older versions of the shared file are migrated
+automatically. Both files are optional, and live PipeWire state is used whenever
+a saved device or profile is unavailable.
 
 More plugins by `ssupt`: [omarchy-plugins](https://github.com/ssupt/omarchy-plugins).
 
@@ -92,9 +95,13 @@ bar position.
 - Press Enter to activate the selected row or action, and Escape to close.
 
 Profile changes preserve the device's previous volume and mute state. The
-transition temporarily mutes affected outputs and streams so a newly created
-profile cannot expose a previously stored high volume. WirePlumber stores the
-selected profile per device and restores it on later connections.
+transition temporarily mutes affected outputs, inputs, and playback streams so
+a newly created profile cannot expose a previously stored high volume or an
+input before its privacy state is restored. It waits for a stable card and
+endpoint inventory under the same mutation lock used by the companion plugin.
+An incomplete, interrupted, unconfirmed, or state-restoration failure switches
+back to the previous profile. WirePlumber stores the selected profile per device
+and restores it on later connections.
 
 ## Development
 

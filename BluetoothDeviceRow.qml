@@ -22,10 +22,8 @@ CursorSurface {
     ? String(actionFailure.message || "") : ""
   readonly property string recoveryAction: controller.recoveryAction(dev ? dev.address : "")
   readonly property bool recoveryVisible: recoveryAction !== ""
-  readonly property bool cancellingPair: controller.deviceActionCancelRequested
-    && controller.activeDeviceAction && dev
-    && Model.normalizedAddress(controller.activeDeviceAction.address)
-      === Model.normalizedAddress(dev.address)
+  readonly property bool cancellingPair: dev
+    && controller.pairingCancellationPending(dev.address)
   readonly property string actionTooltip: {
     if (!dev) return ""
     if (isConnected) return "Disconnect"
@@ -47,9 +45,9 @@ CursorSurface {
   readonly property string activeCodec: Model.audioProfileCodec(
     profileState, profileState ? profileState.activeProfile : "")
   readonly property var deviceAudioSink: controller.bluetoothAudioSink(dev)
-  readonly property var deviceAudioSource: controller.activeAudioProfileHasInput(
-    dev ? dev.address : "") ? controller.bluetoothAudioSource(dev) : null
+  readonly property var deviceAudioSource: controller.bluetoothAudioSource(dev)
   readonly property bool useAudioAvailable: isConnected && !!deviceAudioSink
+  readonly property bool useAudioActionAvailable: controller.audioUseActionAvailable(dev)
   readonly property bool usingForAudio: useAudioAvailable
     && (controller.defaultAudioSink
       ? Model.sameAudioNode(deviceAudioSink, controller.defaultAudioSink)
@@ -57,9 +55,10 @@ CursorSurface {
 
   readonly property bool rowSelected: controller.cursorActive
     && controller.focusSection === sectionName && controller.selectedIndex === rowIndex
-  readonly property bool showDetailsButton: !recoveryVisible
-    && (rowMouse.containsMouse || rowSelected)
-  readonly property bool showUseAudioButton: !recoveryVisible && useAudioAvailable
+  // A failure such as "device is blocked" is resolved in Details. Keep that
+  // action reachable beside Retry/Cancel, including for keyboard-only users.
+  readonly property bool showDetailsButton: rowMouse.containsMouse || rowSelected
+  readonly property bool showUseAudioButton: !recoveryVisible && useAudioActionAvailable
     && (rowMouse.containsMouse || rowSelected)
 
   hasCursor: rowSelected && controller.focusedAction === ""
@@ -143,7 +142,8 @@ CursorSurface {
       width: Style.space(26)
       height: Style.space(26)
       iconName: row.dev ? String(row.dev.icon || "") : ""
-      deviceName: row.dev ? String(row.dev.name || row.dev.deviceName || "") : ""
+      deviceName: row.dev
+        ? String(row.dev.name || "") + " " + String(row.dev.deviceName || "") : ""
       connected: row.isConnected
       foreground: row.statusColor
       fontFamily: controller.bar.fontFamily
@@ -209,7 +209,9 @@ CursorSurface {
       value: row.currentProfileName
       options: row.profileOptions
       hasCursor: row.rowSelected && controller.focusedAction === "profile"
-      enabled: !controller.audioProfileChangeBusy
+      enabled: !controller.audioProfileChangeBusy && !controller.deviceActionBusy
+        && !controller.devicePropertyBusy
+        && controller.pendingAction(row.dev ? row.dev.address : "") === ""
       opacity: enabled ? 1 : 0.5
       foreground: controller.bar.foreground
       fontFamily: controller.bar.fontFamily
@@ -303,7 +305,9 @@ CursorSurface {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       visible: row.recoveryVisible
-      enabled: row.recoveryAction === "cancel" || !controller.deviceActionBusy
+      enabled: row.recoveryAction === "cancel"
+        || (!controller.deviceActionBusy && !controller.devicePropertyBusy
+          && !controller.audioProfileChangeBusy)
       iconText: row.recoveryAction === "cancel" ? "󰅙" : "󰑐"
       tooltipText: row.recoveryAction === "cancel" ? "Cancel pairing"
         : (row.actionFailureMessage !== ""

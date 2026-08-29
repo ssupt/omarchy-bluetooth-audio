@@ -14,8 +14,16 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 "$script_dir/audio-profiles" | jq -c '
   def normalized_address:
     ascii_downcase
-    | select(test("^([0-9a-f]{12}|[0-9a-f]{2}([:_-][0-9a-f]{2}){5})$"))
+    | if test("^([0-9a-f]{12}|[0-9a-f]{2}([:_-][0-9a-f]{2}){5})$") then .
+      elif test("dev_[0-9a-f]{2}([:_-][0-9a-f]{2}){5}") then
+        capture("dev_(?<address>[0-9a-f]{2}([:_-][0-9a-f]{2}){5})").address
+      elif test("bluez_card[._][0-9a-f]{2}([:_-][0-9a-f]{2}){5}") then
+        capture("bluez_card[._](?<address>[0-9a-f]{2}([:_-][0-9a-f]{2}){5})").address
+      else empty end
     | gsub("[:_-]"; "");
+
+  def canonical_address:
+    [scan("[0-9a-f]{2}")] | join(":") | ascii_upcase;
 
   def codec:
     try ((.label // "") | capture("codec (?<codec>[^)]+)"; "i").codec) catch ""
@@ -30,8 +38,13 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
   [
     .[]
-    | select(.bluetooth == true and (.address // "") != "")
+    | select(.bluetooth == true)
     | . as $card
+    # Be defensive when consuming audio-profiles from another compatible
+    # plugin version: an unusable device.string must not hide the MAC embedded
+    # in the canonical BlueZ card name.
+    | ([$card.address, $card.name] | map(normalized_address) | .[0] // "") as $address
+    | select($address != "")
     | [
         .profiles[]
         | select(.value != "off" and (.sinks // 0) > 0)
@@ -44,9 +57,12 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
       ] as $profiles
     | select($profiles | length > 0)
     | {
-        key: ($card.address | normalized_address),
+        key: $address,
         value: {
-          address: $card.address,
+          # Consumers invoke bluetooth-audio-profile-set, whose public identity
+          # is a BlueZ MAC. Never leak a device.string object path or card-name
+          # fallback into that command even though either can identify the key.
+          address: ($address | canonical_address),
           card: $card.name,
           label: $card.label,
           activeProfile: $card.activeProfile,

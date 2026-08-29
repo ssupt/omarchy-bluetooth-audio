@@ -28,8 +28,7 @@ function isUuidLike(value) {
 }
 
 function isAddressLike(value) {
-  var text = String(value || "").trim()
-  return /^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(text)
+  return normalizedAddress(value) !== ""
 }
 
 function normalizedAddress(value) {
@@ -44,7 +43,11 @@ function textContainsAddress(value, address) {
   var expected = normalizedAddress(address)
   if (expected === "") return false
 
-  var text = String(value || "")
+  // The final group of a Bluetooth service UUID is twelve hex digits and can
+  // otherwise masquerade as a raw MAC (for example 00805f9b34fb). Remove full
+  // UUID tokens before scanning node metadata for device identities.
+  var text = String(value || "").replace(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig, " ")
   var matcher = /(^|[^0-9a-f])([0-9a-f]{12}|[0-9a-f]{2}(?:[:_-][0-9a-f]{2}){5})(?=$|[^0-9a-f])/ig
   var match
   while ((match = matcher.exec(text)) !== null) {
@@ -53,10 +56,32 @@ function textContainsAddress(value, address) {
   return false
 }
 
+function textContainsAnyAddress(value) {
+  var text = String(value || "").replace(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig, " ")
+  return /(^|[^0-9a-f])([0-9a-f]{12}|[0-9a-f]{2}(?:[:_-][0-9a-f]{2}){5})(?=$|[^0-9a-f])/i.test(text)
+}
+
+function normalizedIdentity(value) {
+  // Treat ASCII punctuation the way PipeWire does when it turns labels into
+  // node metadata, but retain non-ASCII letters instead of making names such
+  // as “Écouteurs” or “耳机” impossible to match on legacy nodes without an
+  // explicit Bluetooth address.
+  return String(value || "").trim().toLowerCase()
+    .replace(/[\x00-\x2f\x3a-\x40\x5b-\x60\x7b-\x7f]+/g, " ").trim()
+}
+
+function safeStoredIdentifier(value, maximum) {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum
+    && !/[\x00-\x1f\x7f-\x9f\u200e\u200f\u2028-\u202e\u2066-\u2069]/.test(value)
+}
+
 function parseAudioPreferences(raw) {
   var parsed
+  var text = String(raw || "{}")
+  if (text.length > 1048576) text = "{}"
   try {
-    parsed = JSON.parse(String(raw || "{}"))
+    parsed = JSON.parse(text)
   } catch (e) {
     parsed = {}
   }
@@ -71,7 +96,7 @@ function parseAudioPreferences(raw) {
   for (var address in rawProfiles) {
     var key = normalizedAddress(address)
     var profile = rawProfiles[address]
-    if (key !== "" && typeof profile === "string" && profile !== "") profiles[key] = profile
+    if (key !== "" && safeStoredIdentifier(profile, 160)) profiles[key] = profile
   }
 
   var rawPolicies = parsed.bluetoothAudioPolicies
@@ -86,11 +111,74 @@ function parseAudioPreferences(raw) {
   return {
     version: 1,
     defaults: {
-      output: typeof defaults.output === "string" ? defaults.output : "",
-      input: typeof defaults.input === "string" ? defaults.input : ""
+      output: safeStoredIdentifier(defaults.output, 160) ? defaults.output : "",
+      input: safeStoredIdentifier(defaults.input, 160) ? defaults.input : ""
     },
     bluetoothProfiles: profiles,
     bluetoothAudioPolicies: policies
+  }
+}
+
+// Connect-policy overrides live in a plugin-owned sidecar because compatible
+// audio-preference writers are allowed to normalize the shared schema and may
+// discard fields they do not understand. "manual" is retained here as an
+// explicit tombstone so it can override a legacy automatic policy still found
+// in the shared file.
+function parseAudioPolicyOverrides(raw) {
+  var parsed
+  var text = String(raw || "{}")
+  if (text.length > 1048576) text = "{}"
+  try {
+    parsed = JSON.parse(text)
+  } catch (e) {
+    parsed = {}
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = {}
+  var rawPolicies = parsed.bluetoothAudioPolicies
+  if (!rawPolicies || typeof rawPolicies !== "object" || Array.isArray(rawPolicies)) rawPolicies = {}
+
+  var policies = {}
+  for (var address in rawPolicies) {
+    var key = normalizedAddress(address)
+    var policy = rawPolicies[address]
+    if (key !== "" && (policy === "manual" || isValidAudioPolicy(policy)))
+      policies[key] = policy
+  }
+  return policies
+}
+
+function mergeAudioPreferences(shared, policyOverrides) {
+  var source = shared && typeof shared === "object"
+    ? shared : parseAudioPreferences("")
+  var profiles = cloneMap(source.bluetoothProfiles || {})
+  var policies = cloneMap(source.bluetoothAudioPolicies || {})
+  var overrides = policyOverrides && typeof policyOverrides === "object"
+    ? policyOverrides : {}
+
+  for (var address in overrides) {
+    if (overrides[address] === "manual") delete policies[address]
+    else if (isValidAudioPolicy(overrides[address])) policies[address] = overrides[address]
+  }
+  return {
+    version: 1,
+    defaults: {
+      output: String(source.defaults && source.defaults.output || ""),
+      input: String(source.defaults && source.defaults.input || "")
+    },
+    bluetoothProfiles: profiles,
+    bluetoothAudioPolicies: policies
+  }
+}
+
+function isAudioPreferencesDocument(raw) {
+  var text = String(raw || "").trim()
+  if (text === "") return true
+  if (text.length > 1048576) return false
+  try {
+    var parsed = JSON.parse(text)
+    return !!parsed && typeof parsed === "object" && !Array.isArray(parsed)
+  } catch (e) {
+    return false
   }
 }
 
@@ -165,13 +253,43 @@ function nodeProps(node) {
   return node && node.ready && node.properties ? node.properties : {}
 }
 
-function nodeText(node) {
+function isAudioSource(node) {
+  if (!node || node.isSink || node.isStream || !node.audio) return false
+  var name = String(node.name || "")
+  if (/\.monitor$/i.test(name)) return false
+
   var props = nodeProps(node)
-  return [
-    node ? node.name : "",
-    node ? node.description : "",
-    node ? node.nickname : "",
-    node ? node.nick : "",
+  return String(props["media.class"] || "") !== "Audio/Sink"
+}
+
+function identityLabelIsAmbiguous(label, device, peers) {
+  var values = toArray(peers)
+  if (values.length < 2) return false
+  var address = normalizedAddress(device ? device.address : "")
+
+  for (var i = 0; i < values.length; i++) {
+    var peer = values[i]
+    if (!peer || peer === device) continue
+    var peerAddress = normalizedAddress(peer.address)
+    if (address !== "" && peerAddress === address) continue
+    if (normalizedIdentity(peer.name) === label
+        || normalizedIdentity(peer.deviceName) === label) return true
+  }
+  return false
+}
+
+function bluetoothNodeMatchesDevice(node, device, direction, peers) {
+  if (!node || node.isStream || !device) return false
+  if (direction === "sink" && !node.isSink) return false
+  if (direction === "source" && !isAudioSource(node)) return false
+
+  var address = normalizedAddress(device.address)
+  var props = nodeProps(node)
+  var fields = [
+    node.name,
+    node.description,
+    node.nickname,
+    node.nick,
     props["node.name"],
     props["node.description"],
     props["node.nick"],
@@ -183,43 +301,42 @@ function nodeText(node) {
     props["api.bluez5.address"],
     props["bluez5.address"],
     props["media.name"]
-  ].join(" ").toLowerCase()
-}
+  ]
+  var carriesAddress = false
+  for (var field = 0; field < fields.length; field++) {
+    if (isUuidLike(fields[field])) continue
+    if (textContainsAddress(fields[field], address)) return true
+    if (textContainsAnyAddress(fields[field])) carriesAddress = true
+  }
 
-function isAudioSource(node) {
-  if (!node || node.isSink || node.isStream || !node.audio) return false
-  var name = String(node.name || "")
-  if (/\.monitor$/i.test(name)) return false
-
-  var props = nodeProps(node)
-  return String(props["media.class"] || "") !== "Audio/Sink"
-}
-
-function bluetoothNodeMatchesDevice(node, device, direction) {
-  if (!node || node.isStream || !device) return false
-  if (direction === "sink" && !node.isSink) return false
-  if (direction === "source" && !isAudioSource(node)) return false
-
-  var address = normalizedAddress(device.address)
-  var text = nodeText(node)
-  if (textContainsAddress(text, address)) return true
+  // An explicit address belongs to exactly one device. Never let a generic
+  // model name (for example two identical headsets) override a mismatching
+  // address and route audio to whichever node happens to be listed first.
+  if (carriesAddress) return false
 
   // PipeWire may retain the hardware name after the user assigns a BlueZ
-  // alias, so match either label when node metadata lacks an address.
-  var labels = [device.name, device.deviceName]
+  // alias, so match either label when node metadata genuinely lacks an
+  // address. Compare complete normalized fields rather than substrings: a
+  // device called "Buds" must not claim a node called "Buds Pro". If two live
+  // devices share the same label, fail closed because name-only metadata
+  // cannot identify which one owns the endpoint.
+  var labels = [normalizedIdentity(device.name), normalizedIdentity(device.deviceName)]
   for (var i = 0; i < labels.length; i++) {
-    var label = String(labels[i] || "").trim().toLowerCase()
-    if (label !== "" && text.indexOf(label) !== -1) return true
+    var label = labels[i]
+    if (label === "") continue
+    for (var candidate = 0; candidate < fields.length; candidate++)
+      if (normalizedIdentity(fields[candidate]) === label
+          && !identityLabelIsAmbiguous(label, device, peers)) return true
   }
   return false
 }
 
-function bluetoothSinkMatchesDevice(node, device) {
-  return bluetoothNodeMatchesDevice(node, device, "sink")
+function bluetoothSinkMatchesDevice(node, device, peers) {
+  return bluetoothNodeMatchesDevice(node, device, "sink", peers)
 }
 
-function bluetoothSourceMatchesDevice(node, device) {
-  return bluetoothNodeMatchesDevice(node, device, "source")
+function bluetoothSourceMatchesDevice(node, device, peers) {
+  return bluetoothNodeMatchesDevice(node, device, "source", peers)
 }
 
 function sameAudioNode(left, right) {
@@ -297,6 +414,23 @@ function duplexProfileOption(state) {
   return null
 }
 
+function preferredDuplexProfileOption(preferences, address, state) {
+  if (!state) return null
+  var profiles = Array.isArray(state.profiles) ? state.profiles : []
+  var saved = preferredAudioProfile(preferences, address, audioProfileOptions(state), "")
+  if (saved !== "" && audioProfileHasInput(state, saved)) {
+    for (var i = 0; i < profiles.length; i++) {
+      var profile = profiles[i]
+      if (!profile || String(profile.value || profile.name || "") !== saved) continue
+      return {
+        value: saved,
+        label: String(profile.label || profile.description || saved)
+      }
+    }
+  }
+  return duplexProfileOption(state)
+}
+
 // Whether connect-time audio policies make sense at all. PipeWire card
 // state only exists while connected, so offline decisions rely on BlueZ's
 // coarse icon class first and the same label hints the glyph picker uses
@@ -334,10 +468,27 @@ function parseDeviceAliases(raw) {
   var aliases = {}
   for (var node in rawAliases) {
     var label = rawAliases[node]
-    if (node !== "" && typeof label === "string" && label.trim() !== "")
-      aliases[node] = label.trim()
+    var trimmed = typeof label === "string" ? label.trim() : ""
+    if (safeStoredIdentifier(node, 160) && safeStoredIdentifier(trimmed, 80))
+      aliases[node] = trimmed
   }
   return aliases
+}
+
+// PipeWire node names are not stable across Bluetooth profiles or versions:
+// outputs and inputs may use different separators and numeric suffixes. Match
+// saved companion aliases by the embedded device address instead of guessing a
+// particular bluez_output/bluez_input spelling.
+function deviceAliasKeysForAddress(aliases, address) {
+  if (normalizedAddress(address) === "" || !aliases
+      || typeof aliases !== "object" || Array.isArray(aliases)) return []
+
+  var keys = []
+  for (var node in aliases) {
+    if (safeStoredIdentifier(node, 160) && textContainsAddress(node, address))
+      keys.push(node)
+  }
+  return keys
 }
 
 function sortedByLabel(devices) {
@@ -380,7 +531,12 @@ function deviceLists(devices) {
 
   for (var i = 0; i < values.length; i++) {
     var d = values[i]
-    if (!d || !hasHumanName(d)) continue
+    if (!d) continue
+    // Anonymous discovery noise is not useful, but a connected or remembered
+    // device must remain reachable even when BlueZ only exposes its address.
+    // Otherwise users cannot disconnect, unblock, or forget it.
+    if (!hasHumanName(d) && !d.connected && !d.paired && !d.bonded
+        && !d.trusted && !d.blocked) continue
     if (d.connected) connected.push(d)
     // Keep blocked devices reachable even if they are not paired or trusted;
     // otherwise the only control that can unblock them disappears as soon as
@@ -398,9 +554,9 @@ function deviceLists(devices) {
 
 // Tracks actual disconnected -> connected edges without treating devices that
 // are already connected when the shell starts as new connections. Missing
-// devices remain known as disconnected so a later reappearance can still be
-// recognized as a reconnect.
-function observeDeviceConnections(previous, devices) {
+// devices are dropped so discovery churn cannot grow this map forever; once
+// the startup baseline is ready, a connected reappearance is itself an edge.
+function observeDeviceConnections(previous, devices, includeNewConnections) {
   var before = previous && typeof previous === "object" ? previous : {}
   var values = toArray(devices)
   var states = {}
@@ -411,13 +567,11 @@ function observeDeviceConnections(previous, devices) {
     var key = normalizedAddress(device ? device.address : "")
     if (key === "") continue
     var isConnected = !!device.connected
-    if (isConnected && before[key] === false)
+    var wasObserved = Object.prototype.hasOwnProperty.call(before, key)
+    if (isConnected && (before[key] === false || (!!includeNewConnections && !wasObserved)))
       connected.push({ key: key, address: String(device.address) })
     states[key] = isConnected
   }
-
-  for (var oldKey in before)
-    if (states[oldKey] === undefined) states[oldKey] = false
 
   return { states: states, connected: connected }
 }
@@ -440,14 +594,16 @@ function cloneMap(map) {
 }
 
 function pendingAction(actions, address) {
-  return address && actions && actions[address] ? actions[address] : ""
+  var key = normalizedAddress(address)
+  return key !== "" && actions && actions[key] ? actions[key] : ""
 }
 
 function withPendingAction(actions, address, action) {
   var next = cloneMap(actions)
-  if (!address) return next
-  if (action) next[address] = action
-  else delete next[address]
+  var key = normalizedAddress(address)
+  if (key === "") return next
+  if (action) next[key] = action
+  else delete next[key]
   return next
 }
 
@@ -469,7 +625,7 @@ function withDeviceActionFailure(failures, address, action, message) {
 
 function deviceActionReachedState(action, device) {
   if (action === "pair" || action === "connect") return !!device && !!device.connected
-  if (action === "disconnect") return !!device && !device.connected
+  if (action === "disconnect") return !device || !device.connected
   if (action === "forget")
     return !device || (!device.paired && !device.bonded && !device.trusted && !device.blocked)
   return false
@@ -563,7 +719,11 @@ if (typeof module !== "undefined") {
     isAddressLike: isAddressLike,
     normalizedAddress: normalizedAddress,
     textContainsAddress: textContainsAddress,
+    textContainsAnyAddress: textContainsAnyAddress,
     parseAudioPreferences: parseAudioPreferences,
+    parseAudioPolicyOverrides: parseAudioPolicyOverrides,
+    mergeAudioPreferences: mergeAudioPreferences,
+    isAudioPreferencesDocument: isAudioPreferencesDocument,
     isValidAudioPolicy: isValidAudioPolicy,
     audioPolicyOrder: audioPolicyOrder,
     deviceAudioPolicy: deviceAudioPolicy,
@@ -573,7 +733,6 @@ if (typeof module !== "undefined") {
     currentAudioNodeName: currentAudioNodeName,
     hasHumanName: hasHumanName,
     nodeProps: nodeProps,
-    nodeText: nodeText,
     isAudioSource: isAudioSource,
     bluetoothSinkMatchesDevice: bluetoothSinkMatchesDevice,
     bluetoothSourceMatchesDevice: bluetoothSourceMatchesDevice,
@@ -583,6 +742,7 @@ if (typeof module !== "undefined") {
     audioProfileCodec: audioProfileCodec,
     audioProfileHasInput: audioProfileHasInput,
     duplexProfileOption: duplexProfileOption,
+    preferredDuplexProfileOption: preferredDuplexProfileOption,
     isAudioDevice: isAudioDevice,
     sortedByLabel: sortedByLabel,
     deviceRow: deviceRow,
@@ -596,6 +756,7 @@ if (typeof module !== "undefined") {
     withDeviceActionFailure: withDeviceActionFailure,
     deviceActionReachedState: deviceActionReachedState,
     parseDeviceAliases: parseDeviceAliases,
+    deviceAliasKeysForAddress: deviceAliasKeysForAddress,
     visibleSections: visibleSections,
     sectionDevices: sectionDevices,
     deviceIconGlyph: deviceIconGlyph

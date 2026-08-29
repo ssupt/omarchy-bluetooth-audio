@@ -2,16 +2,29 @@
 
 # omarchy:summary=Show or update preferences shared by Omarchy audio plugins
 # omarchy:group=audio
-# omarchy:args=[set-default <output|input> <node-name> | set-profile <bluetooth-address> <profile> | set-policy <bluetooth-address> <manual|output|output-mic>]
+# omarchy:args=[set-default <output|input> <node-name> | set-profile <bluetooth-address> <profile> | set-policy <bluetooth-address> <manual|output|output-mic> | migrate-policies]
 
 set -euo pipefail
+umask 077
 
 preferences_file=${OMARCHY_AUDIO_PREFERENCES_FILE:-${XDG_CONFIG_HOME:-${HOME:?}/.config}/omarchy/audio-preferences.json}
+policy_file=${OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE:-${XDG_CONFIG_HOME:-${HOME:?}/.config}/omarchy/bluetooth-audio-policies.json}
 action=${1:-show}
+maximum_store_bytes=1048576
+
+if [[ $policy_file == "$preferences_file" ]] \
+    || [[ -e $policy_file && -e $preferences_file && $policy_file -ef $preferences_file ]]; then
+  echo "Bluetooth audio policies must use a separate preferences file" >&2
+  exit 1
+fi
 
 usage() {
-  echo "Usage: audio-preferences [show | set-default <output|input> <node-name> | set-profile <bluetooth-address> <profile> | set-policy <bluetooth-address> <manual|output|output-mic>]" >&2
+  echo "Usage: audio-preferences [show | set-default <output|input> <node-name> | set-profile <bluetooth-address> <profile> | set-policy <bluetooth-address> <manual|output|output-mic> | migrate-policies]" >&2
   exit 1
+}
+
+default_policy_overrides() {
+  printf '%s\n' '{"version":1,"bluetoothAudioPolicies":{}}'
 }
 
 default_preferences() {
@@ -32,9 +45,28 @@ normalize_address() {
   printf '%s\n' "$normalized"
 }
 
+validate_identifier() {
+  local value=$1 maximum=$2
+  jq -ner --arg value "$value" --argjson maximum "$maximum" '
+    $value
+    | select(length > 0 and length <= $maximum)
+    | select(test("[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028-\u202e\u2066-\u2069]") | not)
+  '
+}
+
 read_preferences() {
-  if [[ -s $preferences_file ]] && jq -e 'type == "object"' "$preferences_file" >/dev/null 2>&1; then
+  if [[ ! -s $preferences_file ]]; then
+    default_preferences
+  elif (( $(stat -c %s -- "$preferences_file" 2>/dev/null \
+      || printf '%s' "$((maximum_store_bytes + 1))") > maximum_store_bytes )); then
+    echo "Audio preferences are too large; refusing to overwrite them" >&2
+    return 1
+  elif jq -e 'type == "object"' "$preferences_file" >/dev/null 2>&1; then
     jq -c '
+      def identifier($maximum):
+        if type == "string" and length > 0 and length <= $maximum
+            and (test("[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028-\u202e\u2066-\u2069]") | not)
+          then . else "" end;
       def normalize_bluetooth_keys:
         with_entries(
           .key |= ascii_downcase
@@ -44,12 +76,12 @@ read_preferences() {
 
       .version = 1
       | .defaults = (if (.defaults | type) == "object" then .defaults else {} end)
-      | .defaults.output = (if (.defaults.output | type) == "string" then .defaults.output else "" end)
-      | .defaults.input = (if (.defaults.input | type) == "string" then .defaults.input else "" end)
+      | .defaults.output = (.defaults.output | identifier(160))
+      | .defaults.input = (.defaults.input | identifier(160))
       | .bluetoothProfiles = (
           (if (.bluetoothProfiles | type) == "object" then .bluetoothProfiles else {} end)
           | normalize_bluetooth_keys
-          | with_entries(select((.value | type) == "string" and .value != ""))
+          | with_entries(.value |= identifier(160) | select(.value != ""))
         )
       | .bluetoothAudioPolicies = (
           (if (.bluetoothAudioPolicies | type) == "object" then .bluetoothAudioPolicies else {} end)
@@ -58,7 +90,41 @@ read_preferences() {
         )
     ' "$preferences_file"
   else
-    default_preferences
+    echo "Audio preferences contain invalid JSON; refusing to overwrite them" >&2
+    return 1
+  fi
+}
+
+read_policy_overrides() {
+  if [[ ! -s $policy_file ]]; then
+    default_policy_overrides
+  elif (( $(stat -c %s -- "$policy_file" 2>/dev/null \
+      || printf '%s' "$((maximum_store_bytes + 1))") > maximum_store_bytes )); then
+    echo "Bluetooth audio policies are too large; refusing to overwrite them" >&2
+    return 1
+  elif jq -e 'type == "object"' "$policy_file" >/dev/null 2>&1; then
+    jq -c '
+      def normalize_bluetooth_keys:
+        with_entries(
+          .key |= ascii_downcase
+          | select(.key | test("^([0-9a-f]{12}|[0-9a-f]{2}([:_-][0-9a-f]{2}){5})$"))
+          | .key |= gsub("[:_-]"; "")
+        );
+
+      {
+        version: 1,
+        bluetoothAudioPolicies: (
+          (if (.bluetoothAudioPolicies | type) == "object"
+            then .bluetoothAudioPolicies else {} end)
+          | normalize_bluetooth_keys
+          | with_entries(select(.value == "manual"
+              or .value == "output" or .value == "output-mic"))
+        )
+      }
+    ' "$policy_file"
+  else
+    echo "Bluetooth audio policies contain invalid JSON; refusing to overwrite them" >&2
+    return 1
   fi
 }
 
@@ -71,25 +137,68 @@ write_preferences() {
   mkdir -p -- "$preferences_dir"
   lock_file="${preferences_file}.lock"
   exec 9>"$lock_file"
-  flock 9
+  flock -w 5 9 || {
+    echo "Timed out waiting to update audio preferences" >&2
+    return 1
+  }
 
   temporary_file=$(mktemp "$preferences_dir/.audio-preferences.XXXXXX")
   trap 'rm -f -- "$temporary_file"' EXIT
-  read_preferences | jq "$@" "$filter" >"$temporary_file"
+  if ! read_preferences | jq "$@" "$filter" >"$temporary_file"; then
+    rm -f -- "$temporary_file"
+    trap - EXIT
+    return 1
+  fi
   chmod 600 "$temporary_file"
   mv -f -- "$temporary_file" "$preferences_file"
+  trap - EXIT
+}
+
+write_policy_overrides() {
+  local filter=$1
+  shift
+
+  local policy_dir lock_file temporary_file
+  policy_dir=$(dirname -- "$policy_file")
+  mkdir -p -- "$policy_dir"
+  lock_file="${policy_file}.lock"
+  exec 8>"$lock_file"
+  flock -w 5 8 || {
+    echo "Timed out waiting to update Bluetooth audio policies" >&2
+    return 1
+  }
+
+  temporary_file=$(mktemp "$policy_dir/.bluetooth-audio-policies.XXXXXX")
+  trap 'rm -f -- "$temporary_file"' EXIT
+  if ! read_policy_overrides | jq "$@" "$filter" >"$temporary_file"; then
+    rm -f -- "$temporary_file"
+    trap - EXIT
+    return 1
+  fi
+  chmod 600 "$temporary_file"
+  mv -f -- "$temporary_file" "$policy_file"
   trap - EXIT
 }
 
 case "$action" in
   show)
     (( $# == 0 || $# == 1 )) || usage
-    read_preferences
+    shared_preferences=$(read_preferences)
+    policy_overrides=$(read_policy_overrides)
+    jq -cn --argjson shared "$shared_preferences" \
+      --argjson overrides "$policy_overrides" '
+      $shared
+      | .bluetoothAudioPolicies = reduce
+          ($overrides.bluetoothAudioPolicies | to_entries[]) as $entry
+          (.bluetoothAudioPolicies;
+            if $entry.value == "manual" then del(.[$entry.key])
+            else .[$entry.key] = $entry.value end)
+    '
     ;;
   set-default)
     (( $# == 3 )) || usage
     direction=$2
-    node_name=$3
+    node_name=$(validate_identifier "$3" 160) || usage
     [[ $direction == output || $direction == input ]] || usage
     [[ -n $node_name ]] || usage
     write_preferences \
@@ -99,7 +208,7 @@ case "$action" in
   set-profile)
     (( $# == 3 )) || usage
     address=$(normalize_address "$2") || usage
-    profile=$3
+    profile=$(validate_identifier "$3" 160) || usage
     [[ -n $profile ]] || usage
     write_preferences \
       '.version = 1 | .bluetoothProfiles[$address] = $profile' \
@@ -109,18 +218,34 @@ case "$action" in
     (( $# == 3 )) || usage
     address=$(normalize_address "$2") || usage
     policy=$3
-    # Manual is the default, so storing it would only obscure the devices
-    # that actually opted into automatic routing.
-    if [[ $policy == manual ]]; then
-      write_preferences \
-        '.version = 1 | .bluetoothAudioPolicies |= del(.[$address])' \
-        --arg address "$address"
-    elif [[ $policy == output || $policy == output-mic ]]; then
-      write_preferences \
+    if [[ $policy == manual || $policy == output || $policy == output-mic ]]; then
+      # Manual is an explicit tombstone in the sidecar. It must continue to
+      # override a legacy automatic policy until migration or another writer
+      # removes that old field from the shared preferences document.
+      write_policy_overrides \
         '.version = 1 | .bluetoothAudioPolicies[$address] = $policy' \
         --arg address "$address" --arg policy "$policy"
     else
       usage
+    fi
+    ;;
+  migrate-policies)
+    (( $# == 1 )) || usage
+    # Lock the shared document while taking the migration snapshot. Compatible
+    # companion writers use the same lock path for their atomic replacements.
+    exec 7>"${preferences_file}.lock"
+    flock -w 5 7 || {
+      echo "Timed out waiting to migrate Bluetooth audio policies" >&2
+      exit 1
+    }
+    legacy_policies=$(read_preferences | jq -c '.bluetoothAudioPolicies')
+    if (( $(jq 'length' <<<"$legacy_policies") > 0 )); then
+      write_policy_overrides '
+        .version = 1
+        | .bluetoothAudioPolicies = reduce ($legacy | to_entries[]) as $entry
+            (.bluetoothAudioPolicies;
+              if has($entry.key) then . else .[$entry.key] = $entry.value end)
+      ' --argjson legacy "$legacy_policies"
     fi
     ;;
   *) usage ;;

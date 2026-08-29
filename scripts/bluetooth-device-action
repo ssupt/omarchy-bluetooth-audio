@@ -5,6 +5,7 @@
 # omarchy:args=<pair|connect|disconnect|forget> <address>
 
 set -uo pipefail
+export LC_ALL=C
 
 action=${1:-}
 address=${2:-}
@@ -46,7 +47,7 @@ failure_message() {
   local lower=${output,,}
   local detail
 
-  if (( status == 124 )); then
+  if (( status == 124 || status == 137 )); then
     case "$phase" in
       pair) echo "Pairing timed out. Put the device in pairing mode and try again." ;;
       connect) echo "Connection timed out. Make sure the device is nearby and awake." ;;
@@ -111,7 +112,7 @@ run_control() {
     echo "Could not start the Bluetooth operation." >&2
     return 1
   }
-  timeout "${seconds}s" bluetoothctl "$@" >"$active_output_file" 2>&1 &
+  timeout --kill-after=2s "${seconds}s" bluetoothctl "$@" >"$active_output_file" 2>&1 &
   active_control_pid=$!
   status=0
   wait "$active_control_pid" || status=$?
@@ -150,24 +151,22 @@ run_control() {
 
 ensure_powered() {
   local state
-  state=$(timeout 2s bluetoothctl show 2>/dev/null | strip_terminal_codes) || state=
+  state=$(timeout --kill-after=1s 2s bluetoothctl show 2>/dev/null | strip_terminal_codes) || state=
   [[ $state == *"Powered: yes"* ]] && return 0
 
   if ! omarchy-bluetooth-power on >/dev/null 2>&1; then
     echo "The Bluetooth adapter could not be powered on." >&2
     return 1
   fi
-
-  state=$(timeout 2s bluetoothctl show 2>/dev/null | strip_terminal_codes) || state=
-  if [[ $state != *"Powered: yes"* ]]; then
-    echo "The Bluetooth adapter is not ready. Turn Bluetooth on and try again." >&2
-    return 1
-  fi
+  # omarchy-bluetooth-power waits for a powered controller and handles
+  # multi-controller machines. A second default-controller-only check would
+  # incorrectly reject a device owned by another powered adapter; the actual
+  # pair/connect command remains the authoritative readiness check.
 }
 
 ensure_not_blocked() {
   local info
-  info=$(timeout 2s bluetoothctl info "$address" 2>/dev/null | strip_terminal_codes) || return 0
+  info=$(timeout --kill-after=1s 2s bluetoothctl info "$address" 2>/dev/null | strip_terminal_codes) || return 0
   if [[ $info == *"Blocked: yes"* ]]; then
     echo "This device is blocked. Unblock it before trying again." >&2
     return 1
@@ -198,9 +197,9 @@ case "$action" in
     run_control disconnect 10 disconnect "$address" || exit 1
     ;;
   forget)
-    ensure_powered || exit 1
     # Removal is authoritative and also tears down a live connection. Do not
-    # make a misbehaving device's failed disconnect prevent it being forgotten.
+    # power the radio on just to remove cached bonding data, and do not make a
+    # misbehaving device's failed disconnect prevent it being forgotten.
     run_control disconnect 10 disconnect "$address" >/dev/null 2>&1 || true
     run_control remove 10 remove "$address" || exit 1
     ;;

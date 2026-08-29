@@ -1,7 +1,20 @@
 #!/bin/bash
 
 if [[ $* == "-f json list cards" && -n ${AUDIO_CONTROL_CARD_FIXTURE:-} ]]; then
-  command cat "$AUDIO_CONTROL_CARD_FIXTURE"
+  if [[ -n ${AUDIO_CONTROL_PROFILE_STATE:-} && -s ${AUDIO_CONTROL_PROFILE_STATE:-} ]]; then
+    state=$(<"$AUDIO_CONTROL_PROFILE_STATE")
+    card_name=${AUDIO_CONTROL_PROFILE_CARD_NAME:-bluez_card.00_11_22_33_44_55}
+    if [[ $state == old ]]; then
+      active_profile=${AUDIO_CONTROL_PROFILE_OLD_PROFILE:-a2dp-sink-aac}
+    else
+      active_profile=${AUDIO_CONTROL_PROFILE_NEW_PROFILE:-headset-head-unit-msbc}
+    fi
+    jq -c --arg card "$card_name" --arg profile "$active_profile" '
+      map(if .name == $card then .active_profile = $profile else . end)
+    ' "$AUDIO_CONTROL_CARD_FIXTURE"
+  else
+    command cat "$AUDIO_CONTROL_CARD_FIXTURE"
+  fi
   exit 0
 fi
 
@@ -21,35 +34,97 @@ if [[ -n ${AUDIO_CONTROL_PROFILE_LOG:-} && -n ${AUDIO_CONTROL_PROFILE_STATE:-} ]
       if [[ $state == old && ${AUDIO_CONTROL_PROFILE_SINK_READ_FAIL:-0} == 1 ]]; then
         exit 1
       fi
-      if [[ $state == old ]]; then
+      if [[ $state == new && -n ${AUDIO_CONTROL_PROFILE_READ_DELAY:-} ]]; then
+        sleep "$AUDIO_CONTROL_PROFILE_READ_DELAY"
+      fi
+      sink_endpoint_card=$endpoint_card
+      if [[ $state == new && -n ${AUDIO_CONTROL_PROFILE_RECREATE_STATE:-} ]]; then
+        recreate_reads=0
+        [[ ! -s $AUDIO_CONTROL_PROFILE_RECREATE_STATE ]] \
+          || recreate_reads=$(<"$AUDIO_CONTROL_PROFILE_RECREATE_STATE")
+        (( recreate_reads++ ))
+        printf '%s\n' "$recreate_reads" >"$AUDIO_CONTROL_PROFILE_RECREATE_STATE"
+        (( recreate_reads > 1 )) && recreate_reads=2
+        if [[ ${AUDIO_CONTROL_PROFILE_LEGACY_CARD_FIELD:-0} == 1 ]]; then
+          sink_endpoint_card=$(printf '%s,"properties":{"object.serial":"%s"}' \
+            "$endpoint_card" "$recreate_reads")
+        else
+          sink_endpoint_card=$(printf \
+            '"properties":{"device.name":"%s","object.serial":"%s"}' \
+            "$card_name" "$recreate_reads")
+        fi
+      fi
+      if [[ ${AUDIO_CONTROL_PROFILE_MULTIPLE_SINKS:-0} == 1 && $state == old ]]; then
+        printf '[{"index":100,%s,"name":"output.one","volume":{"front-left":{"value_percent":"42%%"},"front-right":{"value_percent":"30%%"}},"mute":false},{"index":102,%s,"name":"output.two","volume":{"front-left":{"value_percent":"17%%"}},"mute":true}]\n' "$endpoint_card" "$endpoint_card"
+      elif [[ ${AUDIO_CONTROL_PROFILE_MULTIPLE_SINKS:-0} == 1 ]]; then
+        printf '[{"index":101,%s,"name":"output.one","volume":{"front-left":{"value_percent":"100%%"},"front-right":{"value_percent":"100%%"}},"mute":false},{"index":103,%s,"name":"output.two","volume":{"front-left":{"value_percent":"90%%"}},"mute":false}]\n' "$sink_endpoint_card" "$sink_endpoint_card"
+      elif [[ $state == old ]]; then
         printf '[{"index":100,%s,"volume":{"front-left":{"value_percent":"42%%"}},"mute":false}]\n' "$endpoint_card"
       else
-        printf '[{"index":101,%s,"volume":{"front-left":{"value_percent":"100%%"}},"mute":false}]\n' "$endpoint_card"
+        printf '[{"index":101,%s,"volume":{"front-left":{"value_percent":"100%%"}},"mute":false}]\n' "$sink_endpoint_card"
       fi
       exit 0
       ;;
     "-f json list sources")
+      if [[ $state == new && -n ${AUDIO_CONTROL_PROFILE_READ_DELAY:-} ]]; then
+        sleep "$AUDIO_CONTROL_PROFILE_READ_DELAY"
+      fi
       if [[ $state == new && ${AUDIO_CONTROL_PROFILE_NO_NEW_SOURCE:-0} == 1 ]]; then
         printf '[{"index":201,"name":"bluez_output.example.monitor","monitor_source":"bluez_output.example","properties":{"device.name":"%s","media.class":"Audio/Sink"},"volume":{"mono":{"value_percent":"100%%"}},"mute":false}]\n' "$card_name"
       elif [[ $state == old && ${AUDIO_CONTROL_PROFILE_NO_OLD_SOURCE:-0} == 1 ]]; then
         printf '[{"index":201,"name":"bluez_output.example.monitor","monitor_source":"bluez_output.example","properties":{"device.name":"%s","media.class":"Audio/Sink"},"volume":{"mono":{"value_percent":"100%%"}},"mute":false}]\n' "$card_name"
       else
-        printf '[{"index":200,%s,"name":"bluez_input.example","monitor_source":"","volume":{"mono":{"value_percent":"36%%"}},"mute":true},{"index":201,"name":"bluez_output.example.monitor","monitor_source":"bluez_output.example","properties":{"device.name":"%s","media.class":"Audio/Sink"},"volume":{"mono":{"value_percent":"100%%"}},"mute":false}]\n' "$endpoint_card" "$card_name"
+        source_mute=true
+        if [[ $state == old && ${AUDIO_CONTROL_PROFILE_OLD_SOURCE_UNMUTED:-0} == 1 ]] \
+            || [[ $state == new && ${AUDIO_CONTROL_PROFILE_NEW_SOURCE_UNMUTED:-0} == 1 ]]; then
+          source_mute=false
+        fi
+        printf '[{"index":200,%s,"name":"bluez_input.example","monitor_source":"","volume":{"mono":{"value_percent":"36%%"}},"mute":%s},{"index":201,"name":"bluez_output.example.monitor","monitor_source":"bluez_output.example","properties":{"device.name":"%s","media.class":"Audio/Sink"},"volume":{"mono":{"value_percent":"100%%"}},"mute":false}]\n' "$endpoint_card" "$source_mute" "$card_name"
       fi
       exit 0
       ;;
     "-f json list sink-inputs")
-      echo '[{"index":300,"sink":100,"mute":false}]'
+      if [[ ${AUDIO_CONTROL_PROFILE_INVALID_STREAM:-0} == 1 ]]; then
+        echo '[{"index":"invalid","sink":100,"mute":false}]'
+      elif [[ ${AUDIO_CONTROL_PROFILE_RECREATE_STREAM:-0} == 1 ]]; then
+        if [[ $state == old ]]; then stream_serial=1; else stream_serial=2; fi
+        printf '[{"index":300,"sink":100,"mute":false,"properties":{"object.serial":"%s"}}]\n' \
+          "$stream_serial"
+      elif [[ ${AUDIO_CONTROL_PROFILE_MOVE_STREAM:-0} == 1 ]]; then
+        if [[ $state == old ]]; then stream_index=300; else stream_index=301; fi
+        printf '[{"index":%s,"sink":100,"mute":false,"properties":{"object.serial":"1"}}]\n' \
+          "$stream_index"
+      else
+        stream_mute=false
+        [[ ${AUDIO_CONTROL_PROFILE_STREAM_MUTED:-0} != 1 ]] || stream_mute=true
+        printf '[{"index":300,"sink":100,"mute":%s}]\n' "$stream_mute"
+      fi
       exit 0
       ;;
     set-card-profile\ *)
       printf '%s\n' "$*" >>"$AUDIO_CONTROL_PROFILE_LOG"
       [[ ${AUDIO_CONTROL_PROFILE_SET_FAIL:-0} != 1 ]] || exit 1
-      printf 'new\n' >"$AUDIO_CONTROL_PROFILE_STATE"
+      [[ ${AUDIO_CONTROL_PROFILE_IGNORE_SET:-0} != 1 ]] || exit 0
+      if [[ ${3:-} == a2dp-sink-aac ]]; then
+        printf 'old\n' >"$AUDIO_CONTROL_PROFILE_STATE"
+      else
+        printf 'new\n' >"$AUDIO_CONTROL_PROFILE_STATE"
+      fi
       exit 0
       ;;
     set-sink-*|set-source-*)
       printf '%s\n' "$*" >>"$AUDIO_CONTROL_PROFILE_LOG"
+      if [[ ${AUDIO_CONTROL_PROFILE_FAIL_STREAM_UNMUTE:-0} == 1
+          && ${1:-} == set-sink-input-mute && ${3:-} == false ]]; then
+        exit 1
+      fi
+      if [[ -n ${AUDIO_CONTROL_PROFILE_FAIL_ONCE_COMMAND:-}
+          && ${1:-} == "$AUDIO_CONTROL_PROFILE_FAIL_ONCE_COMMAND"
+          && -n ${AUDIO_CONTROL_PROFILE_FAIL_ONCE_STATE:-}
+          && ! -s ${AUDIO_CONTROL_PROFILE_FAIL_ONCE_STATE} ]]; then
+        printf 'failed\n' >"$AUDIO_CONTROL_PROFILE_FAIL_ONCE_STATE"
+        exit 1
+      fi
       exit 0
       ;;
   esac

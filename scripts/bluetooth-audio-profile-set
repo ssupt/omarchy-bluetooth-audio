@@ -26,5 +26,29 @@ card=$("$script_dir/bluetooth-audio-profiles" | jq -r --arg address "$address" -
 [[ -n $card ]] || { echo "Bluetooth audio profile is not available" >&2; exit 1; }
 # WirePlumber's device.restore-profile policy stores this profile against the
 # individual BlueZ card and restores it the next time that device appears.
-"$script_dir/audio-profile-set" "$card" "$profile"
-"$script_dir/audio-preferences" set-profile "$address" "$profile"
+profile_set_pid=
+cancel_profile_set() {
+  trap - INT TERM HUP
+  if [[ -n $profile_set_pid ]]; then
+    kill -TERM "$profile_set_pid" >/dev/null 2>&1 || true
+    wait "$profile_set_pid" >/dev/null 2>&1 || true
+  fi
+  exit 130
+}
+trap cancel_profile_set INT TERM HUP
+
+"$script_dir/audio-profile-set" "$card" "$profile" &
+profile_set_pid=$!
+profile_set_status=0
+wait "$profile_set_pid" || profile_set_status=$?
+profile_set_pid=
+trap - INT TERM HUP
+(( profile_set_status == 0 )) || exit "$profile_set_status"
+
+if ! "$script_dir/audio-preferences" set-profile "$address" "$profile"; then
+  # Exit 2 has a precise contract for QML callers: the requested live card
+  # state is active, but its shared fallback preference could not be written.
+  # It must not be retried as though pactl failed and recreated endpoints.
+  echo "Audio mode is active, but its preference could not be saved" >&2
+  exit 2
+fi

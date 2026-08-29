@@ -20,6 +20,10 @@ fi
 
 case "$property" in
   name)
+    if [[ $value == *[$'\001'-$'\037'$'\177']* ]]; then
+      echo "Bluetooth device names cannot contain control characters." >&2
+      exit 1
+    fi
     bluez_property=Alias
     signature=s
     wire_value=$value
@@ -51,14 +55,14 @@ fi
 
 output=
 status=0
-output=$(timeout 5s busctl set-property \
+output=$(timeout --kill-after=2s 5s busctl set-property \
   org.bluez "$device_path" org.bluez.Device1 \
   "$bluez_property" "$signature" "$wire_value" 2>&1) || status=$?
 if (( status == 0 )); then
   exit 0
 fi
 
-if (( status == 124 )); then
+if (( status == 124 || status == 137 )); then
   echo "Changing the Bluetooth device setting timed out." >&2
   exit 1
 fi

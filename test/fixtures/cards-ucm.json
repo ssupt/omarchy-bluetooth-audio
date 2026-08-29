@@ -1,0 +1,44 @@
+[
+  {
+    "index": 40,
+    "name": "alsa_card.ucm-example",
+    "active_profile": "off",
+    "properties": {
+      "device.api": "alsa",
+      "device.description": "UCM Headset"
+    },
+    "ports": {
+      "[Out] Speaker": {
+        "priority": 100,
+        "profiles": ["HiFi"]
+      },
+      "[In] Mic": {
+        "priority": 100,
+        "profiles": ["HiFi"]
+      }
+    },
+    "profiles": {
+      "off": {
+        "description": "Off",
+        "sinks": 0,
+        "sources": 0,
+        "priority": 0,
+        "available": true
+      },
+      "HiFi": {
+        "description": "HiFi",
+        "sinks": 1,
+        "sources": 1,
+        "priority": 100,
+        "available": true
+      },
+      "Broken": {
+        "description": "No matching UCM ports",
+        "sinks": 1,
+        "sources": 1,
+        "priority": 200,
+        "available": true
+      }
+    }
+  }
+]

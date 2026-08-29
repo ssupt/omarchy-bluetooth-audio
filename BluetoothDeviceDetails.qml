@@ -119,8 +119,8 @@ Item {
           height: Style.space(34)
           iconName: controller.deviceDetailsRow ? controller.deviceDetailsRow.icon : ""
           deviceName: controller.deviceDetailsRow
-            ? String(controller.deviceDetailsRow.name
-              || controller.deviceDetailsRow.deviceName || "") : ""
+            ? String(controller.deviceDetailsRow.name || "") + " "
+              + String(controller.deviceDetailsRow.deviceName || "") : ""
           connected: controller.deviceDetailsRow
             ? controller.deviceDetailsRow.connected : false
           foreground: controller.deviceDetailsRow && controller.deviceDetailsRow.blocked
@@ -441,7 +441,7 @@ Item {
         iconText: "󰅙"
         leftAlign: true
         bordered: true
-        enabled: !controller.devicePropertyBusy && !controller.deviceActionBusy
+        enabled: !controller.deviceDetailsControlsBusy && !controller.deviceActionBusy
         opacity: enabled ? 1 : 0.55
         foreground: controller.bar.urgent
         accent: controller.bar.urgent
