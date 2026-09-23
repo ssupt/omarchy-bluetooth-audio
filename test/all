@@ -1331,6 +1331,22 @@ fi
 echo "PASS: zero-endpoint profile directions must settle"
 
 : >"$profile_log"
+printf 'new\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_LOOPBACK_SOURCE=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 a2dp-sink-aac \
+  || fail "persistent WirePlumber loopback blocked playback-only profile"
+[[ $(<"$profile_state") == old
+    && $(rg -c '^set-card-profile ' "$profile_log") == 1 ]] \
+  || fail "persistent loopback triggered profile rollback"
+echo "PASS: persistent WirePlumber loopback survives playback-only profile switch"
+
+: >"$profile_log"
 printf 'old\n' >"$profile_state"
 if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
@@ -1490,7 +1506,7 @@ echo "PASS: unknown input state is preserved"
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.6.3"
+  and .version == "0.7.0"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

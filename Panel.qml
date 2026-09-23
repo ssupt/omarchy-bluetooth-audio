@@ -2269,12 +2269,13 @@ Panel {
     if (!audioControlInstalled) return
     controller.hide()
     var payload = '{"tab":"bluetooth"}'
-    if (bar && bar.shell && typeof bar.shell.summon === "function")
-      bar.shell.summon("ssupt.audio-control", payload)
-    else
-      Quickshell.execDetached([
-        "omarchy-shell", "shell", "summon", "ssupt.audio-control", payload
-      ])
+    // Some shell versions reject this clone-to-companion call. IPC can still
+    // summon the enabled audio plugin from the shell's own target.
+    if (bar && bar.shell && typeof bar.shell.summon === "function"
+        && bar.shell.summon("ssupt.audio-control", payload)) return
+    Quickshell.execDetached([
+      "omarchy-shell", "shell", "summon", "ssupt.audio-control", payload
+    ])
   }
 
   function toggleBluetooth() {
