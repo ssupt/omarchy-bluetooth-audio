@@ -15,6 +15,7 @@ Item {
   property int sequence: 0
   property string buffer: ""
   property var pending: ({})
+  property var expired: ({})
   property var panels: []
   property var controller: null
   readonly property var devices: Bluetooth.devices ? Bluetooth.devices.values : []
@@ -86,11 +87,25 @@ Item {
         backend.running = false
         return
       }
-      if (!reply || reply.version !== 1 || !reply.id || !pending[reply.id]
+      if (!reply || reply.version !== 1 || !reply.id
           || ((reply.result === undefined) === (reply.error === undefined))) {
         error = "Bluetooth service protocol mismatch"
         backend.running = false
         return
+      }
+      if (!pending[reply.id]) {
+        // A queued command may finish after its UI deadline. Its outcome was
+        // already reported as unknown; a late reply must not restart the service.
+        if (!expired[reply.id]) {
+          error = "Bluetooth service protocol mismatch"
+          backend.running = false
+          return
+        }
+        var remaining = ({})
+        for (var oldId in expired) if (oldId !== reply.id) remaining[oldId] = true
+        expired = remaining
+        end = buffer.indexOf("\n")
+        continue
       }
       var item = pending[reply.id]
       var next = ({})
@@ -102,6 +117,31 @@ Item {
     if (buffer.length > 1048576) {
       error = "Bluetooth service sent an oversized response"
       backend.running = false
+    }
+  }
+
+  function expirePending(now) {
+    var current = pending
+    var next = ({})
+    var retired = ({})
+    var timedOut = []
+    for (var oldId in expired) retired[oldId] = true
+    for (var key in current) {
+      var item = current[key]
+      if (now - item.started < 60000) next[key] = item
+      else {
+        retired[key] = true
+        timedOut.push(item)
+      }
+    }
+    var ids = Object.keys(retired)
+    while (ids.length > 64) delete retired[ids.shift()]
+    pending = next
+    expired = retired
+    for (var i = 0; i < timedOut.length; i++) {
+      if (timedOut[i].callback) timedOut[i].callback(null, {
+        code: "timeout", message: "Bluetooth command outcome is unknown", outcome: "unknown"
+      })
     }
   }
 
@@ -147,6 +187,7 @@ Item {
     onExited: {
       root.ready = false
       root.buffer = ""
+      root.expired = ({})
       root.failPending("Bluetooth service disconnected; check the operation's live state")
       if (!root.destroying && !reconnectTimer.running) reconnectTimer.start()
     }
@@ -186,18 +227,6 @@ Item {
     interval: 1000
     repeat: true
     running: Object.keys(root.pending).length > 0
-    onTriggered: {
-      var now = Date.now()
-      var current = root.pending
-      var next = ({})
-      for (var key in current) {
-        var item = current[key]
-        if (now - item.started < 60000) next[key] = item
-        else if (item.callback) item.callback(null, {
-          code: "timeout", message: "Bluetooth command outcome is unknown", outcome: "unknown"
-        })
-      }
-      root.pending = next
-    }
+    onTriggered: root.expirePending(Date.now())
   }
 }
