@@ -28,6 +28,17 @@ flock -w 5 8 || {
   echo "Another audio change is still finishing" >&2
   exit 1
 }
+# Draft Rust releases also hold an unsuffixed lock. Keep both during the
+# cross-plugin migration so either installed audio version serializes with us.
+service_lock=${XDG_RUNTIME_DIR:-/tmp}/omarchy-audio-mutation.lock
+exec 7>>"$service_lock" || {
+  echo "Could not open the audio service mutation lock" >&2
+  exit 1
+}
+flock -w 5 7 || {
+  echo "Another audio change is still finishing" >&2
+  exit 1
+}
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 profile_state=$("$script_dir/audio-profiles" |

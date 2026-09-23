@@ -11,6 +11,7 @@ Item {
   required property var controller
   property bool preferencesReady: false
   property bool automaticRetries: true
+  property bool sharedOwner: false
 
   property bool connectionBaselineReady: false
   property var connectionStates: ({})
@@ -158,7 +159,7 @@ Item {
     // Every monitor retains a shadow queue, but only one is allowed to mutate
     // global PipeWire state. The guard is evaluated on every tick so a
     // surviving mirror takes over without a stale declarative binding.
-    if (typeof controller.isAudioPolicyCoordinator === "function"
+    if (!sharedOwner && typeof controller.isAudioPolicyCoordinator === "function"
         && !controller.isAudioPolicyCoordinator()) return
     // Manual mode changes and policy changes on sibling monitors recreate the
     // same global card endpoints. Do not route against their transient nodes.

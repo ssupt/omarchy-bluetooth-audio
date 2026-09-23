@@ -6,10 +6,12 @@
   "author": "ssupt",
   "description": "Adds Bluetooth device details, reliable controls, codec selection, and per-device connect-time audio policies",
   "kinds": [
-    "bar-widget"
+    "bar-widget",
+    "service"
   ],
   "entryPoints": {
-    "barWidget": "Panel.qml"
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
   },
   "barWidget": {
     "displayName": "Advanced Bluetooth Audio",
