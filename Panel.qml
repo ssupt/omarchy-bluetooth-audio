@@ -958,6 +958,16 @@ Panel {
   function finishDeviceAction(code, message) {
     var operation = activeDeviceAction
     if (!operation) return
+    if (code === 0 && !deviceActionCancelRequested && operation.action === "forget") {
+      // Only an authoritative unpair removes saved audio routes. A temporary
+      // disconnect keeps groups and application pins for reconnection.
+      if (bluetoothService && typeof bluetoothService.forgetAudioRoutes === "function")
+        bluetoothService.forgetAudioRoutes(operation.address)
+      else if (audioControlService && audioControlService.ready
+          && Array.isArray(audioControlService.capabilities)
+          && audioControlService.capabilities.indexOf("devices.forget") !== -1)
+        audioControlService.request("devices.forget", { address: operation.address })
+    }
     if (deviceActionCancelRequested) {
       setPendingAction(operation.address, "")
       setDeviceActionFailure(operation.address, "", "")

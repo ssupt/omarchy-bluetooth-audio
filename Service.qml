@@ -18,10 +18,58 @@ Item {
   property var expired: ({})
   property var panels: []
   property var controller: null
+  property var pendingAudioForgets: []
+  property var audioForgetInFlight: ({})
+  readonly property var audioControlService: shell ? shell.serviceFor("ssupt.audio-control") : null
   readonly property var devices: Bluetooth.devices ? Bluetooth.devices.values : []
   property alias policyEngine: sharedPolicy
   readonly property string executable: decodeURIComponent(
     String(Qt.resolvedUrl("bin/omarchy-bluetooth-service")).replace(/^file:\/\//, ""))
+
+  onAudioControlServiceChanged: {
+    audioForgetInFlight = ({})
+    flushAudioForgets()
+  }
+  Connections {
+    target: root.audioControlService
+    function onReadyChanged() { root.flushAudioForgets() }
+  }
+
+  function forgetAudioRoutes(address) {
+    var key = String(address || "")
+    if (key === "" || pendingAudioForgets.indexOf(key) !== -1) return
+    pendingAudioForgets = pendingAudioForgets.concat([key]).slice(-32)
+    flushAudioForgets()
+  }
+
+  function flushAudioForgets() {
+    var audio = audioControlService
+    if (!audio || !audio.ready || !Array.isArray(audio.capabilities)
+        || audio.capabilities.indexOf("devices.forget") === -1) return
+    for (var i = 0; i < pendingAudioForgets.length; i++) {
+      var address = pendingAudioForgets[i]
+      if (audioForgetInFlight[address]) continue
+      sendAudioForget(audio, address)
+    }
+  }
+
+  function sendAudioForget(audio, address) {
+    var inflight = Object.assign({}, audioForgetInFlight)
+    inflight[address] = true
+    audioForgetInFlight = inflight
+    audio.request("devices.forget", { address: address }, function(_result, failure) {
+      var next = Object.assign({}, root.audioForgetInFlight)
+      delete next[address]
+      root.audioForgetInFlight = next
+      if (failure) {
+        console.warn("Could not remove forgotten Bluetooth audio routes: " + failure.message)
+      } else {
+        root.pendingAudioForgets = root.pendingAudioForgets.filter(function(value) {
+          return value !== address
+        })
+      }
+    })
+  }
 
   function failPending(message) {
     var current = pending
