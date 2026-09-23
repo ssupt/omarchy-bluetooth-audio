@@ -1490,7 +1490,7 @@ echo "PASS: unknown input state is preserved"
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.6.2"
+  and .version == "0.6.3"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ssupt.bluetooth-audio",
   "name": "Advanced Bluetooth Audio",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "author": "ssupt",
   "description": "Adds Bluetooth device details, reliable controls, codec selection, and per-device connect-time audio policies",
   "kinds": [

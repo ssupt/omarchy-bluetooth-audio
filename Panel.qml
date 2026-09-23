@@ -109,7 +109,9 @@ Panel {
   property bool audioControlInstalled: false
   readonly property var audioControlService: bar && bar.shell
     ? bar.shell.serviceFor("ssupt.audio-control") : null
-  readonly property bool audioControlReady: !!audioControlService && audioControlService.ready
+  readonly property bool audioControlDefaultBridgeReady: !!audioControlService
+    && audioControlService.ready && Array.isArray(audioControlService.capabilities)
+    && audioControlService.capabilities.indexOf("default.compat") !== -1
   onAudioPluginRegistryChanged: Qt.callLater(function() { root.refreshAudioControlInstalled() })
   onAudioControlInstalledChanged: {
     if (!audioControlInstalled && headerIndex === 0) headerIndex = 1
@@ -727,14 +729,14 @@ Panel {
     if (!sink) return
     var previousSinkName = defaultAudioSink && defaultAudioSink.name
       ? String(defaultAudioSink.name) : ""
-    if (!audioControlReady) Pipewire.preferredDefaultAudioSink = sink
+    if (!audioControlDefaultBridgeReady) Pipewire.preferredDefaultAudioSink = sink
     if (sink.id !== undefined && sink.name) {
-      var command = audioControlReady
+      var command = audioControlDefaultBridgeReady
         ? [audioControlScript("audio-output-set-default"), String(sink.id),
             String(sink.name), previousSinkName]
         : ["omarchy-audio-output-set-default", String(sink.id), String(sink.name)]
       Quickshell.execDetached(command)
-      if (!audioControlReady) Quickshell.execDetached([
+      if (!audioControlDefaultBridgeReady) Quickshell.execDetached([
           pluginScript("audio-preferences"),
           "set-default",
           "output",
@@ -747,14 +749,14 @@ Panel {
     if (!source) return
     var previousSourceName = defaultAudioSource && defaultAudioSource.name
       ? String(defaultAudioSource.name) : ""
-    if (!audioControlReady) Pipewire.preferredDefaultAudioSource = source
+    if (!audioControlDefaultBridgeReady) Pipewire.preferredDefaultAudioSource = source
     if (source.id !== undefined && source.name) {
-      var command = audioControlReady
+      var command = audioControlDefaultBridgeReady
         ? [audioControlScript("audio-input-set-default"), String(source.id),
             String(source.name), previousSourceName]
         : ["omarchy-audio-input-set-default", String(source.id), String(source.name)]
       Quickshell.execDetached(command)
-      if (!audioControlReady) Quickshell.execDetached([
+      if (!audioControlDefaultBridgeReady) Quickshell.execDetached([
           pluginScript("audio-preferences"),
           "set-default",
           "input",
