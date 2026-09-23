@@ -205,7 +205,7 @@ impl Service {
                 json!({"name":"omarchy-bluetooth-service", "protocolVersion":1,
                 "capabilities":["device.action","device.cancel","device.property","profile.list","profile.set","policy.set","health"]}),
             ),
-            "health" => Ok(json!({"status":"ok"})),
+            "health" => Ok(json!({"status":"ok", "pid":std::process::id()})),
             "profile.list" => {
                 self.script(
                     "bluetooth-audio-profiles",
@@ -325,8 +325,20 @@ impl Service {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().skip(1).collect::<Vec<_>>() != ["--stdio"] {
-        return Err("Usage: omarchy-bluetooth-service --stdio".into());
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--build-info"] {
+        println!(
+            "{}",
+            json!({
+                "sourceId": env!("BLUETOOTH_BUILD_ID"),
+                "target": env!("BLUETOOTH_BUILD_TARGET"),
+                "protocolVersion": 1
+            })
+        );
+        return Ok(());
+    }
+    if args != ["--stdio"] {
+        return Err("Usage: omarchy-bluetooth-service --stdio|--build-info".into());
     }
     let executable = std::env::current_exe()?;
     let scripts = executable

@@ -10,6 +10,9 @@ fail() {
   exit 1
 }
 
+python3 "$ROOT/packaging/release.py" --check "$ROOT" || fail "bundled service release"
+python3 "$TEST_DIR/release.py" || fail "release verification"
+
 for script in "$ROOT"/scripts/* "$TEST_DIR"/mocks/*; do
   bash -n "$script" || fail "bash syntax: ${script##*/}"
 done
@@ -584,13 +587,13 @@ env -u QT_QPA_PLATFORMTHEME -u DISPLAY -u WAYLAND_DISPLAY \
 echo "PASS: Bluetooth policy state machine"
 
 if ! service_result=$(env -u QT_QPA_PLATFORMTHEME -u DISPLAY -u WAYLAND_DISPLAY \
-    QT_QPA_PLATFORM=offscreen timeout 10 quickshell -p "$ROOT/ServiceHarness.qml" --no-color 2>&1); then
+    QT_QPA_PLATFORM=offscreen timeout 20 quickshell -p "$ROOT/ServiceHarness.qml" --no-color 2>&1); then
   printf '%s\n' "$service_result" >&2
-  fail "shell service handshake"
+  fail "shell service lifecycle"
 fi
-[[ $service_result == *"PASS: shell service handshake and health"* ]] \
-  || fail "shell service did not confirm health"
-echo "PASS: shell service handshake and health"
+[[ $service_result == *"PASS: shell service restart and panel handoff"* ]] \
+  || fail "shell service did not recover and transfer ownership"
+echo "PASS: shell service restart and panel handoff"
 
 ucm_profiles=$(
   AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards-ucm.json" \

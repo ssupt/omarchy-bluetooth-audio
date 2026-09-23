@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin:
+    name: Bluetooth plugin and QML lifecycle
+    runs-on: ubuntu-24.04
+    container: archlinux:base
+    timeout-minutes: 20
+    steps:
+      - name: Install build and test tools
+        run: pacman -Syu --noconfirm base-devel git rust clang quickshell qt6-declarative libpulse pipewire pipewire-audio pipewire-pulse wireplumber dbus nodejs jq python
+      - name: Check out plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out Omarchy validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: basecamp/omarchy
+          ref: 7be59e1f4b7451d352d4673c560168290792590f
+          path: omarchy
+          sparse-checkout: bin/omarchy-plugin-validate
+          sparse-checkout-cone-mode: false
+      - name: Check Rust and bundled service
+        run: |
+          cargo fmt --check --manifest-path backend/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path backend/Cargo.toml -- -D warnings
+          cargo test --locked --manifest-path backend/Cargo.toml
+          cargo build --locked --release --manifest-path backend/Cargo.toml
+          python3 packaging/release.py --check .
+          python3 packaging/release.py --check-binary backend/target/release/omarchy-bluetooth-service
+      - name: Run plugin regression suite
+        run: ./test/all
+      - name: Validate Omarchy manifest
+        run: ./omarchy/bin/omarchy-plugin-validate .
+
+  minimum-rust:
+    name: Rust 1.85 compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Build and test
+        run: |
+          cargo +1.85.0 test --locked --manifest-path backend/Cargo.toml
+          cargo +1.85.0 build --locked --release --manifest-path backend/Cargo.toml
+          python3 packaging/release.py --check-binary backend/target/release/omarchy-bluetooth-service

@@ -111,10 +111,15 @@ and restores it on later connections.
 
 ```bash
 cargo build --locked --release --manifest-path backend/Cargo.toml
-cp backend/target/release/omarchy-bluetooth-service bin/omarchy-bluetooth-service
+python3 packaging/release.py --prepare . --binary backend/target/release/omarchy-bluetooth-service
 ./test/all
 omarchy-plugin-validate .
 ```
+
+The release command atomically replaces the bundled binary and records its
+source fingerprint and SHA-256 in `backend-release.json`. The test suite checks
+both against the current plugin files, so a PR cannot ship an old service with
+new QML or helpers.
 
 `Service.qml` keeps one Rust process and connect-policy engine alive across bar
 widgets. `Panel.qml` owns shell integration and user actions. The device row,
