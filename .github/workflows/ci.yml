@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Install build and test tools
-        run: pacman -Syu --noconfirm base-devel git rust clang quickshell qt6-declarative libpulse pipewire pipewire-audio pipewire-pulse wireplumber dbus nodejs jq python
+        run: pacman -Syu --noconfirm base-devel git rust clang quickshell qt6-declarative libpulse pipewire pipewire-audio pipewire-pulse wireplumber dbus nodejs jq python ripgrep
       - name: Check out plugin
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check out Omarchy validator
