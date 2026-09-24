@@ -61,7 +61,8 @@ read_preferences() {
       || printf '%s' "$((maximum_store_bytes + 1))") > maximum_store_bytes )); then
     echo "Audio preferences are too large; refusing to overwrite them" >&2
     return 1
-  elif jq -e 'type == "object"' "$preferences_file" >/dev/null 2>&1; then
+  elif jq -e 'type == "object" and ((has("version") | not) or .version == 1)' \
+      "$preferences_file" >/dev/null 2>&1; then
     jq -c '
       def identifier($maximum):
         if type == "string" and length > 0 and length <= $maximum
@@ -90,7 +91,7 @@ read_preferences() {
         )
     ' "$preferences_file"
   else
-    echo "Audio preferences contain invalid JSON; refusing to overwrite them" >&2
+    echo "Audio preferences are invalid or use an unsupported version; refusing to overwrite them" >&2
     return 1
   fi
 }
@@ -102,7 +103,8 @@ read_policy_overrides() {
       || printf '%s' "$((maximum_store_bytes + 1))") > maximum_store_bytes )); then
     echo "Bluetooth audio policies are too large; refusing to overwrite them" >&2
     return 1
-  elif jq -e 'type == "object"' "$policy_file" >/dev/null 2>&1; then
+  elif jq -e 'type == "object" and ((has("version") | not) or .version == 1)' \
+      "$policy_file" >/dev/null 2>&1; then
     jq -c '
       def normalize_bluetooth_keys:
         with_entries(
@@ -123,7 +125,7 @@ read_policy_overrides() {
       }
     ' "$policy_file"
   else
-    echo "Bluetooth audio policies contain invalid JSON; refusing to overwrite them" >&2
+    echo "Bluetooth audio policies are invalid or use an unsupported version; refusing to overwrite them" >&2
     return 1
   fi
 }

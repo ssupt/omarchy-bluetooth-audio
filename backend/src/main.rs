@@ -2,12 +2,13 @@
 //! process alive independently of bar widgets on individual monitors.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 
 const MAX_FRAME: usize = 65_536;
 const MAX_OUTPUT: usize = 131_072;
@@ -47,8 +48,32 @@ impl Failure {
 
 struct Service {
     scripts: PathBuf,
-    mutation: Mutex<()>,
     active_action: Mutex<Option<(String, u32)>>,
+    jobs: Mutex<HashMap<String, Job>>,
+}
+
+struct Job {
+    address: Option<String>,
+    admitted: Instant,
+    deadline: Duration,
+    running: bool,
+    cancelled: bool,
+}
+
+fn mutation_deadline(method: &str) -> Option<Duration> {
+    match method {
+        "device.action" => Some(Duration::from_secs(50)),
+        "device.property" | "policy.set" => Some(Duration::from_secs(8)),
+        "profile.set" => Some(Duration::from_secs(40)),
+        _ => None,
+    }
+}
+
+fn reply(request: &Request, result: Result<Value, Failure>) -> Value {
+    match result {
+        Ok(result) => json!({"version":1,"id":request.id,"result":result}),
+        Err(error) => json!({"version":1,"id":request.id,"error":error}),
+    }
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, Failure> {
@@ -108,7 +133,7 @@ impl Service {
         name: &str,
         args: &[&str],
         deadline: Duration,
-        action: Option<&str>,
+        action: Option<(&str, &str)>,
     ) -> Result<Value, Failure> {
         let path = self.scripts.join(name);
         let mut child = Command::new(&path)
@@ -123,8 +148,19 @@ impl Service {
         let pid = child
             .id()
             .ok_or_else(|| Failure::unknown("Bluetooth helper has no process ID"))?;
-        if let Some(address) = action {
+        if let Some((request_id, address)) = action {
             *self.active_action.lock().await = Some((address.to_owned(), pid));
+            if self
+                .jobs
+                .lock()
+                .await
+                .get(request_id)
+                .is_some_and(|job| job.cancelled)
+            {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
         }
         let stdout = child.stdout.take().expect("piped helper stdout");
         let stderr = child.stderr.take().expect("piped helper stderr");
@@ -199,7 +235,11 @@ impl Service {
         }
     }
 
-    async fn handle(&self, request: &Request) -> Result<Value, Failure> {
+    async fn handle(
+        &self,
+        request: &Request,
+        remaining: Option<Duration>,
+    ) -> Result<Value, Failure> {
         match request.method.as_str() {
             "hello" => Ok(
                 json!({"name":"omarchy-bluetooth-service", "protocolVersion":1,
@@ -226,12 +266,11 @@ impl Service {
                         "Invalid Bluetooth action",
                     ));
                 }
-                let _guard = self.mutation.lock().await;
                 self.script(
                     "bluetooth-device-action",
                     &[action, device],
-                    Duration::from_secs(50),
-                    Some(device),
+                    remaining.unwrap_or(Duration::from_secs(50)),
+                    Some((&request.id, device)),
                 )
                 .await
             }
@@ -243,14 +282,41 @@ impl Service {
                         "Invalid Bluetooth address",
                     ));
                 }
-                let active = self.active_action.lock().await;
-                if let Some((address, pid)) = active.as_ref() {
-                    if address.eq_ignore_ascii_case(device) {
-                        unsafe {
-                            libc::kill(*pid as i32, libc::SIGTERM);
+                let requested_id = request.params.get("requestId").and_then(Value::as_str);
+                if request.params.get("requestId").is_some()
+                    && requested_id.is_none_or(|id| id.is_empty() || id.len() > 80)
+                {
+                    return Err(Failure::rejected(
+                        "invalid_params",
+                        "Invalid Bluetooth command ID",
+                    ));
+                }
+                let mut jobs = self.jobs.lock().await;
+                let target = jobs
+                    .iter()
+                    .filter(|(id, job)| {
+                        requested_id.is_none_or(|wanted| *id == wanted)
+                            && job
+                                .address
+                                .as_deref()
+                                .is_some_and(|value| value.eq_ignore_ascii_case(device))
+                    })
+                    .min_by_key(|(_, job)| job.admitted)
+                    .map(|(id, _)| id.clone());
+                if let Some(target) = target {
+                    let job = jobs.get_mut(&target).expect("selected job");
+                    job.cancelled = true;
+                    if job.running {
+                        let active = self.active_action.lock().await;
+                        if let Some((address, pid)) = active.as_ref() {
+                            if address.eq_ignore_ascii_case(device) {
+                                unsafe {
+                                    libc::kill(*pid as i32, libc::SIGTERM);
+                                }
+                            }
                         }
-                        return Ok(json!({"outcome":"cancel_requested"}));
                     }
+                    return Ok(json!({"outcome":"cancel_requested"}));
                 }
                 Ok(json!({"outcome":"already_finished"}))
             }
@@ -270,11 +336,10 @@ impl Service {
                         "Invalid Bluetooth property",
                     ));
                 }
-                let _guard = self.mutation.lock().await;
                 self.script(
                     "bluetooth-device-property",
                     &[property, path, value],
-                    Duration::from_secs(8),
+                    remaining.unwrap_or(Duration::from_secs(8)),
                     None,
                 )
                 .await
@@ -288,11 +353,10 @@ impl Service {
                         "Invalid Bluetooth audio mode",
                     ));
                 }
-                let _guard = self.mutation.lock().await;
                 self.script(
                     "bluetooth-audio-profile-set",
                     &[device, profile],
-                    Duration::from_secs(40),
+                    remaining.unwrap_or(Duration::from_secs(40)),
                     None,
                 )
                 .await
@@ -306,11 +370,10 @@ impl Service {
                         "Invalid Bluetooth audio policy",
                     ));
                 }
-                let _guard = self.mutation.lock().await;
                 self.script(
                     "audio-preferences",
                     &["set-policy", device, policy],
-                    Duration::from_secs(8),
+                    remaining.unwrap_or(Duration::from_secs(8)),
                     None,
                 )
                 .await
@@ -348,10 +411,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("scripts");
     let service = Arc::new(Service {
         scripts,
-        mutation: Mutex::new(()),
         active_action: Mutex::new(None),
+        jobs: Mutex::new(HashMap::new()),
     });
     let (tx, mut rx) = mpsc::channel::<Value>(32);
+    let (mutation_tx, mut mutation_rx) = mpsc::channel::<Request>(32);
+    let worker_service = service.clone();
+    let worker_replies = tx.clone();
+    let worker = tokio::spawn(async move {
+        while let Some(request) = mutation_rx.recv().await {
+            let remaining = {
+                let mut jobs = worker_service.jobs.lock().await;
+                let job = jobs.get_mut(&request.id).expect("admitted mutation");
+                if job.cancelled {
+                    None
+                } else {
+                    let left = job.deadline.saturating_sub(job.admitted.elapsed());
+                    if left.is_zero() {
+                        None
+                    } else {
+                        job.running = true;
+                        Some(left)
+                    }
+                }
+            };
+            let result = if let Some(remaining) = remaining {
+                worker_service.handle(&request, Some(remaining)).await
+            } else {
+                let jobs = worker_service.jobs.lock().await;
+                if jobs.get(&request.id).is_some_and(|job| job.cancelled) {
+                    Err(Failure::rejected(
+                        "cancelled",
+                        "Queued Bluetooth command was cancelled",
+                    ))
+                } else {
+                    Err(Failure::rejected(
+                        "timeout",
+                        "Bluetooth command expired while queued",
+                    ))
+                }
+            };
+            worker_service.jobs.lock().await.remove(&request.id);
+            if worker_replies.send(reply(&request, result)).await.is_err() {
+                break;
+            }
+        }
+    });
+    let other_permits = Arc::new(Semaphore::new(32));
+    let cancel_permits = Arc::new(Semaphore::new(4));
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(reply) = rx.recv().await {
@@ -379,17 +486,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             break;
         }
-        let service = service.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let result = service.handle(&request).await;
-            let reply = match result {
-                Ok(result) => json!({"version":1,"id":request.id,"result":result}),
-                Err(error) => json!({"version":1,"id":request.id,"error":error}),
+        if let Some(deadline) = mutation_deadline(&request.method) {
+            let mut jobs = service.jobs.lock().await;
+            if jobs.contains_key(&request.id) {
+                drop(jobs);
+                let _ = tx
+                    .send(reply(
+                        &request,
+                        Err(Failure::rejected(
+                            "duplicate_id",
+                            "Bluetooth command ID is already pending",
+                        )),
+                    ))
+                    .await;
+                continue;
+            }
+            jobs.insert(
+                request.id.clone(),
+                Job {
+                    address: request
+                        .params
+                        .get("address")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    admitted: Instant::now(),
+                    deadline,
+                    running: false,
+                    cancelled: false,
+                },
+            );
+            drop(jobs);
+            if let Err(error) = mutation_tx.try_send(request) {
+                let request = error.into_inner();
+                service.jobs.lock().await.remove(&request.id);
+                let _ = tx
+                    .send(reply(
+                        &request,
+                        Err(Failure::rejected(
+                            "busy",
+                            "Bluetooth mutation queue is full",
+                        )),
+                    ))
+                    .await;
+            }
+        } else {
+            let permits = if request.method == "device.cancel" {
+                cancel_permits.clone()
+            } else {
+                other_permits.clone()
             };
-            let _ = tx.send(reply).await;
-        });
+            let Ok(permit) = permits.try_acquire_owned() else {
+                let _ = tx
+                    .send(reply(
+                        &request,
+                        Err(Failure::rejected(
+                            "busy",
+                            "Too many Bluetooth commands are pending",
+                        )),
+                    ))
+                    .await;
+                continue;
+            };
+            let service = service.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = service.handle(&request, None).await;
+                let _ = tx.send(reply(&request, result)).await;
+                drop(permit);
+            });
+        }
     }
+    drop(mutation_tx);
+    worker.await?;
     drop(tx);
     writer.await??;
     Ok(())

@@ -594,6 +594,7 @@ fi
 [[ $service_result == *"PASS: shell service restart and panel handoff"* ]] \
   || fail "shell service did not recover and transfer ownership"
 echo "PASS: shell service restart and panel handoff"
+python3 "$TEST_DIR/service_actions.py" || fail "service-owned device action lifecycle"
 
 ucm_profiles=$(
   AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards-ucm.json" \
@@ -879,6 +880,31 @@ fi
 [[ $(<"$corrupt_preferences") == '{broken json' ]] \
   || fail "corrupt audio preferences changed after a rejected write"
 echo "PASS: corrupt audio preferences are preserved"
+
+for unsupported_version in 99 0 '"future"' null; do
+  printf '{"version":%s,"futureField":{"keep":true}}\n' "$unsupported_version" \
+    >"$corrupt_preferences"
+  preferences_before=$(sha256sum "$corrupt_preferences")
+  if OMARCHY_AUDIO_PREFERENCES_FILE="$corrupt_preferences" \
+    "$ROOT/scripts/audio-preferences" set-default output test-output >/dev/null 2>&1; then
+    fail "unsupported shared preferences version was overwritten"
+  fi
+  [[ $(sha256sum "$corrupt_preferences") == "$preferences_before" ]] \
+    || fail "rejected shared preferences changed"
+
+  printf '{"version":%s,"futureField":{"keep":true}}\n' "$unsupported_version" \
+    >"$corrupt_policy_overrides"
+  policies_before=$(sha256sum "$corrupt_policy_overrides")
+  if OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+    OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$corrupt_policy_overrides" \
+    "$ROOT/scripts/audio-preferences" set-policy 00:11:22:33:44:55 output >/dev/null 2>&1; then
+    fail "unsupported policy version was overwritten"
+  fi
+  [[ $(sha256sum "$corrupt_policy_overrides") == "$policies_before" ]] \
+    || fail "rejected policy file changed"
+done
+echo "PASS: unsupported preference schemas are preserved byte for byte"
+printf '%s\n' '{broken json' >"$corrupt_preferences"
 
 : >"$bluetooth_property_log"
 OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \

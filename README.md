@@ -68,9 +68,11 @@ current bar position. Disabling or removing it restores the built-in widget.
 Requires `bluetoothctl`, `busctl`, `pactl`, `jq`, `timeout`, and `flock`, all
 present in a standard Omarchy installation.
 The plugin includes a prebuilt x86_64 Linux Rust command service. It owns
-Bluetooth actions, audio mode changes, and preference writes across bar
-widgets on multiple monitors. The panel remains usable with its local helpers
-if the service cannot start.
+Bluetooth actions, their completion and cancellation, audio mode changes, and
+preference writes across bar widgets on multiple monitors. Successful forget
+also clears saved audio routes when the audio companion is available. Automatic
+default routing waits for the audio service result and live default state. The
+panel remains usable with its local helpers if the service cannot start.
 
 ## Removing
 

@@ -133,7 +133,8 @@ Panel {
   property string audioProfileSetStderr: ""
   readonly property string audioProfileError: audioProfileSetError !== ""
     ? audioProfileSetError : (audioProfileReadError !== ""
-      ? audioProfileReadError : audioPreferencesError)
+      ? audioProfileReadError : (policyEngine.defaultError !== ""
+        ? policyEngine.defaultError : audioPreferencesError))
   property var pendingAudioProfile: null
   property var unconfirmedAudioProfile: null
   // Kept until Process exits even if PipeWire confirms early. Confirmation
@@ -352,6 +353,7 @@ Panel {
   readonly property bool audioPolicyPreferenceBusy: pendingAudioPolicy !== null
   readonly property bool localDeviceActionBusy: deviceActionProc.running
     || deviceActionProc.collecting || activeDeviceAction !== null
+    || (bluetoothService && Object.keys(bluetoothService.deviceActions).length > 0)
   readonly property bool hasPendingDeviceActions: {
     if (Object.keys(pendingActions).length > 0) return true
     if (!bar || typeof bar.moduleWidgets !== "function") return false
@@ -725,44 +727,58 @@ Panel {
     }
   }
 
-  function setDefaultAudioSink(sink) {
-    if (!sink) return
+  function setDefaultAudioSink(sink, callback) {
+    if (!sink) return false
     var previousSinkName = defaultAudioSink && defaultAudioSink.name
       ? String(defaultAudioSink.name) : ""
-    if (!audioControlDefaultBridgeReady) Pipewire.preferredDefaultAudioSink = sink
     if (sink.id !== undefined && sink.name) {
-      var command = audioControlDefaultBridgeReady
-        ? [audioControlScript("audio-output-set-default"), String(sink.id),
-            String(sink.name), previousSinkName]
-        : ["omarchy-audio-output-set-default", String(sink.id), String(sink.name)]
-      Quickshell.execDetached(command)
-      if (!audioControlDefaultBridgeReady) Quickshell.execDetached([
+      if (audioControlDefaultBridgeReady) {
+        audioControlService.request("default.compat", {
+          direction: "output", id: Number(sink.id),
+          name: String(sink.name), previous: previousSinkName
+        }, callback)
+        return true
+      }
+      Pipewire.preferredDefaultAudioSink = sink
+      Quickshell.execDetached(["omarchy-audio-output-set-default",
+        String(sink.id), String(sink.name)])
+      Quickshell.execDetached([
           pluginScript("audio-preferences"),
           "set-default",
           "output",
           String(sink.name)
         ])
+      if (callback) callback({ outcome: "unconfirmed" }, null)
+      return true
     }
+    return false
   }
 
-  function setDefaultAudioSource(source) {
-    if (!source) return
+  function setDefaultAudioSource(source, callback) {
+    if (!source) return false
     var previousSourceName = defaultAudioSource && defaultAudioSource.name
       ? String(defaultAudioSource.name) : ""
-    if (!audioControlDefaultBridgeReady) Pipewire.preferredDefaultAudioSource = source
     if (source.id !== undefined && source.name) {
-      var command = audioControlDefaultBridgeReady
-        ? [audioControlScript("audio-input-set-default"), String(source.id),
-            String(source.name), previousSourceName]
-        : ["omarchy-audio-input-set-default", String(source.id), String(source.name)]
-      Quickshell.execDetached(command)
-      if (!audioControlDefaultBridgeReady) Quickshell.execDetached([
+      if (audioControlDefaultBridgeReady) {
+        audioControlService.request("default.compat", {
+          direction: "input", id: Number(source.id),
+          name: String(source.name), previous: previousSourceName
+        }, callback)
+        return true
+      }
+      Pipewire.preferredDefaultAudioSource = source
+      Quickshell.execDetached(["omarchy-audio-input-set-default",
+        String(source.id), String(source.name)])
+      Quickshell.execDetached([
           pluginScript("audio-preferences"),
           "set-default",
           "input",
           String(source.name)
         ])
+      if (callback) callback({ outcome: "unconfirmed" }, null)
+      return true
     }
+    return false
   }
 
   function useDeviceForAudio(device) {
@@ -792,6 +808,11 @@ Panel {
   }
 
   function pendingAction(address) {
+    if (bluetoothService) {
+      var serviceAction = bluetoothService.deviceActions[
+        Model.normalizedAddress(address)]
+      if (serviceAction) return serviceAction.pending
+    }
     var local = Model.pendingAction(pendingActions, address)
     if (local !== "" || !bar || typeof bar.moduleWidgets !== "function") return local
     var items = bar.moduleWidgets(moduleName) || []
@@ -830,6 +851,12 @@ Panel {
   }
 
   function deviceActionFailure(address) {
+    if (bluetoothService) {
+      var result = bluetoothService.deviceActionResults[
+        Model.normalizedAddress(address)]
+      if (result && result.message)
+        return { action: result.action, message: result.message }
+    }
     var local = Model.deviceActionFailure(deviceActionFailures, address)
     if (local || !bar || typeof bar.moduleWidgets !== "function") return local
     var items = bar.moduleWidgets(moduleName) || []
@@ -870,6 +897,10 @@ Panel {
   }
 
   function pairingCancellationPending(address) {
+    if (bluetoothService) {
+      var active = bluetoothService.deviceActions[Model.normalizedAddress(address)]
+      if (active && active.action === "pair") return active.cancelled === true
+    }
     var owner = deviceActionOwner(address, "pair")
     return !!owner && owner.deviceActionCancelRequested === true
   }
@@ -907,6 +938,10 @@ Panel {
   }
 
   function recoveryAction(address) {
+    if (bluetoothService) {
+      var active = bluetoothService.deviceActions[Model.normalizedAddress(address)]
+      if (active && active.action === "pair" && !active.cancelled) return "cancel"
+    }
     var owner = deviceActionOwner(address, "pair")
     if (owner && !owner.deviceActionCancelRequested)
       return "cancel"
@@ -943,11 +978,10 @@ Panel {
     }
     setPendingAction(device.address, pending, action)
     if (bluetoothService && bluetoothService.ready) {
-      bluetoothService.request("device.action", {
-        action: String(action), address: String(device.address)
-      }, function(_result, failure) {
-        root.finishDeviceAction(failure ? 1 : 0, failure ? failure.message : "")
-      })
+      if (!bluetoothService.startDeviceAction(action, device.address, pending)) {
+        activeDeviceAction = null
+        setPendingAction(device.address, "")
+      }
       return
     }
     deviceActionProc.command = deviceCommand(action, device.address)
@@ -983,6 +1017,27 @@ Panel {
     syncPendingActions()
     if (code === 0 && pendingAction(operation.address) !== "")
       setPendingAction(operation.address, operation.pending, operation.action)
+  }
+
+  function finishServiceDeviceAction(operation, result, failure) {
+    if (activeDeviceAction && Model.normalizedAddress(activeDeviceAction.address)
+        === Model.normalizedAddress(operation.address)) {
+      activeDeviceAction = null
+      deviceActionCancelRequested = false
+    }
+    if (operation.cancelled) {
+      adoptPendingAction(operation.address, "", "")
+      adoptDeviceActionFailure(operation.address, "", "")
+    } else if (failure) {
+      adoptPendingAction(operation.address, "", "")
+      adoptDeviceActionFailure(operation.address, operation.action,
+        String(failure.message || "") || defaultDeviceActionError(operation.action))
+    } else {
+      adoptDeviceActionFailure(operation.address, "", "")
+      syncPendingActions()
+      if (pendingAction(operation.address) !== "")
+        adoptPendingAction(operation.address, operation.pending, operation.action)
+    }
   }
 
   function connectDevice(device) {
@@ -1305,6 +1360,11 @@ Panel {
 
   function cancelPairing(device) {
     if (!device || !device.address) return
+    if (bluetoothService && bluetoothService.ready
+        && bluetoothService.cancelDeviceAction(device.address)) {
+      if (typeof device.cancelPair === "function") device.cancelPair()
+      return
+    }
     var owner = deviceActionOwner(device.address, "pair")
     if (!owner) return
     if (owner !== root) {
@@ -1819,6 +1879,7 @@ Panel {
               failure.action, failure.message)
         }
       if (activeDeviceAction && !deviceActionCancelRequested
+          && !(bluetoothService && bluetoothService.ready)
           && typeof actionSibling.adoptInterruptedDeviceAction === "function")
         actionSibling.adoptInterruptedDeviceAction(activeDeviceAction)
       if (interruptedProfile
@@ -1850,6 +1911,13 @@ Panel {
     // policy. Adopt its shadow before this item can become the first/coordinator
     // widget, otherwise a change in module ordering could strand that queue.
     Qt.callLater(function() { root.adoptExistingAudioPolicyApplications() })
+  }
+
+  Connections {
+    target: root.bluetoothService
+    function onDeviceActionFinished(operation, result, failure) {
+      root.finishServiceDeviceAction(operation, result, failure)
+    }
   }
 
   Connections {

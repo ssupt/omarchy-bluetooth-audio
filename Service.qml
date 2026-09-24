@@ -20,6 +20,9 @@ Item {
   property var controller: null
   property var pendingAudioForgets: []
   property var audioForgetInFlight: ({})
+  property var deviceActions: ({})
+  property var deviceActionResults: ({})
+  signal deviceActionFinished(var operation, var result, var failure)
   readonly property var audioControlService: shell ? shell.serviceFor("ssupt.audio-control") : null
   readonly property var devices: Bluetooth.devices ? Bluetooth.devices.values : []
   property alias policyEngine: sharedPolicy
@@ -40,6 +43,66 @@ Item {
     if (key === "" || pendingAudioForgets.indexOf(key) !== -1) return
     pendingAudioForgets = pendingAudioForgets.concat([key]).slice(-32)
     flushAudioForgets()
+  }
+
+  function actionKey(address) {
+    return String(address || "").toLowerCase().replace(/[:_-]/g, "")
+  }
+
+  function startDeviceAction(action, address, pendingState) {
+    var key = actionKey(address)
+    if (key === "" || Object.keys(deviceActions).length > 0) return false
+    var operation = {
+      action: String(action), address: String(address),
+      pending: String(pendingState), cancelled: false, requestId: ""
+    }
+    var actions = Object.assign({}, deviceActions)
+    actions[key] = operation
+    deviceActions = actions
+    var results = Object.assign({}, deviceActionResults)
+    delete results[key]
+    deviceActionResults = results
+    var id = request("device.action", { action: operation.action, address: operation.address },
+      function(result, failure) {
+        // The service survives every panel. Successful forget cleanup belongs
+        // here even when the initiating widget disappeared mid-command.
+        if (!failure && result && result.outcome === "applied"
+            && operation.action === "forget")
+          root.forgetAudioRoutes(operation.address)
+        var current = Object.assign({}, root.deviceActions)
+        var completedOperation = Object.assign({}, operation, {
+          cancelled: !!(current[key] && current[key].cancelled)
+        })
+        delete current[key]
+        root.deviceActions = current
+        var completed = Object.assign({}, root.deviceActionResults)
+        completed[key] = {
+          action: operation.action,
+          message: failure && !completedOperation.cancelled
+            ? String(failure.message || "Bluetooth operation failed") : "",
+          outcome: failure ? String(failure.outcome || "unknown") : "applied"
+        }
+        root.deviceActionResults = completed
+        root.deviceActionFinished(completedOperation, result, failure)
+      })
+    if (id) {
+      operation.requestId = id
+      actions = Object.assign({}, deviceActions)
+      actions[key] = operation
+      deviceActions = actions
+    }
+    return id !== ""
+  }
+
+  function cancelDeviceAction(address) {
+    var key = actionKey(address)
+    var operation = deviceActions[key]
+    if (!operation) return false
+    var next = Object.assign({}, deviceActions)
+    next[key] = Object.assign({}, operation, { cancelled: true })
+    deviceActions = next
+    request("device.cancel", { address: operation.address, requestId: operation.requestId })
+    return true
   }
 
   function flushAudioForgets() {
