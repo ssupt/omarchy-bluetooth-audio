@@ -22,6 +22,10 @@ Item {
   property var audioForgetInFlight: ({})
   property var deviceActions: ({})
   property var deviceActionResults: ({})
+  property var manualAudioSelection: null
+  property string manualAudioError: ""
+  property int manualAudioSequence: 0
+  readonly property bool manualAudioBusy: manualAudioSelection !== null
   signal deviceActionFinished(var operation, var result, var failure)
   readonly property var audioControlService: shell ? shell.serviceFor("ssupt.audio-control") : null
   readonly property var devices: Bluetooth.devices ? Bluetooth.devices.values : []
@@ -30,12 +34,96 @@ Item {
     String(Qt.resolvedUrl("bin/omarchy-bluetooth-service")).replace(/^file:\/\//, ""))
 
   onAudioControlServiceChanged: {
+    interruptManualAudio()
     audioForgetInFlight = ({})
     flushAudioForgets()
   }
   Connections {
     target: root.audioControlService
-    function onReadyChanged() { root.flushAudioForgets() }
+    function onReadyChanged() {
+      if (!root.audioControlService.ready) root.interruptManualAudio()
+      root.flushAudioForgets()
+    }
+  }
+
+  function interruptManualAudio() {
+    var operation = manualAudioSelection
+    if (!operation) return
+    manualAudioSelection = null
+    manualAudioError = operation.stage === "input"
+      ? "Bluetooth output changed, but the microphone result could not be confirmed"
+      : "Bluetooth output result could not be confirmed"
+    if (operation.unsaved.length > 0)
+      manualAudioError += "; output preference could not be saved"
+  }
+
+  function selectDeviceAudio(address, output, input) {
+    if (manualAudioBusy) return false
+    var audio = audioControlService
+    if (!audio || !audio.ready || !Array.isArray(audio.capabilities)
+        || audio.capabilities.indexOf("default.compat") === -1) {
+      manualAudioError = "Audio service is unavailable"
+      return false
+    }
+    if (!output || !output.name || !Number.isInteger(output.id)) {
+      manualAudioError = "Bluetooth output is unavailable"
+      return false
+    }
+    if (input && (!input.name || !Number.isInteger(input.id))) {
+      manualAudioError = "Bluetooth microphone is unavailable"
+      return false
+    }
+    var operation = {
+      id: ++manualAudioSequence, address: String(address), stage: "output",
+      output: output, input: input, unsaved: []
+    }
+    manualAudioError = ""
+    manualAudioSelection = operation
+    sendManualAudioDefault(operation, "output")
+    return true
+  }
+
+  function sendManualAudioDefault(operation, direction) {
+    var target = direction === "output" ? operation.output : operation.input
+    audioControlService.request("default.compat", {
+      direction: direction, id: target.id, name: target.name,
+      previous: target.previous
+    }, function(result, failure) {
+      root.finishManualAudioDefault(operation.id, direction, result, failure)
+    })
+  }
+
+  function finishManualAudioDefault(id, direction, result, failure) {
+    var operation = manualAudioSelection
+    if (!operation || operation.id !== id || operation.stage !== direction) return
+    var outcome = String(result && result.outcome || "")
+    if (failure || (outcome !== "applied" && outcome !== "persistence_failed")) {
+      var detail = String(failure && failure.message || "Audio service did not confirm the change")
+      var uncertain = failure && failure.outcome === "unknown"
+      if (direction === "output") {
+        manualAudioError = (uncertain ? "Bluetooth output may have changed: "
+          : "Could not select Bluetooth output: ") + detail
+      } else {
+        manualAudioError = "Bluetooth output changed, but the microphone "
+          + (uncertain ? "result is unknown: " : "could not be selected: ") + detail
+        if (operation.unsaved.length > 0)
+          manualAudioError += "; output preference could not be saved"
+      }
+      manualAudioSelection = null
+      return
+    }
+    var unsaved = operation.unsaved.slice()
+    if (outcome === "persistence_failed") unsaved.push(direction)
+    if (direction === "output" && operation.input) {
+      var next = Object.assign({}, operation, { stage: "input", unsaved: unsaved })
+      manualAudioSelection = next
+      sendManualAudioDefault(next, "input")
+      return
+    }
+    manualAudioSelection = null
+    if (unsaved.length > 0)
+      manualAudioError = "Bluetooth audio is active, but the " + unsaved.join(" and ")
+        + " preference could not be saved"
   }
 
   function forgetAudioRoutes(address) {

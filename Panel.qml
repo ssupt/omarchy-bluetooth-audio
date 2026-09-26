@@ -60,6 +60,10 @@ Panel {
   readonly property var adapter: Bluetooth.defaultAdapter
   readonly property var bluetoothService: bar && bar.shell
     ? bar.shell.serviceFor("ssupt.bluetooth-audio") : null
+  readonly property bool manualAudioBusy: !!bluetoothService
+    && bluetoothService.manualAudioBusy
+  readonly property string manualAudioError: bluetoothService
+    ? bluetoothService.manualAudioError : ""
   onBluetoothServiceChanged: {
     if (bluetoothService) bluetoothService.registerPanel(root)
   }
@@ -132,9 +136,10 @@ Panel {
   property string audioProfileSetError: ""
   property string audioProfileSetStderr: ""
   readonly property string audioProfileError: audioProfileSetError !== ""
-    ? audioProfileSetError : (audioProfileReadError !== ""
-      ? audioProfileReadError : (policyEngine.defaultError !== ""
-        ? policyEngine.defaultError : audioPreferencesError))
+    ? audioProfileSetError : (manualAudioError !== "" ? manualAudioError
+      : (audioProfileReadError !== "" ? audioProfileReadError
+        : (policyEngine.defaultError !== ""
+          ? policyEngine.defaultError : audioPreferencesError)))
   property var pendingAudioProfile: null
   property var unconfirmedAudioProfile: null
   // Kept until Process exits even if PipeWire confirms early. Confirmation
@@ -489,6 +494,7 @@ Panel {
 
   function audioUseActionAvailable(device) {
     return !audioProfileChangeBusy && !deviceActionBusy && !devicePropertyBusy
+      && !manualAudioBusy
       && !!device && device.connected
       && pendingAction(device.address) === ""
       && !!bluetoothAudioSink(device)
@@ -783,10 +789,9 @@ Panel {
 
   function useDeviceForAudio(device) {
     if (!device || audioProfileChangeBusy || deviceActionBusy || devicePropertyBusy
-        || pendingAction(device.address) !== "") return
+        || manualAudioBusy || pendingAction(device.address) !== "") return
     var sink = bluetoothAudioSink(device)
     if (!sink) return
-    setDefaultAudioSink(sink)
 
     // High-fidelity Bluetooth profiles expose output only. Communication
     // profiles also expose a matching microphone; when present, selecting the
@@ -795,6 +800,27 @@ Panel {
     // asynchronously refreshed profile inventory. This keeps a click during
     // card discovery from routing output but overlooking an available mic.
     var source = bluetoothAudioSource(device)
+    if (audioControlDefaultBridgeReady) {
+      if (!bluetoothService
+          || typeof bluetoothService.selectDeviceAudio !== "function") {
+        audioProfileSetError = "Bluetooth service is unavailable"
+        return
+      }
+      var output = {
+        id: Number(sink.id), name: String(sink.name),
+        previous: defaultAudioSink && defaultAudioSink.name
+          ? String(defaultAudioSink.name) : ""
+      }
+      var input = source ? {
+        id: Number(source.id), name: String(source.name),
+        previous: defaultAudioSource && defaultAudioSource.name
+          ? String(defaultAudioSource.name) : ""
+      } : null
+      audioProfileSetError = ""
+      bluetoothService.selectDeviceAudio(device.address, output, input)
+      return
+    }
+    setDefaultAudioSink(sink)
     if (source) setDefaultAudioSource(source)
   }
 

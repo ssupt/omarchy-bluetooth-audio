@@ -232,7 +232,7 @@ Item {
     // Manual mode changes and policy changes on sibling monitors recreate the
     // same global card endpoints. Do not route against their transient nodes.
     if (controller.audioProfileChangeBusy || controller.deviceActionBusy
-        || controller.devicePropertyBusy) return
+        || controller.devicePropertyBusy || controller.manualAudioBusy) return
 
     var next = {}
     var defaultRequests = []

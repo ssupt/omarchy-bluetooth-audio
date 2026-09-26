@@ -595,6 +595,8 @@ fi
   || fail "shell service did not recover and transfer ownership"
 echo "PASS: shell service restart and panel handoff"
 python3 "$TEST_DIR/service_actions.py" || fail "service-owned device action lifecycle"
+python3 "$TEST_DIR/manual_audio.py" || fail "manual audio default results"
+node "$TEST_DIR/manual_audio_panel.js" || fail "manual audio panel wiring"
 
 ucm_profiles=$(
   AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards-ucm.json" \
