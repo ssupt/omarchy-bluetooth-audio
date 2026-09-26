@@ -10,10 +10,14 @@ fail() {
   exit 1
 }
 
+python3 "$ROOT/packaging/release.py" --check "$ROOT" || fail "bundled service release"
+python3 "$TEST_DIR/release.py" || fail "release verification"
+
 for script in "$ROOT"/scripts/* "$TEST_DIR"/mocks/*; do
   bash -n "$script" || fail "bash syntax: ${script##*/}"
 done
 echo "PASS: helper syntax"
+python3 "$TEST_DIR/backend.py" || fail "Rust command service"
 
 node - "$ROOT/Model.js" "$ROOT" <<'JS'
 const assert = require('node:assert/strict')
@@ -492,7 +496,7 @@ assert.match(panelSource, /pluginScript\("bluetooth-device-property"\)/)
 assert.match(panelSource, /id: devicePropertyProc/)
 assert.match(panelSource, /id: forgetDialog/)
 assert.match(controllerSource, /BluetoothAudioPolicyEngine/)
-assert.match(controllerSource, /policyEngine\.observeDevices\(devices\)/)
+assert.match(controllerSource, /localPolicyEngine\.observeDevices\(devices\)/)
 assert.match(controllerSource, /audioProfilesNeeded: connectedDevices\.length > 0/)
 assert.match(controllerSource, /opened \|\| policyEngine\.hasPending/)
 assert.match(policySource, /function applyPending\(\)/)
@@ -529,7 +533,7 @@ assert.match(controllerSource, /id: policyProfileSwitchProc/)
 assert.match(controllerSource, /audioProfileSetStderr/)
 assert.match(controllerSource, /activeAudioProfileOperation/)
 assert.match(controllerSource,
-  /var operation = root\.activeAudioProfileOperation[\s\S]*?if \(!operation\)/)
+  /function finishAudioProfileOperation\(code, message\)[\s\S]*?var operation = activeAudioProfileOperation[\s\S]*?if \(!operation\)/)
 assert.match(policySource, /withPatch\(entry,/)
 assert.match(policySource, /stableTicks/)
 assert.match(policySource, /cardSignature/)
@@ -581,6 +585,18 @@ env -u QT_QPA_PLATFORMTHEME -u DISPLAY -u WAYLAND_DISPLAY \
   "$qml_test_runner" -silent -input "$TEST_DIR/tst_policy.qml" \
   || fail "Bluetooth policy state machine"
 echo "PASS: Bluetooth policy state machine"
+
+if ! service_result=$(env -u QT_QPA_PLATFORMTHEME -u DISPLAY -u WAYLAND_DISPLAY \
+    QT_QPA_PLATFORM=offscreen timeout 20 quickshell -p "$ROOT/ServiceHarness.qml" --no-color 2>&1); then
+  printf '%s\n' "$service_result" >&2
+  fail "shell service lifecycle"
+fi
+[[ $service_result == *"PASS: shell service restart and panel handoff"* ]] \
+  || fail "shell service did not recover and transfer ownership"
+echo "PASS: shell service restart and panel handoff"
+python3 "$TEST_DIR/service_actions.py" || fail "service-owned device action lifecycle"
+python3 "$TEST_DIR/manual_audio.py" || fail "manual audio default results"
+node "$TEST_DIR/manual_audio_panel.js" || fail "manual audio panel wiring"
 
 ucm_profiles=$(
   AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards-ucm.json" \
@@ -655,7 +671,7 @@ migration_overrides_lock="${migration_overrides}.lock"
 corrupt_policy_overrides_lock="${corrupt_policy_overrides}.lock"
 sanitized_preferences_lock="${sanitized_preferences}.lock"
 corrupt_preferences_lock="${corrupt_preferences}.lock"
-trap 'rm -f "$fallback_card_fixture" "$profile_log" "$profile_state" "$profile_recreate_state" "$profile_fail_once_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$policy_preferences" "$policy_overrides" "$migration_overrides" "$corrupt_policy_overrides" "$sanitized_preferences" "$corrupt_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock" "$policy_preferences_lock" "$policy_overrides_lock" "$migration_overrides_lock" "$corrupt_policy_overrides_lock" "$sanitized_preferences_lock" "$corrupt_preferences_lock" "$profile_runtime/omarchy-audio-mutation-${UID}.lock"; rmdir "$profile_runtime"' EXIT
+trap 'rm -f "$fallback_card_fixture" "$profile_log" "$profile_state" "$profile_recreate_state" "$profile_fail_once_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$policy_preferences" "$policy_overrides" "$migration_overrides" "$corrupt_policy_overrides" "$sanitized_preferences" "$corrupt_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock" "$policy_preferences_lock" "$policy_overrides_lock" "$migration_overrides_lock" "$corrupt_policy_overrides_lock" "$sanitized_preferences_lock" "$corrupt_preferences_lock" "$profile_runtime/omarchy-audio-mutation-${UID}.lock" "$profile_runtime/omarchy-audio-mutation.lock"; rmdir "$profile_runtime"' EXIT
 export XDG_RUNTIME_DIR="$profile_runtime"
 printf 'old\n' >"$profile_state"
 
@@ -866,6 +882,31 @@ fi
 [[ $(<"$corrupt_preferences") == '{broken json' ]] \
   || fail "corrupt audio preferences changed after a rejected write"
 echo "PASS: corrupt audio preferences are preserved"
+
+for unsupported_version in 99 0 '"future"' null; do
+  printf '{"version":%s,"futureField":{"keep":true}}\n' "$unsupported_version" \
+    >"$corrupt_preferences"
+  preferences_before=$(sha256sum "$corrupt_preferences")
+  if OMARCHY_AUDIO_PREFERENCES_FILE="$corrupt_preferences" \
+    "$ROOT/scripts/audio-preferences" set-default output test-output >/dev/null 2>&1; then
+    fail "unsupported shared preferences version was overwritten"
+  fi
+  [[ $(sha256sum "$corrupt_preferences") == "$preferences_before" ]] \
+    || fail "rejected shared preferences changed"
+
+  printf '{"version":%s,"futureField":{"keep":true}}\n' "$unsupported_version" \
+    >"$corrupt_policy_overrides"
+  policies_before=$(sha256sum "$corrupt_policy_overrides")
+  if OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
+    OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$corrupt_policy_overrides" \
+    "$ROOT/scripts/audio-preferences" set-policy 00:11:22:33:44:55 output >/dev/null 2>&1; then
+    fail "unsupported policy version was overwritten"
+  fi
+  [[ $(sha256sum "$corrupt_policy_overrides") == "$policies_before" ]] \
+    || fail "rejected policy file changed"
+done
+echo "PASS: unsupported preference schemas are preserved byte for byte"
+printf '%s\n' '{broken json' >"$corrupt_preferences"
 
 : >"$bluetooth_property_log"
 OMARCHY_AUDIO_PREFERENCES_FILE="$policy_preferences" \
@@ -1321,6 +1362,22 @@ fi
 echo "PASS: zero-endpoint profile directions must settle"
 
 : >"$profile_log"
+printf 'new\n' >"$profile_state"
+AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_LOOPBACK_SOURCE=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 a2dp-sink-aac \
+  || fail "persistent WirePlumber loopback blocked playback-only profile"
+[[ $(<"$profile_state") == old
+    && $(rg -c '^set-card-profile ' "$profile_log") == 1 ]] \
+  || fail "persistent loopback triggered profile rollback"
+echo "PASS: persistent WirePlumber loopback survives playback-only profile switch"
+
+: >"$profile_log"
 printf 'old\n' >"$profile_state"
 if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
   AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
@@ -1480,7 +1537,7 @@ echo "PASS: unknown input state is preserved"
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.6.2"
+  and .version == "0.7.0"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

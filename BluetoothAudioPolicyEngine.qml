@@ -11,6 +11,7 @@ Item {
   required property var controller
   property bool preferencesReady: false
   property bool automaticRetries: true
+  property bool sharedOwner: false
 
   property bool connectionBaselineReady: false
   property var connectionStates: ({})
@@ -23,6 +24,7 @@ Item {
   readonly property int maximumSwitchAttempts: 3
   readonly property bool hasPending: Object.keys(pendingApplications).length > 0
   property bool profileSwitchBusy: false
+  property string defaultError: ""
   property string activeProfileSwitchKey: ""
   property string activeProfileSwitchAddress: ""
 
@@ -109,6 +111,73 @@ Item {
     return id + ":" + String(node.name || "")
   }
 
+  function defaultMatches(direction, node) {
+    var current = direction === "output"
+      ? controller.defaultAudioSink : controller.defaultAudioSource
+    return !!current && !!node
+      && String(current.name || "") === String(node.name || "")
+      && String(current.id || "") === String(node.id || "")
+  }
+
+  function advanceDefault(key, entry, direction, node, requests) {
+    if (!node) return { entry: entry, confirmed: false }
+    var signature = audioNodeSignature(node)
+    if (entry.defaultRequested) {
+      if (!entry.defaultResult)
+        return { entry: entry, confirmed: false }
+      if (entry.defaultRequested !== direction || entry.defaultSignature !== signature) {
+        entry = withPatch(entry, { defaultRequested: "", defaultResult: "",
+          defaultSignature: "", defaultWaitTicks: 0 })
+      } else if (defaultMatches(direction, node)) {
+        entry = withPatch(entry, { defaultRequested: "", defaultResult: "",
+          defaultSignature: "", defaultWaitTicks: 0 })
+        return { entry: entry, confirmed: true }
+      } else {
+        var waited = Number(entry.defaultWaitTicks || 0) + 1
+        if (waited < switchConfirmationTicks)
+          return { entry: withPatch(entry, { defaultWaitTicks: waited }), confirmed: false }
+        entry = withPatch(entry, { defaultRequested: "", defaultResult: "",
+          defaultSignature: "", defaultWaitTicks: 0 })
+      }
+    }
+    if (defaultMatches(direction, node)) return { entry: entry, confirmed: true }
+    if (Number(entry.defaultAttempts || 0) >= maximumSwitchAttempts) {
+      defaultError = "Could not confirm the Bluetooth audio default"
+      return { entry: withPatch(entry, { defaultUnknown: true }), confirmed: false }
+    }
+    entry = withPatch(entry, { defaultRequested: direction,
+      defaultSignature: signature, defaultResult: "", defaultWaitTicks: 0,
+      defaultAttempts: Number(entry.defaultAttempts || 0) + 1 })
+    requests.push({ key: key, direction: direction, node: node, signature: signature })
+    return { entry: entry, confirmed: false }
+  }
+
+  function finishDefaultSwitch(key, direction, signature, result, failure) {
+    var entry = pendingApplications[key]
+    if (!entry || entry.defaultRequested !== direction
+        || entry.defaultSignature !== signature) return
+    var pending = clone(pendingApplications)
+    if (failure) {
+      var code = String(failure.code || "")
+      if (failure.outcome === "rejected"
+          && ["busy", "conflict", "unavailable", "stale_node", "stale_graph"].indexOf(code) !== -1) {
+        pending[key] = withPatch(entry, { defaultRequested: "", defaultResult: "",
+          defaultSignature: "", defaultWaitTicks: 0 })
+      } else {
+        defaultError = String(failure.message || "Bluetooth audio default outcome is unknown")
+        pending[key] = withPatch(entry, { defaultUnknown: true })
+      }
+    } else {
+      var outcome = String(result && result.outcome || "")
+      if (outcome === "persistence_failed")
+        defaultError = String(result.message || "Audio default changed, but its preference could not be saved")
+      pending[key] = withPatch(entry, { defaultResult: outcome || "unconfirmed" })
+    }
+    pendingApplications = pending
+    applicationsPublished(pending)
+    refreshRequested()
+  }
+
   function requestProfileSwitch(key, state, duplex) {
     if (!state || !state.address || !duplex || !duplex.value) return false
     if (profileSwitchBusy || controller.audioProfileChangeBusy) return false
@@ -158,14 +227,15 @@ Item {
     // Every monitor retains a shadow queue, but only one is allowed to mutate
     // global PipeWire state. The guard is evaluated on every tick so a
     // surviving mirror takes over without a stale declarative binding.
-    if (typeof controller.isAudioPolicyCoordinator === "function"
+    if (!sharedOwner && typeof controller.isAudioPolicyCoordinator === "function"
         && !controller.isAudioPolicyCoordinator()) return
     // Manual mode changes and policy changes on sibling monitors recreate the
     // same global card endpoints. Do not route against their transient nodes.
     if (controller.audioProfileChangeBusy || controller.deviceActionBusy
-        || controller.devicePropertyBusy) return
+        || controller.devicePropertyBusy || controller.manualAudioBusy) return
 
     var next = {}
+    var defaultRequests = []
     for (var i = 0; i < keys.length; i++) {
       var key = keys[i]
       var entry = pendingApplications[key]
@@ -196,6 +266,10 @@ Item {
         next[key] = entry
         continue
       }
+      if (entry.defaultUnknown || (entry.defaultRequested && !entry.defaultResult)) {
+        next[key] = entry
+        continue
+      }
 
       var attempts = Number(entry.attempts || 0) + 1
       var expired = attempts >= maximumAttempts
@@ -203,19 +277,22 @@ Item {
 
       var sink = controller.bluetoothAudioSink(device)
       if (entry.policy === "output") {
-        if (sink) controller.setDefaultAudioSink(sink)
-        else if (attempts < maximumAttempts) next[key] = entry
+        var output = advanceDefault(key, entry, "output", sink, defaultRequests)
+        if (!output.confirmed && (sink || attempts < maximumAttempts)) next[key] = output.entry
         continue
       }
 
       var sinkSignature = audioNodeSignature(sink)
       if (sink && (!entry.outputApplied
           || entry.outputSinkSignature !== sinkSignature)) {
-        controller.setDefaultAudioSink(sink)
-        entry = withPatch(entry, {
-          outputApplied: true,
-          outputSinkSignature: sinkSignature
-        })
+        var outputChange = advanceDefault(key, entry, "output", sink, defaultRequests)
+        entry = outputChange.entry
+        if (!outputChange.confirmed) {
+          next[key] = entry
+          continue
+        }
+        entry = withPatch(entry, { outputApplied: true,
+          outputSinkSignature: sinkSignature })
       }
 
       var state = controller.audioProfileState(key)
@@ -227,7 +304,8 @@ Item {
       if (Model.audioProfileHasInput(state, state.activeProfile)) {
         var source = controller.bluetoothAudioSource(device)
         if (sink && source && entry.outputApplied) {
-          controller.setDefaultAudioSource(source)
+          var inputChange = advanceDefault(key, entry, "input", source, defaultRequests)
+          if (!inputChange.confirmed) next[key] = inputChange.entry
           continue
         }
         if (attempts < maximumAttempts) next[key] = entry
@@ -298,6 +376,22 @@ Item {
 
     pendingApplications = next
     applicationsPublished(next)
+    for (var requestIndex = 0; requestIndex < defaultRequests.length; requestIndex++) {
+      var request = defaultRequests[requestIndex]
+      var callback = (function(item) {
+        return function(result, failure) {
+          engine.finishDefaultSwitch(item.key, item.direction,
+            item.signature, result, failure)
+        }
+      })(request)
+      var accepted = request.direction === "output"
+        ? controller.setDefaultAudioSink(request.node, callback)
+        : controller.setDefaultAudioSource(request.node, callback)
+      if (!accepted) callback(null, {
+        code: "unavailable", outcome: "rejected",
+        message: "Bluetooth audio endpoint disappeared"
+      })
+    }
   }
 
   Timer {

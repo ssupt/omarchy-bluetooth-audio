@@ -28,6 +28,11 @@ TestCase {
     property var sinkNode: null
     property var sourceNode: null
     property var profileState: null
+    property var defaultAudioSink: null
+    property var defaultAudioSource: null
+    property var sinkCallback: null
+    property var sourceCallback: null
+    property bool autoCompleteDefaults: true
     property int sinkCalls: 0
     property int sourceCalls: 0
 
@@ -46,6 +51,11 @@ TestCase {
       sinkNode = null
       sourceNode = null
       profileState = null
+      defaultAudioSink = null
+      defaultAudioSource = null
+      sinkCallback = null
+      sourceCallback = null
+      autoCompleteDefaults = true
       sinkCalls = 0
       sourceCalls = 0
     }
@@ -56,8 +66,24 @@ TestCase {
     function bluetoothAudioSource(deviceValue) { return sourceNode }
     function audioProfileState(address) { return profileState }
     function pendingAction(address) { return pendingDeviceAction }
-    function setDefaultAudioSink(sink) { sinkCalls += 1 }
-    function setDefaultAudioSource(source) { sourceCalls += 1 }
+    function setDefaultAudioSink(sink, callback) {
+      sinkCalls += 1
+      sinkCallback = callback
+      if (autoCompleteDefaults) {
+        defaultAudioSink = sink
+        callback({ outcome: "applied" }, null)
+      }
+      return true
+    }
+    function setDefaultAudioSource(source, callback) {
+      sourceCalls += 1
+      sourceCallback = callback
+      if (autoCompleteDefaults) {
+        defaultAudioSource = source
+        callback({ outcome: "applied" }, null)
+      }
+      return true
+    }
   }
 
   Component {
@@ -100,7 +126,7 @@ TestCase {
   }
 
   function advanceToProfileSwitch() {
-    for (var i = 0; i < 9; i++) engine.applyPending()
+    for (var i = 0; i < 11; i++) engine.applyPending()
   }
 
   function test_startupConnectionsAreBaselineButLaterNewDevicesAreEdges() {
@@ -140,6 +166,8 @@ TestCase {
     mockController.sinkNode = { id: 1, name: "bluez_output.test" }
     engine.applyPending()
     compare(mockController.sinkCalls, 1)
+    verify(engine.pendingApplications["001122334455"] !== undefined)
+    engine.applyPending()
     compare(Object.keys(engine.pendingApplications).length, 0)
   }
 
@@ -158,6 +186,7 @@ TestCase {
     compare(mockController.sinkCalls, 1)
     compare(mockController.sourceCalls, 0)
     verify(!engine.profileSwitchBusy)
+    engine.applyPending()
     compare(Object.keys(engine.pendingApplications).length, 0)
   }
 
@@ -223,7 +252,9 @@ TestCase {
     mockController.sinkNode = { id: 1, name: "bluez_output.test" }
     engine.applyPending()
     compare(mockController.sinkCalls, 1)
+    engine.applyPending()
     compare(mockController.sourceCalls, 1)
+    engine.applyPending()
     compare(Object.keys(engine.pendingApplications).length, 0)
   }
 
@@ -244,7 +275,9 @@ TestCase {
     mockController.sinkNode = { id: 3, name: "bluez_output.test" }
     engine.applyPending()
     compare(mockController.sinkCalls, 2)
+    engine.applyPending()
     compare(mockController.sourceCalls, 1)
+    engine.applyPending()
     compare(Object.keys(engine.pendingApplications).length, 0)
   }
 
@@ -260,6 +293,7 @@ TestCase {
     mockController.coordinator = true
     engine.applyPending()
     compare(mockController.sinkCalls, 1)
+    engine.applyPending()
     compare(Object.keys(engine.pendingApplications).length, 0)
   }
 
@@ -290,6 +324,7 @@ TestCase {
     mockController.deviceActionBusy = false
     engine.applyPending()
     compare(mockController.sinkCalls, 1)
+    engine.applyPending()
     compare(Object.keys(engine.pendingApplications).length, 0)
   }
 
@@ -305,6 +340,7 @@ TestCase {
     mockController.pendingDeviceAction = ""
     engine.applyPending()
     compare(mockController.sinkCalls, 1)
+    engine.applyPending()
     compare(Object.keys(engine.pendingApplications).length, 0)
   }
 
@@ -321,6 +357,84 @@ TestCase {
     engine.applyPending()
 
     compare(mockController.sinkCalls, 0)
+    compare(Object.keys(engine.pendingApplications).length, 0)
+  }
+
+  function test_defaultBridgeRetriesBusyAndStalePreviousDefault() {
+    queue("output")
+    mockController.autoCompleteDefaults = false
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+    engine.applyPending()
+    compare(mockController.sinkCalls, 1)
+    mockController.sinkCallback(null, {
+      code: "busy", outcome: "rejected", message: "Audio service is busy"
+    })
+    engine.applyPending()
+    compare(mockController.sinkCalls, 2)
+    mockController.sinkCallback(null, {
+      code: "conflict", outcome: "rejected", message: "Previous default changed"
+    })
+    engine.applyPending()
+    compare(mockController.sinkCalls, 3)
+    mockController.defaultAudioSink = mockController.sinkNode
+    mockController.sinkCallback({ outcome: "applied" }, null)
+    engine.applyPending()
+    compare(Object.keys(engine.pendingApplications).length, 0)
+  }
+
+  function test_persistenceFailureIsVisibleAfterStateConfirmation() {
+    queue("output")
+    mockController.autoCompleteDefaults = false
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+    engine.applyPending()
+    mockController.defaultAudioSink = mockController.sinkNode
+    mockController.sinkCallback({ outcome: "persistence_failed",
+      message: "Audio default changed, but its preference could not be saved" }, null)
+    verify(engine.pendingApplications["001122334455"] !== undefined)
+    engine.applyPending()
+    compare(Object.keys(engine.pendingApplications).length, 0)
+    verify(engine.defaultError.indexOf("could not be saved") !== -1)
+  }
+
+  function test_unknownOutcomeStaysPendingWithoutReplay() {
+    queue("output")
+    mockController.autoCompleteDefaults = false
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+    engine.applyPending()
+    mockController.sinkCallback(null, {
+      code: "timeout", outcome: "unknown", message: "Default outcome is unknown"
+    })
+    for (var i = 0; i < 10; i++) engine.applyPending()
+    compare(mockController.sinkCalls, 1)
+    verify(engine.pendingApplications["001122334455"].defaultUnknown)
+    compare(engine.defaultError, "Default outcome is unknown")
+  }
+
+  function test_microphonePolicyWaitsForBothBridgeResults() {
+    queue("output-mic")
+    mockController.autoCompleteDefaults = false
+    mockController.profileState = outputOnlyState()
+    mockController.profileState.activeProfile = "headset-head-unit-msbc"
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+    mockController.sourceNode = { id: 2, name: "bluez_input.test" }
+    engine.applyPending()
+    compare(mockController.sinkCalls, 1)
+    compare(mockController.sourceCalls, 0)
+    engine.applyPending()
+    compare(mockController.sourceCalls, 0)
+    mockController.defaultAudioSink = mockController.sinkNode
+    mockController.sinkCallback({ outcome: "applied" }, null)
+    engine.applyPending()
+    compare(mockController.sourceCalls, 1)
+    verify(engine.pendingApplications["001122334455"] !== undefined)
+    mockController.sourceCallback(null, {
+      code: "busy", outcome: "rejected", message: "Audio service is busy"
+    })
+    engine.applyPending()
+    compare(mockController.sourceCalls, 2)
+    mockController.defaultAudioSource = mockController.sourceNode
+    mockController.sourceCallback({ outcome: "applied" }, null)
+    engine.applyPending()
     compare(Object.keys(engine.pendingApplications).length, 0)
   }
 }

@@ -58,6 +58,17 @@ Panel {
   property var pendingAudioPolicy: null
 
   readonly property var adapter: Bluetooth.defaultAdapter
+  readonly property var bluetoothService: bar && bar.shell
+    ? bar.shell.serviceFor("ssupt.bluetooth-audio") : null
+  readonly property bool manualAudioBusy: !!bluetoothService
+    && bluetoothService.manualAudioBusy
+  readonly property string manualAudioError: bluetoothService
+    ? bluetoothService.manualAudioError : ""
+  onBluetoothServiceChanged: {
+    if (bluetoothService) bluetoothService.registerPanel(root)
+  }
+  readonly property var policyEngine: bluetoothService && bluetoothService.ready
+    ? bluetoothService.policyEngine : localPolicyEngine
 
   // True while this instance owes BlueZ a StopDiscovery: set when it starts
   // discovery (or opens onto a session already running) and cleared once
@@ -100,6 +111,11 @@ Panel {
     && audioPolicyOverridesReady
   readonly property var audioPluginRegistry: bar && bar.shell ? bar.shell.pluginRegistry : null
   property bool audioControlInstalled: false
+  readonly property var audioControlService: bar && bar.shell
+    ? bar.shell.serviceFor("ssupt.audio-control") : null
+  readonly property bool audioControlDefaultBridgeReady: !!audioControlService
+    && audioControlService.ready && Array.isArray(audioControlService.capabilities)
+    && audioControlService.capabilities.indexOf("default.compat") !== -1
   onAudioPluginRegistryChanged: Qt.callLater(function() { root.refreshAudioControlInstalled() })
   onAudioControlInstalledChanged: {
     if (!audioControlInstalled && headerIndex === 0) headerIndex = 1
@@ -109,6 +125,7 @@ Panel {
   // BlueZ owns pairing and connection state; PipeWire owns the audio card's
   // active profile and therefore the codec/microphone mode offered here.
   property var audioProfiles: ({})
+  property bool audioProfilesRequestBusy: false
   property string sharedAudioPreferencesError: ""
   property string audioPolicyPreferencesError: ""
   property string audioPreferenceWriteError: ""
@@ -119,8 +136,10 @@ Panel {
   property string audioProfileSetError: ""
   property string audioProfileSetStderr: ""
   readonly property string audioProfileError: audioProfileSetError !== ""
-    ? audioProfileSetError : (audioProfileReadError !== ""
-      ? audioProfileReadError : audioPreferencesError)
+    ? audioProfileSetError : (manualAudioError !== "" ? manualAudioError
+      : (audioProfileReadError !== "" ? audioProfileReadError
+        : (policyEngine.defaultError !== ""
+          ? policyEngine.defaultError : audioPreferencesError)))
   property var pendingAudioProfile: null
   property var unconfirmedAudioProfile: null
   // Kept until Process exits even if PipeWire confirms early. Confirmation
@@ -129,8 +148,10 @@ Panel {
   property bool audioProfileMenuOpen: false
   readonly property bool userAudioProfileChangeBusy: audioProfileSetProc.running
     || audioProfileSetProc.collecting || pendingAudioProfile !== null
+    || activeAudioProfileOperation !== null
   readonly property bool audioProfileCommandBusy: audioProfileSetProc.running
-    || audioProfileSetProc.collecting || policyEngine.profileSwitchBusy
+    || audioProfileSetProc.collecting || activeAudioProfileOperation !== null
+    || policyEngine.profileSwitchBusy
   readonly property bool localAudioProfileChangeBusy: userAudioProfileChangeBusy
     || policyEngine.profileSwitchBusy
   // PipeWire cards are global while this widget is mirrored per monitor. Read
@@ -336,7 +357,8 @@ Panel {
   }
   readonly property bool audioPolicyPreferenceBusy: pendingAudioPolicy !== null
   readonly property bool localDeviceActionBusy: deviceActionProc.running
-    || deviceActionProc.collecting
+    || deviceActionProc.collecting || activeDeviceAction !== null
+    || (bluetoothService && Object.keys(bluetoothService.deviceActions).length > 0)
   readonly property bool hasPendingDeviceActions: {
     if (Object.keys(pendingActions).length > 0) return true
     if (!bar || typeof bar.moduleWidgets !== "function") return false
@@ -472,6 +494,7 @@ Panel {
 
   function audioUseActionAvailable(device) {
     return !audioProfileChangeBusy && !deviceActionBusy && !devicePropertyBusy
+      && !manualAudioBusy
       && !!device && device.connected
       && pendingAction(device.address) === ""
       && !!bluetoothAudioSink(device)
@@ -510,6 +533,24 @@ Panel {
       policy: String(policy)
     }
     devicePropertyError = ""
+    if (bluetoothService && bluetoothService.ready) {
+      bluetoothService.request("policy.set", {
+        address: String(deviceDetailsAddress), policy: String(policy)
+      }, function(_result, failure) {
+        var operation = root.pendingAudioPolicy
+        root.pendingAudioPolicy = null
+        if (!operation) return
+        if (!failure) {
+          root.applyAudioPolicyOverride(operation.address, operation.policy)
+          audioPolicyPreferencesView.reload()
+        } else if (Model.normalizedAddress(root.deviceDetailsAddress)
+            === Model.normalizedAddress(operation.address)) {
+          root.devicePropertyError = failure.message
+            || "Could not save this device's audio policy."
+        }
+      })
+      return
+    }
     audioPolicyPreferenceProc.command = [
       pluginScript("audio-preferences"),
       "set-policy",
@@ -569,7 +610,18 @@ Panel {
 
   function refreshAudioProfiles() {
     if (!audioProfilesNeeded || audioProfilesProc.running
-        || audioProfilesProc.collecting) return
+        || audioProfilesProc.collecting || audioProfilesRequestBusy) return
+    if (bluetoothService && bluetoothService.ready) {
+      audioProfilesRequestBusy = true
+      bluetoothService.request("profile.list", {}, function(result, failure) {
+        root.audioProfilesRequestBusy = false
+        if (!failure) root.updateAudioProfiles(JSON.stringify(result))
+        else if (root.opened && root.connectedDevices.length > 0)
+          root.audioProfileReadError = failure.message
+            || "Could not read Bluetooth audio modes"
+      })
+      return
+    }
     audioProfilesProc.prepare()
     audioProfilesProc.running = true
   }
@@ -625,6 +677,16 @@ Panel {
     unconfirmedAudioProfile = pendingAudioProfile
     activeAudioProfileOperation = pendingAudioProfile
     audioProfileSetError = ""
+    if (bluetoothService && bluetoothService.ready) {
+      bluetoothService.request("profile.set", {
+        address: String(address), profile: String(profile)
+      }, function(result, failure) {
+        root.finishAudioProfileOperation(failure ? 1
+          : result && result.outcome === "persistence_failed" ? 2 : 0,
+          failure ? failure.message : result && result.message || "")
+      })
+      return
+    }
     audioProfileSetProc.command = [
       pluginScript("bluetooth-audio-profile-set"),
       String(address),
@@ -632,6 +694,34 @@ Panel {
     ]
     audioProfileSetProc.prepare()
     audioProfileSetProc.running = true
+  }
+
+  function finishAudioProfileOperation(code, message) {
+    var operation = activeAudioProfileOperation
+    activeAudioProfileOperation = null
+    // A live card may already have confirmed the switch. Keep process
+    // ownership until the preference write outcome is known as well.
+    if (!operation) {
+      audioProfilePendingTimeout.stop()
+      audioProfileSettleTimer.restart()
+      return
+    }
+    if (code !== 0 && code !== 2) {
+      audioProfileSetError = String(message || "")
+        || "Could not change the Bluetooth audio mode"
+      pendingAudioProfile = null
+      unconfirmedAudioProfile = null
+      audioProfilePendingTimeout.stop()
+    } else {
+      audioProfileSetError = ""
+      if (code === 2 && audioPreferencesError === "")
+        audioPreferenceWriteError = "Audio mode is active, but its preference could not be saved"
+      if (pendingAudioProfile || unconfirmedAudioProfile)
+        audioProfilePendingTimeout.restart()
+      else
+        audioProfilePendingTimeout.stop()
+    }
+    audioProfileSettleTimer.restart()
   }
 
   function closeAudioProfileMenus(exceptIndex) {
@@ -643,52 +733,65 @@ Panel {
     }
   }
 
-  function setDefaultAudioSink(sink) {
-    if (!sink) return
+  function setDefaultAudioSink(sink, callback) {
+    if (!sink) return false
     var previousSinkName = defaultAudioSink && defaultAudioSink.name
       ? String(defaultAudioSink.name) : ""
-    Pipewire.preferredDefaultAudioSink = sink
     if (sink.id !== undefined && sink.name) {
-      var command = audioControlInstalled
-        ? [audioControlScript("audio-output-set-default"), String(sink.id),
-            String(sink.name), previousSinkName]
-        : ["omarchy-audio-output-set-default", String(sink.id), String(sink.name)]
-      Quickshell.execDetached(command)
+      if (audioControlDefaultBridgeReady) {
+        audioControlService.request("default.compat", {
+          direction: "output", id: Number(sink.id),
+          name: String(sink.name), previous: previousSinkName
+        }, callback)
+        return true
+      }
+      Pipewire.preferredDefaultAudioSink = sink
+      Quickshell.execDetached(["omarchy-audio-output-set-default",
+        String(sink.id), String(sink.name)])
       Quickshell.execDetached([
-        pluginScript("audio-preferences"),
-        "set-default",
-        "output",
-        String(sink.name)
-      ])
+          pluginScript("audio-preferences"),
+          "set-default",
+          "output",
+          String(sink.name)
+        ])
+      if (callback) callback({ outcome: "unconfirmed" }, null)
+      return true
     }
+    return false
   }
 
-  function setDefaultAudioSource(source) {
-    if (!source) return
+  function setDefaultAudioSource(source, callback) {
+    if (!source) return false
     var previousSourceName = defaultAudioSource && defaultAudioSource.name
       ? String(defaultAudioSource.name) : ""
-    Pipewire.preferredDefaultAudioSource = source
     if (source.id !== undefined && source.name) {
-      var command = audioControlInstalled
-        ? [audioControlScript("audio-input-set-default"), String(source.id),
-            String(source.name), previousSourceName]
-        : ["omarchy-audio-input-set-default", String(source.id), String(source.name)]
-      Quickshell.execDetached(command)
+      if (audioControlDefaultBridgeReady) {
+        audioControlService.request("default.compat", {
+          direction: "input", id: Number(source.id),
+          name: String(source.name), previous: previousSourceName
+        }, callback)
+        return true
+      }
+      Pipewire.preferredDefaultAudioSource = source
+      Quickshell.execDetached(["omarchy-audio-input-set-default",
+        String(source.id), String(source.name)])
       Quickshell.execDetached([
-        pluginScript("audio-preferences"),
-        "set-default",
-        "input",
-        String(source.name)
-      ])
+          pluginScript("audio-preferences"),
+          "set-default",
+          "input",
+          String(source.name)
+        ])
+      if (callback) callback({ outcome: "unconfirmed" }, null)
+      return true
     }
+    return false
   }
 
   function useDeviceForAudio(device) {
     if (!device || audioProfileChangeBusy || deviceActionBusy || devicePropertyBusy
-        || pendingAction(device.address) !== "") return
+        || manualAudioBusy || pendingAction(device.address) !== "") return
     var sink = bluetoothAudioSink(device)
     if (!sink) return
-    setDefaultAudioSink(sink)
 
     // High-fidelity Bluetooth profiles expose output only. Communication
     // profiles also expose a matching microphone; when present, selecting the
@@ -697,6 +800,27 @@ Panel {
     // asynchronously refreshed profile inventory. This keeps a click during
     // card discovery from routing output but overlooking an available mic.
     var source = bluetoothAudioSource(device)
+    if (audioControlDefaultBridgeReady) {
+      if (!bluetoothService
+          || typeof bluetoothService.selectDeviceAudio !== "function") {
+        audioProfileSetError = "Bluetooth service is unavailable"
+        return
+      }
+      var output = {
+        id: Number(sink.id), name: String(sink.name),
+        previous: defaultAudioSink && defaultAudioSink.name
+          ? String(defaultAudioSink.name) : ""
+      }
+      var input = source ? {
+        id: Number(source.id), name: String(source.name),
+        previous: defaultAudioSource && defaultAudioSource.name
+          ? String(defaultAudioSource.name) : ""
+      } : null
+      audioProfileSetError = ""
+      bluetoothService.selectDeviceAudio(device.address, output, input)
+      return
+    }
+    setDefaultAudioSink(sink)
     if (source) setDefaultAudioSource(source)
   }
 
@@ -710,6 +834,11 @@ Panel {
   }
 
   function pendingAction(address) {
+    if (bluetoothService) {
+      var serviceAction = bluetoothService.deviceActions[
+        Model.normalizedAddress(address)]
+      if (serviceAction) return serviceAction.pending
+    }
     var local = Model.pendingAction(pendingActions, address)
     if (local !== "" || !bar || typeof bar.moduleWidgets !== "function") return local
     var items = bar.moduleWidgets(moduleName) || []
@@ -748,6 +877,12 @@ Panel {
   }
 
   function deviceActionFailure(address) {
+    if (bluetoothService) {
+      var result = bluetoothService.deviceActionResults[
+        Model.normalizedAddress(address)]
+      if (result && result.message)
+        return { action: result.action, message: result.message }
+    }
     var local = Model.deviceActionFailure(deviceActionFailures, address)
     if (local || !bar || typeof bar.moduleWidgets !== "function") return local
     var items = bar.moduleWidgets(moduleName) || []
@@ -788,6 +923,10 @@ Panel {
   }
 
   function pairingCancellationPending(address) {
+    if (bluetoothService) {
+      var active = bluetoothService.deviceActions[Model.normalizedAddress(address)]
+      if (active && active.action === "pair") return active.cancelled === true
+    }
     var owner = deviceActionOwner(address, "pair")
     return !!owner && owner.deviceActionCancelRequested === true
   }
@@ -825,6 +964,10 @@ Panel {
   }
 
   function recoveryAction(address) {
+    if (bluetoothService) {
+      var active = bluetoothService.deviceActions[Model.normalizedAddress(address)]
+      if (active && active.action === "pair" && !active.cancelled) return "cancel"
+    }
     var owner = deviceActionOwner(address, "pair")
     if (owner && !owner.deviceActionCancelRequested)
       return "cancel"
@@ -860,9 +1003,67 @@ Panel {
       pending: String(pending)
     }
     setPendingAction(device.address, pending, action)
+    if (bluetoothService && bluetoothService.ready) {
+      if (!bluetoothService.startDeviceAction(action, device.address, pending)) {
+        activeDeviceAction = null
+        setPendingAction(device.address, "")
+      }
+      return
+    }
     deviceActionProc.command = deviceCommand(action, device.address)
     deviceActionProc.prepare()
     deviceActionProc.running = true
+  }
+
+  function finishDeviceAction(code, message) {
+    var operation = activeDeviceAction
+    if (!operation) return
+    if (code === 0 && !deviceActionCancelRequested && operation.action === "forget") {
+      // Only an authoritative unpair removes saved audio routes. A temporary
+      // disconnect keeps groups and application pins for reconnection.
+      if (bluetoothService && typeof bluetoothService.forgetAudioRoutes === "function")
+        bluetoothService.forgetAudioRoutes(operation.address)
+      else if (audioControlService && audioControlService.ready
+          && Array.isArray(audioControlService.capabilities)
+          && audioControlService.capabilities.indexOf("devices.forget") !== -1)
+        audioControlService.request("devices.forget", { address: operation.address })
+    }
+    if (deviceActionCancelRequested) {
+      setPendingAction(operation.address, "")
+      setDeviceActionFailure(operation.address, "", "")
+    } else if (code !== 0) {
+      setPendingAction(operation.address, "")
+      setDeviceActionFailure(operation.address, operation.action,
+        String(message || "") || defaultDeviceActionError(operation.action))
+    } else {
+      setDeviceActionFailure(operation.address, "", "")
+    }
+    activeDeviceAction = null
+    deviceActionCancelRequested = false
+    syncPendingActions()
+    if (code === 0 && pendingAction(operation.address) !== "")
+      setPendingAction(operation.address, operation.pending, operation.action)
+  }
+
+  function finishServiceDeviceAction(operation, result, failure) {
+    if (activeDeviceAction && Model.normalizedAddress(activeDeviceAction.address)
+        === Model.normalizedAddress(operation.address)) {
+      activeDeviceAction = null
+      deviceActionCancelRequested = false
+    }
+    if (operation.cancelled) {
+      adoptPendingAction(operation.address, "", "")
+      adoptDeviceActionFailure(operation.address, "", "")
+    } else if (failure) {
+      adoptPendingAction(operation.address, "", "")
+      adoptDeviceActionFailure(operation.address, operation.action,
+        String(failure.message || "") || defaultDeviceActionError(operation.action))
+    } else {
+      adoptDeviceActionFailure(operation.address, "", "")
+      syncPendingActions()
+      if (pendingAction(operation.address) !== "")
+        adoptPendingAction(operation.address, operation.pending, operation.action)
+    }
   }
 
   function connectDevice(device) {
@@ -999,8 +1200,41 @@ Panel {
     devicePropertyError = ""
     devicePropertyProc.command = devicePropertyCommand(
       propertyName, details.dbusPath, value)
+    if (bluetoothService && bluetoothService.ready) {
+      bluetoothService.request("device.property", {
+        property: String(propertyName), path: String(details.dbusPath),
+        value: typeof value === "boolean" ? (value ? "true" : "false") : String(value)
+      }, function(_result, failure) {
+        root.finishDeviceProperty(failure ? 1 : 0, failure ? failure.message : "")
+      })
+      return
+    }
     devicePropertyProc.prepare()
     devicePropertyProc.running = true
+  }
+
+  function finishDeviceProperty(code, message) {
+    var operation = pendingDeviceProperty
+    if (!operation) return
+    var liveDevice = deviceByAddress(operation.address)
+    if (liveDevice && liveDeviceProperty(liveDevice, operation.propertyName)
+        === operation.expected) {
+      confirmDeviceProperty()
+      return
+    }
+    if (code !== 0) {
+      pendingDeviceProperty = null
+      if (Model.normalizedAddress(deviceDetailsAddress)
+          === Model.normalizedAddress(operation.address)) {
+        devicePropertyError = String(message || "") || operation.errorMessage
+        if (operation.propertyName === "name" && deviceDetailsRow)
+          deviceDetailsView.updateNameIfIdle(String(
+            deviceDisplayName(deviceDetailsRow)
+              || deviceDetailsRow.deviceName || ""))
+      }
+    } else {
+      devicePropertyConfirmTimer.restart()
+    }
   }
 
   // With the companion plugin enabled, a rename must also land in its
@@ -1152,6 +1386,11 @@ Panel {
 
   function cancelPairing(device) {
     if (!device || !device.address) return
+    if (bluetoothService && bluetoothService.ready
+        && bluetoothService.cancelDeviceAction(device.address)) {
+      if (typeof device.cancelPair === "function") device.cancelPair()
+      return
+    }
     var owner = deviceActionOwner(device.address, "pair")
     if (!owner) return
     if (owner !== root) {
@@ -1163,6 +1402,8 @@ Panel {
     setPendingAction(device.address, "")
     setDeviceActionFailure(device.address, "", "")
     if (typeof device.cancelPair === "function") device.cancelPair()
+    if (bluetoothService && bluetoothService.ready && !deviceActionProc.running)
+      bluetoothService.request("device.cancel", { address: String(device.address) })
     if (deviceActionProc.running) deviceActionProc.signal(15)
   }
 
@@ -1180,6 +1421,7 @@ Panel {
   // Keep the coordinator's policy queue replicated across monitor widgets.
   // Engine adoption is deliberately silent, preventing publication loops.
   function publishAudioPolicyApplications(applications) {
+    if (bluetoothService && bluetoothService.ready) return
     if (!isAudioPolicyCoordinator() || !bar
         || typeof bar.moduleWidgets !== "function") return
     var items = bar.moduleWidgets(moduleName) || []
@@ -1192,7 +1434,8 @@ Panel {
   }
 
   function adoptAudioPolicyApplications(applications) {
-    policyEngine.adoptApplications(applications)
+    if (!bluetoothService || !bluetoothService.ready)
+      localPolicyEngine.adoptApplications(applications)
   }
 
   function audioPolicyApplicationsSnapshot() {
@@ -1200,6 +1443,7 @@ Panel {
   }
 
   function adoptExistingAudioPolicyApplications() {
+    if (bluetoothService && bluetoothService.ready) return
     if (!bar || typeof bar.moduleWidgets !== "function") return
     var items = bar.moduleWidgets(moduleName) || []
     var merged = {}
@@ -1214,7 +1458,7 @@ Panel {
       for (var key in applications)
         if (!merged[key]) merged[key] = cloneMap(applications[key])
     }
-    if (Object.keys(merged).length > 0) policyEngine.adoptApplications(merged)
+    if (Object.keys(merged).length > 0) localPolicyEngine.adoptApplications(merged)
   }
 
   function syncPendingActions() {
@@ -1487,7 +1731,8 @@ Panel {
   onConnectedDevicesChanged: {
     reselectFocusedDevice()
     syncPendingActions()
-    policyEngine.observeDevices(devices)
+    if (!bluetoothService || !bluetoothService.ready)
+      localPolicyEngine.observeDevices(devices)
     var expectedProfile = pendingAudioProfile || unconfirmedAudioProfile
     if (expectedProfile) {
       var expectedDevice = deviceByAddress(expectedProfile.address)
@@ -1514,12 +1759,14 @@ Panel {
   onKnownDevicesChanged: {
     reselectFocusedDevice()
     syncPendingActions()
-    policyEngine.observeDevices(devices)
+    if (!bluetoothService || !bluetoothService.ready)
+      localPolicyEngine.observeDevices(devices)
   }
   onDiscoveredDevicesChanged: {
     reselectFocusedDevice()
     syncPendingActions()
-    policyEngine.observeDevices(devices)
+    if (!bluetoothService || !bluetoothService.ready)
+      localPolicyEngine.observeDevices(devices)
   }
   onVisibleSectionsChanged: clampCursor()
   onPipewireNodesChanged: {
@@ -1637,6 +1884,7 @@ Panel {
   // confirmations. Hand interrupted operations and discovery debt to surviving
   // mirrors; only write StopDiscovery directly when this is the final item.
   Component.onDestruction: {
+    if (bluetoothService) bluetoothService.unregisterPanel(root)
     var items = bar && typeof bar.moduleWidgets === "function" ? bar.moduleWidgets(moduleName) : []
     var interruptedProfile = activeAudioProfileOperation
       || pendingAudioProfile || unconfirmedAudioProfile
@@ -1657,6 +1905,7 @@ Panel {
               failure.action, failure.message)
         }
       if (activeDeviceAction && !deviceActionCancelRequested
+          && !(bluetoothService && bluetoothService.ready)
           && typeof actionSibling.adoptInterruptedDeviceAction === "function")
         actionSibling.adoptInterruptedDeviceAction(activeDeviceAction)
       if (interruptedProfile
@@ -1677,8 +1926,9 @@ Panel {
   }
 
   Component.onCompleted: {
+    if (bluetoothService) bluetoothService.registerPanel(root)
     refreshAudioControlInstalled()
-    policyEngine.initializeDevices(devices)
+    localPolicyEngine.initializeDevices(devices)
     // Preserve policies written by versions that stored them in the shared
     // audio document before a schema-normalizing companion writer can drop the
     // unknown field. The migration is locked and idempotent across monitors.
@@ -1687,6 +1937,13 @@ Panel {
     // policy. Adopt its shadow before this item can become the first/coordinator
     // widget, otherwise a change in module ordering could strand that queue.
     Qt.callLater(function() { root.adoptExistingAudioPolicyApplications() })
+  }
+
+  Connections {
+    target: root.bluetoothService
+    function onDeviceActionFinished(operation, result, failure) {
+      root.finishServiceDeviceAction(operation, result, failure)
+    }
   }
 
   Connections {
@@ -1804,34 +2061,11 @@ Panel {
 
     function finishCollection() {
       if (!collecting || !stderrComplete || !exitComplete) return
-      var operation = root.activeDeviceAction
       var code = resultCode
       collecting = false
       stderrComplete = false
       exitComplete = false
-      if (!operation) return
-
-      if (root.deviceActionCancelRequested) {
-        root.setPendingAction(operation.address, "")
-        root.setDeviceActionFailure(operation.address, "", "")
-      } else if (code !== 0) {
-        root.setPendingAction(operation.address, "")
-        root.setDeviceActionFailure(
-          operation.address,
-          operation.action,
-          root.deviceActionStderr || root.defaultDeviceActionError(operation.action))
-      } else {
-        root.setDeviceActionFailure(operation.address, "", "")
-      }
-
-      root.activeDeviceAction = null
-      root.deviceActionCancelRequested = false
-      root.syncPendingActions()
-      // A long pairing helper can consume most of the timer that started with
-      // the command. Give BlueZ a full confirmation window after helper success
-      // on every monitor instead of timing out moments after the process exits.
-      if (code === 0 && root.pendingAction(operation.address) !== "")
-        root.setPendingAction(operation.address, operation.pending, operation.action)
+      root.finishDeviceAction(code, root.deviceActionStderr)
     }
 
     stderr: StdioCollector {
@@ -1866,39 +2100,11 @@ Panel {
 
     function finishCollection() {
       if (!collecting || !stderrComplete || !exitComplete) return
-      var operation = root.pendingDeviceProperty
       var code = resultCode
       collecting = false
       stderrComplete = false
       exitComplete = false
-      if (!operation) return
-
-      var liveDevice = root.deviceByAddress(operation.address)
-      if (liveDevice && root.liveDeviceProperty(liveDevice, operation.propertyName)
-          === operation.expected) {
-        // A timed-out D-Bus client can still have delivered the write. Live
-        // BlueZ state is authoritative, so do not turn an applied change into
-        // a sticky failure merely because the helper exited non-zero.
-        root.confirmDeviceProperty()
-        return
-      }
-
-      if (code !== 0) {
-        root.pendingDeviceProperty = null
-        if (Model.normalizedAddress(root.deviceDetailsAddress)
-            === Model.normalizedAddress(operation.address)) {
-          root.devicePropertyError = root.devicePropertyStderr || operation.errorMessage
-          // Renames are shown optimistically while the helper runs. If BlueZ
-          // rejects the write, put the field back in sync with the live object
-          // instead of leaving an unapplied alias on screen beside the error.
-          if (operation.propertyName === "name" && root.deviceDetailsRow)
-            deviceDetailsView.updateNameIfIdle(String(
-              root.deviceDisplayName(root.deviceDetailsRow)
-                || root.deviceDetailsRow.deviceName || ""))
-        }
-      } else {
-        devicePropertyConfirmTimer.restart()
-      }
+      root.finishDeviceProperty(code, root.devicePropertyStderr)
     }
 
     stderr: StdioCollector {
@@ -2005,37 +2211,11 @@ Panel {
 
     function finishCollection() {
       if (!collecting || !stderrComplete || !exitComplete) return
-      var operation = root.activeAudioProfileOperation
       var code = resultCode
       collecting = false
       stderrComplete = false
       exitComplete = false
-      root.activeAudioProfileOperation = null
-      // The target can disappear while the helper is running, or a live card
-      // refresh can be superseded by a disconnect. Such a result is stale; an
-      // early profile confirmation alone does not clear process ownership,
-      // because exit 2 can still report a failed preference write.
-      if (!operation) {
-        audioProfilePendingTimeout.stop()
-        audioProfileSettleTimer.restart()
-        return
-      }
-      if (code !== 0 && code !== 2) {
-        root.audioProfileSetError = root.audioProfileSetStderr
-          || "Could not change the Bluetooth audio mode"
-        root.pendingAudioProfile = null
-        root.unconfirmedAudioProfile = null
-        audioProfilePendingTimeout.stop()
-      } else {
-        root.audioProfileSetError = ""
-        if (code === 2 && root.audioPreferencesError === "")
-          root.audioPreferenceWriteError = "Audio mode is active, but its preference could not be saved"
-        if (root.pendingAudioProfile || root.unconfirmedAudioProfile)
-          audioProfilePendingTimeout.restart()
-        else
-          audioProfilePendingTimeout.stop()
-      }
-      audioProfileSettleTimer.restart()
+      root.finishAudioProfileOperation(code, root.audioProfileSetStderr)
     }
 
     stderr: StdioCollector {
@@ -2054,14 +2234,27 @@ Panel {
   }
 
   BluetoothAudioPolicyEngine {
-    id: policyEngine
+    id: localPolicyEngine
     controller: root
+    automaticRetries: !root.bluetoothService || !root.bluetoothService.ready
     preferencesReady: root.audioPreferencesReady
     onRefreshRequested: audioProfileRefreshTimer.restart()
     onApplicationsPublished: function(applications) {
       root.publishAudioPolicyApplications(applications)
     }
     onProfileSwitchRequested: function(key, address, profile) {
+      if (root.bluetoothService && root.bluetoothService.ready) {
+        root.bluetoothService.request("profile.set", {
+          address: address, profile: profile
+        }, function(result, failure) {
+          var code = failure ? 1
+            : result && result.outcome === "persistence_failed" ? 2 : 0
+          if (code === 2 && root.audioPreferencesError === "")
+            root.audioPreferenceWriteError = "Audio mode is active, but its preference could not be saved"
+          policyEngine.finishProfileSwitch(key, code)
+        })
+        return
+      }
       policyProfileSwitchProc.key = key
       policyProfileSwitchProc.command = [
         root.pluginScript("bluetooth-audio-profile-set"),
@@ -2180,12 +2373,13 @@ Panel {
     if (!audioControlInstalled) return
     controller.hide()
     var payload = '{"tab":"bluetooth"}'
-    if (bar && bar.shell && typeof bar.shell.summon === "function")
-      bar.shell.summon("ssupt.audio-control", payload)
-    else
-      Quickshell.execDetached([
-        "omarchy-shell", "shell", "summon", "ssupt.audio-control", payload
-      ])
+    // Some shell versions reject this clone-to-companion call. IPC can still
+    // summon the enabled audio plugin from the shell's own target.
+    if (bar && bar.shell && typeof bar.shell.summon === "function"
+        && bar.shell.summon("ssupt.audio-control", payload)) return
+    Quickshell.execDetached([
+      "omarchy-shell", "shell", "summon", "ssupt.audio-control", payload
+    ])
   }
 
   function toggleBluetooth() {

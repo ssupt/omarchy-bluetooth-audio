@@ -67,6 +67,12 @@ current bar position. Disabling or removing it restores the built-in widget.
 
 Requires `bluetoothctl`, `busctl`, `pactl`, `jq`, `timeout`, and `flock`, all
 present in a standard Omarchy installation.
+The plugin includes a prebuilt x86_64 Linux Rust command service. It owns
+Bluetooth actions, their completion and cancellation, audio mode changes, and
+preference writes across bar widgets on multiple monitors. Successful forget
+also clears saved audio routes when the audio companion is available. Automatic
+default routing waits for the audio service result and live default state. The
+panel remains usable with its local helpers if the service cannot start.
 
 ## Removing
 
@@ -106,15 +112,23 @@ and restores it on later connections.
 ## Development
 
 ```bash
+cargo build --locked --release --manifest-path backend/Cargo.toml
+python3 packaging/release.py --prepare . --binary backend/target/release/omarchy-bluetooth-service
 ./test/all
 omarchy-plugin-validate .
 ```
 
-`Panel.qml` owns shell integration and user actions. Background connect-policy
-transitions live in `BluetoothAudioPolicyEngine.qml`; the device row, details
-page, and glyph are separate QML components; and `Model.js` contains the pure,
-Node-tested projections and state helpers. System changes remain isolated in
-the scripts under `scripts/`.
+The release command atomically replaces the bundled binary and records its
+source fingerprint and SHA-256 in `backend-release.json`. The test suite checks
+both against the current plugin files, so a PR cannot ship an old service with
+new QML or helpers.
+
+`Service.qml` keeps one Rust process and connect-policy engine alive across bar
+widgets. `Panel.qml` owns shell integration and user actions. The device row,
+details page, and glyph are separate QML components; `Model.js` contains the
+pure, Node-tested projections and state helpers. The Rust process invokes the
+plugin's system helpers under `scripts/` so the panel remains independent of
+the audio companion.
 
 The panel is kept as a focused clone of the current native Bluetooth widget so
 it retains Omarchy's discovery, connection, and multi-monitor behavior.

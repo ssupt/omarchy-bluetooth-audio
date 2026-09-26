@@ -1,0 +1,7 @@
+{
+  "protocolVersion": 1,
+  "sha256": "c7d13e2e1e01bed4a56e52e8c453941e33785858bbd2252136b02694cb6410f8",
+  "sourceId": "2335edc3b25b2e3471edac7165d2fb9d1e88b631c7b977c58a262be6e9f70cff",
+  "target": "x86_64-unknown-linux-gnu",
+  "version": "0.7.0"
+}

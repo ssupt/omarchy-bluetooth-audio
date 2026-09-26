@@ -28,6 +28,17 @@ flock -w 5 8 || {
   echo "Another audio change is still finishing" >&2
   exit 1
 }
+# Draft Rust releases also hold an unsuffixed lock. Keep both during the
+# cross-plugin migration so either installed audio version serializes with us.
+service_lock=${XDG_RUNTIME_DIR:-/tmp}/omarchy-audio-mutation.lock
+exec 7>>"$service_lock" || {
+  echo "Could not open the audio service mutation lock" >&2
+  exit 1
+}
+flock -w 5 7 || {
+  echo "Another audio change is still finishing" >&2
+  exit 1
+}
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 profile_state=$("$script_dir/audio-profiles" |
@@ -103,6 +114,7 @@ project_endpoint_states() {
       serial: ((.properties[\"object.serial\"]
         // .properties[\"object.id\"] // \"\") | tostring),
       mute: .mute,
+      loopback: ((.properties[\"bluez5.loopback\"] // \"false\") | tostring),
       volumes: [
         (.volume // {}) | to_entries[]?
         | (.value.value_percent
@@ -317,6 +329,7 @@ rollback_profile() {
   local rollback_active_profile=
   local rollback_signature= last_rollback_signature=
   local rollback_stable_ticks=0 rollback_sink_count rollback_source_count
+  local rollback_transient_source_count
   local rollback_sinks_ready rollback_sources_ready sink_identity source_identity endpoint_key
   local -A muted_rollback_sinks=() muted_rollback_sources=()
 
@@ -377,6 +390,8 @@ rollback_profile() {
 
     rollback_sink_count=$(jq 'length' <<<"$rollback_sink_states") || return 1
     rollback_source_count=$(jq 'length' <<<"$rollback_source_states") || return 1
+    rollback_transient_source_count=$(jq '[.[] | select(.loopback != "true")] | length' \
+      <<<"$rollback_source_states") || return 1
     rollback_sinks_ready=false
     rollback_sources_ready=false
     if (( expected_old_sinks == 0 )); then
@@ -385,7 +400,7 @@ rollback_profile() {
       (( rollback_sink_count >= expected_old_sinks )) && rollback_sinks_ready=true
     fi
     if (( expected_old_sources == 0 )); then
-      (( rollback_source_count == 0 )) && rollback_sources_ready=true
+      (( rollback_transient_source_count == 0 )) && rollback_sources_ready=true
     else
       (( rollback_source_count >= expected_old_sources )) && rollback_sources_ready=true
     fi
@@ -475,6 +490,7 @@ timeout --kill-after=1s 2 pactl set-card-profile "$card" "$profile" || exit 1
 
 new_sinks=()
 new_sources=()
+new_transient_sources=()
 first_new_sink_states='[]'
 first_new_source_states='[]'
 declare -A muted_new_sinks=()
@@ -506,6 +522,11 @@ for (( attempt = 0; attempt < 40; attempt++ )); do
   fi
   mapfile -t new_sinks < <(jq -r '.[].index' <<<"$new_sink_states")
   mapfile -t new_sources < <(jq -r '.[].index' <<<"$new_source_states")
+  # WirePlumber can keep its Bluetooth loopback microphone across A2DP and
+  # headset profiles. It is not a profile-owned input that must disappear.
+  mapfile -t new_transient_sources < <(jq -r '
+    .[] | select(.loopback != "true") | .index
+  ' <<<"$new_source_states")
 
   # A duplex profile may expose its sink before its source. Keep every new
   # output quiet as soon as it appears instead of leaving it at a previously
@@ -559,7 +580,7 @@ for (( attempt = 0; attempt < 40; attempt++ )); do
     (( ${#new_sinks[@]} >= expected_sinks )) || sinks_ready=false
   fi
   if (( expected_sources == 0 )); then
-    (( ${#new_sources[@]} == 0 )) || sources_ready=false
+    (( ${#new_transient_sources[@]} == 0 )) || sources_ready=false
   else
     (( ${#new_sources[@]} >= expected_sources )) || sources_ready=false
   fi
@@ -599,7 +620,7 @@ elif [[ -z $transition_error ]] \
     && (( expected_sinks > 0 && ${#new_sinks[@]} < expected_sinks )); then
   transition_error="The new audio output did not become available"
 elif [[ -z $transition_error && $expected_sources == 0
-    && ${#new_sources[@]} -ne 0 ]]; then
+    && ${#new_transient_sources[@]} -ne 0 ]]; then
   transition_error="The previous audio input did not disappear"
 elif [[ -z $transition_error ]] \
     && (( expected_sources > 0 && ${#new_sources[@]} < expected_sources )); then
