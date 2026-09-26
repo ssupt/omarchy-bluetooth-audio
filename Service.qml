@@ -20,12 +20,40 @@ Item {
   property var controller: null
   property var pendingAudioForgets: []
   property var audioForgetInFlight: ({})
+  property int audioForgetGeneration: 0
+  property var audioForgetAttempts: ({})
+  property var audioForgetRetryAt: ({})
+  property var audioForgetFailures: ({})
+  readonly property int maximumAudioForgetAttempts: 4
+  readonly property string audioForgetError: {
+    var addresses = Object.keys(audioForgetFailures)
+    if (addresses.length === 0) return ""
+    var failure = audioForgetFailures[addresses[0]]
+    return "Could not remove saved audio data for a forgotten Bluetooth device: "
+      + String(failure.message || "Audio cleanup failed")
+  }
   property var deviceActions: ({})
   property var deviceActionResults: ({})
   property var manualAudioSelection: null
   property string manualAudioError: ""
   property int manualAudioSequence: 0
   readonly property bool manualAudioBusy: manualAudioSelection !== null
+  property var manualProfileOperation: null
+  property var manualProfileResult: null
+  property int manualProfileSequence: 0
+  readonly property bool manualProfileBusy: manualProfileOperation !== null
+  readonly property string manualProfileError: {
+    var result = manualProfileResult
+    if (!result) return ""
+    if (result.outcome === "persistence_failed")
+      return "Audio mode is active, but its preference could not be saved"
+    if (result.outcome === "unknown")
+      return "Bluetooth audio mode may have changed: "
+        + String(result.message || "the final result could not be confirmed")
+    if (result.outcome === "rejected")
+      return String(result.message || "Could not change the Bluetooth audio mode")
+    return ""
+  }
   signal deviceActionFinished(var operation, var result, var failure)
   readonly property var audioControlService: shell ? shell.serviceFor("ssupt.audio-control") : null
   readonly property var devices: Bluetooth.devices ? Bluetooth.devices.values : []
@@ -35,15 +63,28 @@ Item {
 
   onAudioControlServiceChanged: {
     interruptManualAudio()
-    audioForgetInFlight = ({})
+    interruptAudioForgets()
     flushAudioForgets()
   }
   Connections {
     target: root.audioControlService
     function onReadyChanged() {
       if (!root.audioControlService.ready) root.interruptManualAudio()
+      if (!root.audioControlService.ready) root.interruptAudioForgets()
       root.flushAudioForgets()
     }
+  }
+
+  function interruptAudioForgets() {
+    var failures = Object.assign({}, audioForgetFailures)
+    for (var address in audioForgetInFlight)
+      failures[address] = {
+        outcome: "unknown", message: "Audio service disconnected before cleanup was confirmed"
+      }
+    audioForgetFailures = failures
+    audioForgetGeneration++
+    audioForgetInFlight = ({})
+    audioForgetRetryTimer.stop()
   }
 
   function interruptManualAudio() {
@@ -55,6 +96,49 @@ Item {
       : "Bluetooth output result could not be confirmed"
     if (operation.unsaved.length > 0)
       manualAudioError += "; output preference could not be saved"
+  }
+
+  function pluginScript(name) {
+    return decodeURIComponent(String(Qt.resolvedUrl("scripts/" + name))
+      .replace(/^file:\/\//, ""))
+  }
+
+  function setManualAudioProfile(address, profile) {
+    if (manualProfileBusy || sharedPolicy.profileSwitchBusy || !address || !profile)
+      return false
+    var operation = {
+      id: ++manualProfileSequence, address: String(address), profile: String(profile)
+    }
+    manualProfileResult = null
+    manualProfileOperation = operation
+    if (ready) {
+      request("profile.set", { address: operation.address, profile: operation.profile },
+        function(result, failure) {
+          root.finishManualAudioProfile(operation.id, result, failure)
+        })
+    } else {
+      manualProfileSetProc.command = [pluginScript("bluetooth-audio-profile-set"),
+        operation.address, operation.profile]
+      manualProfileSetProc.prepare(operation.id)
+      manualProfileSetProc.running = true
+    }
+    return true
+  }
+
+  function finishManualAudioProfile(id, result, failure) {
+    var operation = manualProfileOperation
+    if (!operation || operation.id !== id) return
+    var outcome = failure ? String(failure.outcome || "unknown")
+      : String(result && result.outcome || "unknown")
+    if (failure && outcome !== "rejected") outcome = "unknown"
+    if (!failure && outcome !== "applied" && outcome !== "persistence_failed")
+      outcome = "unknown"
+    var message = String(failure && failure.message || result && result.message || "")
+    manualProfileOperation = null
+    manualProfileResult = {
+      id: operation.id, address: operation.address, profile: operation.profile,
+      outcome: outcome, message: message
+    }
   }
 
   function selectDeviceAudio(address, output, input) {
@@ -128,8 +212,16 @@ Item {
 
   function forgetAudioRoutes(address) {
     var key = String(address || "")
-    if (key === "" || pendingAudioForgets.indexOf(key) !== -1) return
-    pendingAudioForgets = pendingAudioForgets.concat([key]).slice(-32)
+    if (key === "") return
+    if (pendingAudioForgets.indexOf(key) === -1)
+      pendingAudioForgets = pendingAudioForgets.concat([key])
+    else if (!audioForgetFailures[key]) return
+    var failures = Object.assign({}, audioForgetFailures)
+    delete failures[key]
+    audioForgetFailures = failures
+    var attempts = Object.assign({}, audioForgetAttempts)
+    delete attempts[key]
+    audioForgetAttempts = attempts
     flushAudioForgets()
   }
 
@@ -199,26 +291,81 @@ Item {
         || audio.capabilities.indexOf("devices.forget") === -1) return
     for (var i = 0; i < pendingAudioForgets.length; i++) {
       var address = pendingAudioForgets[i]
-      if (audioForgetInFlight[address]) continue
+      if (audioForgetInFlight[address] || audioForgetFailures[address]) continue
+      if (audioForgetRetryAt[address] > Date.now()) continue
+      if (audioForgetRetryAt[address]) {
+        var due = Object.assign({}, audioForgetRetryAt)
+        delete due[address]
+        audioForgetRetryAt = due
+      }
       sendAudioForget(audio, address)
     }
+    scheduleAudioForgetRetry()
+  }
+
+  function scheduleAudioForgetRetry() {
+    var nextAt = 0
+    for (var address in audioForgetRetryAt) {
+      if (pendingAudioForgets.indexOf(address) === -1 || audioForgetInFlight[address]
+          || audioForgetFailures[address]) continue
+      if (!nextAt || audioForgetRetryAt[address] < nextAt)
+        nextAt = audioForgetRetryAt[address]
+    }
+    if (!nextAt) {
+      audioForgetRetryTimer.stop()
+      return
+    }
+    audioForgetRetryTimer.interval = Math.max(1, nextAt - Date.now())
+    audioForgetRetryTimer.restart()
   }
 
   function sendAudioForget(audio, address) {
     var inflight = Object.assign({}, audioForgetInFlight)
     inflight[address] = true
     audioForgetInFlight = inflight
+    var attempts = Object.assign({}, audioForgetAttempts)
+    attempts[address] = (attempts[address] || 0) + 1
+    audioForgetAttempts = attempts
+    var generation = audioForgetGeneration
     audio.request("devices.forget", { address: address }, function(_result, failure) {
+      if (root.audioForgetGeneration !== generation || root.audioControlService !== audio)
+        return
       var next = Object.assign({}, root.audioForgetInFlight)
       delete next[address]
       root.audioForgetInFlight = next
       if (failure) {
-        console.warn("Could not remove forgotten Bluetooth audio routes: " + failure.message)
+        if (failure.outcome === "rejected"
+            && (failure.code === "busy" || failure.code === "not_ready")
+            && root.audioForgetAttempts[address] < root.maximumAudioForgetAttempts) {
+          var retryAt = Object.assign({}, root.audioForgetRetryAt)
+          retryAt[address] = Date.now()
+            + 500 * Math.pow(2, root.audioForgetAttempts[address] - 1)
+          root.audioForgetRetryAt = retryAt
+          root.scheduleAudioForgetRetry()
+          return
+        }
+        var failures = Object.assign({}, root.audioForgetFailures)
+        failures[address] = {
+          outcome: String(failure.outcome || "unknown"),
+          message: String(failure.message || "Audio cleanup failed")
+        }
+        root.audioForgetFailures = failures
+        console.warn("Could not remove forgotten Bluetooth audio routes: " + failures[address].message)
       } else {
         root.pendingAudioForgets = root.pendingAudioForgets.filter(function(value) {
           return value !== address
         })
+        var remaining = Object.assign({}, root.audioForgetAttempts)
+        delete remaining[address]
+        root.audioForgetAttempts = remaining
+        remaining = Object.assign({}, root.audioForgetRetryAt)
+        delete remaining[address]
+        root.audioForgetRetryAt = remaining
+        remaining = Object.assign({}, root.audioForgetFailures)
+        delete remaining[address]
+        root.audioForgetFailures = remaining
       }
+      root.scheduleAudioForgetRetry()
     })
   }
 
@@ -391,6 +538,53 @@ Item {
       if (!root.destroying && !reconnectTimer.running) reconnectTimer.start()
     }
   }
+  Process {
+    id: manualProfileSetProc
+    property int operationId: 0
+    property bool collecting: false
+    property bool stderrComplete: false
+    property bool exitComplete: false
+    property int resultCode: 0
+    property string resultMessage: ""
+
+    function prepare(id) {
+      operationId = id
+      collecting = true
+      stderrComplete = false
+      exitComplete = false
+      resultCode = 0
+      resultMessage = ""
+    }
+
+    function finishCollection() {
+      if (!collecting || !stderrComplete || !exitComplete) return
+      collecting = false
+      if (resultCode === 0)
+        root.finishManualAudioProfile(operationId, { outcome: "applied" }, null)
+      else if (resultCode === 2)
+        root.finishManualAudioProfile(operationId,
+          { outcome: "persistence_failed", message: resultMessage }, null)
+      else
+        root.finishManualAudioProfile(operationId, null, {
+          outcome: "rejected", code: "helper_failed",
+          message: resultMessage || "Could not change the Bluetooth audio mode"
+        })
+    }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        manualProfileSetProc.resultMessage = String(text || "").trim()
+        manualProfileSetProc.stderrComplete = true
+        manualProfileSetProc.finishCollection()
+      }
+    }
+    onExited: function(exitCode) {
+      resultCode = exitCode
+      exitComplete = true
+      finishCollection()
+    }
+  }
   BluetoothAudioPolicyEngine {
     id: sharedPolicy
     controller: root.controller
@@ -421,6 +615,11 @@ Item {
     id: reconnectTimer
     interval: 5000
     onTriggered: if (!root.destroying) backend.running = true
+  }
+  Timer {
+    id: audioForgetRetryTimer
+    repeat: false
+    onTriggered: root.flushAudioForgets()
   }
   Timer {
     interval: 1000

@@ -38,6 +38,7 @@ const sources = Object.fromEntries(qmlSources.map(file => [
 const panelSource = qmlSources.map(file => sources[file]).join('\n')
 const controllerSource = sources['Panel.qml']
 const policySource = sources['BluetoothAudioPolicyEngine.qml']
+const serviceSource = fs.readFileSync(path.join(sourceRoot, 'Service.qml'), 'utf8')
 
 assert.match(panelSource, /audioControlInstalled/)
 assert.match(panelSource, /var payload = '\{"tab":"bluetooth"\}'/)
@@ -510,8 +511,7 @@ assert.match(controllerSource, /id: audioPolicyPreferenceProc/)
 for (const processId of [
   'audioPolicyPreferenceProc',
   'deviceActionProc',
-  'devicePropertyProc',
-  'audioProfileSetProc'
+  'devicePropertyProc'
 ]) {
   const processStart = controllerSource.indexOf('id: ' + processId)
   assert.notEqual(processStart, -1)
@@ -530,10 +530,13 @@ assert.match(policySource, /requestProfileSwitch\(/)
 assert.match(policySource, /signal profileSwitchRequested/)
 assert.match(policySource, /function finishProfileSwitch\(/)
 assert.match(controllerSource, /id: policyProfileSwitchProc/)
-assert.match(controllerSource, /audioProfileSetStderr/)
-assert.match(controllerSource, /activeAudioProfileOperation/)
-assert.match(controllerSource,
-  /function finishAudioProfileOperation\(code, message\)[\s\S]*?var operation = activeAudioProfileOperation[\s\S]*?if \(!operation\)/)
+assert.match(controllerSource, /bluetoothService\.setManualAudioProfile\(address, profile\)/)
+assert.match(controllerSource, /bluetoothService\.manualProfileError/)
+assert.match(serviceSource, /function setManualAudioProfile\(address, profile\)/)
+assert.match(serviceSource, /function finishManualAudioProfile\(id, result, failure\)/)
+assert.match(serviceSource, /id: manualProfileSetProc/)
+assert.doesNotMatch(controllerSource, /id: audioProfileSetProc/)
+assert.match(controllerSource, /text: root\.audioForgetError/)
 assert.match(policySource, /withPatch\(entry,/)
 assert.match(policySource, /stableTicks/)
 assert.match(policySource, /cardSignature/)
@@ -544,7 +547,7 @@ assert.ok(
   'output-only policy must not depend on profile inventory'
 )
 assert.match(policySource, /attempts < maximumAttempts/)
-assert.match(panelSource, /pluginScript\("bluetooth-audio-profile-set"\)/)
+assert.match(serviceSource, /pluginScript\("bluetooth-audio-profile-set"\)/)
 assert.doesNotMatch(panelSource, /pluginScript\("audio-profile-set"\)/)
 assert.match(panelSource, /connectPolicyHint/)
 assert.match(panelSource, /Model\.duplexProfileOption\(/)
@@ -595,6 +598,7 @@ fi
   || fail "shell service did not recover and transfer ownership"
 echo "PASS: shell service restart and panel handoff"
 python3 "$TEST_DIR/service_actions.py" || fail "service-owned device action lifecycle"
+python3 "$TEST_DIR/service_recovery.py" || fail "service-owned profile and cleanup recovery"
 python3 "$TEST_DIR/manual_audio.py" || fail "manual audio default results"
 node "$TEST_DIR/manual_audio_panel.js" || fail "manual audio panel wiring"
 

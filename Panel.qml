@@ -64,8 +64,26 @@ Panel {
     && bluetoothService.manualAudioBusy
   readonly property string manualAudioError: bluetoothService
     ? bluetoothService.manualAudioError : ""
+  readonly property string manualProfileError: bluetoothService
+    ? bluetoothService.manualProfileError : ""
+  readonly property string audioForgetError: bluetoothService
+    ? bluetoothService.audioForgetError : ""
   onBluetoothServiceChanged: {
-    if (bluetoothService) bluetoothService.registerPanel(root)
+    if (bluetoothService) {
+      bluetoothService.registerPanel(root)
+      adoptManualProfileOperation(bluetoothService.manualProfileOperation)
+    }
+  }
+  Connections {
+    target: root.bluetoothService
+    function onManualProfileOperationChanged() {
+      if (root.bluetoothService)
+        root.adoptManualProfileOperation(root.bluetoothService.manualProfileOperation)
+    }
+    function onManualProfileResultChanged() {
+      if (root.bluetoothService)
+        root.finishAudioProfileOperation(root.bluetoothService.manualProfileResult)
+    }
   }
   readonly property var policyEngine: bluetoothService && bluetoothService.ready
     ? bluetoothService.policyEngine : localPolicyEngine
@@ -134,24 +152,19 @@ Panel {
       ? audioPolicyPreferencesError : audioPreferenceWriteError)
   property string audioProfileReadError: ""
   property string audioProfileSetError: ""
-  property string audioProfileSetStderr: ""
-  readonly property string audioProfileError: audioProfileSetError !== ""
-    ? audioProfileSetError : (manualAudioError !== "" ? manualAudioError
-      : (audioProfileReadError !== "" ? audioProfileReadError
-        : (policyEngine.defaultError !== ""
-          ? policyEngine.defaultError : audioPreferencesError)))
+  readonly property string audioProfileError: manualProfileError !== ""
+    ? manualProfileError : (audioProfileSetError !== "" ? audioProfileSetError
+      : (manualAudioError !== "" ? manualAudioError
+        : (audioProfileReadError !== "" ? audioProfileReadError
+          : (policyEngine.defaultError !== ""
+            ? policyEngine.defaultError : audioPreferencesError))))
   property var pendingAudioProfile: null
   property var unconfirmedAudioProfile: null
-  // Kept until Process exits even if PipeWire confirms early. Confirmation
-  // proves the hardware state, not that the wrapper persisted the preference.
-  property var activeAudioProfileOperation: null
   property bool audioProfileMenuOpen: false
-  readonly property bool userAudioProfileChangeBusy: audioProfileSetProc.running
-    || audioProfileSetProc.collecting || pendingAudioProfile !== null
-    || activeAudioProfileOperation !== null
-  readonly property bool audioProfileCommandBusy: audioProfileSetProc.running
-    || audioProfileSetProc.collecting || activeAudioProfileOperation !== null
-    || policyEngine.profileSwitchBusy
+  readonly property bool userAudioProfileChangeBusy: pendingAudioProfile !== null
+    || (!!bluetoothService && bluetoothService.manualProfileBusy)
+  readonly property bool audioProfileCommandBusy: (!!bluetoothService
+    && bluetoothService.manualProfileBusy) || policyEngine.profileSwitchBusy
   readonly property bool localAudioProfileChangeBusy: userAudioProfileChangeBusy
     || policyEngine.profileSwitchBusy
   // PipeWire cards are global while this widget is mirrored per monitor. Read
@@ -669,58 +682,21 @@ Panel {
       }
     }
     if (!available) return
-
-    pendingAudioProfile = {
-      address: Model.normalizedAddress(address),
-      profile: String(profile)
-    }
-    unconfirmedAudioProfile = pendingAudioProfile
-    activeAudioProfileOperation = pendingAudioProfile
     audioProfileSetError = ""
-    if (bluetoothService && bluetoothService.ready) {
-      bluetoothService.request("profile.set", {
-        address: String(address), profile: String(profile)
-      }, function(result, failure) {
-        root.finishAudioProfileOperation(failure ? 1
-          : result && result.outcome === "persistence_failed" ? 2 : 0,
-          failure ? failure.message : result && result.message || "")
-      })
-      return
-    }
-    audioProfileSetProc.command = [
-      pluginScript("bluetooth-audio-profile-set"),
-      String(address),
-      String(profile)
-    ]
-    audioProfileSetProc.prepare()
-    audioProfileSetProc.running = true
+    if (!bluetoothService || !bluetoothService.setManualAudioProfile(address, profile))
+      audioProfileSetError = "Bluetooth service is unavailable"
   }
 
-  function finishAudioProfileOperation(code, message) {
-    var operation = activeAudioProfileOperation
-    activeAudioProfileOperation = null
-    // A live card may already have confirmed the switch. Keep process
-    // ownership until the preference write outcome is known as well.
-    if (!operation) {
-      audioProfilePendingTimeout.stop()
-      audioProfileSettleTimer.restart()
-      return
-    }
-    if (code !== 0 && code !== 2) {
-      audioProfileSetError = String(message || "")
-        || "Could not change the Bluetooth audio mode"
+  function finishAudioProfileOperation(result) {
+    if (!result) return
+    var operation = pendingAudioProfile || unconfirmedAudioProfile
+    if (operation && operation.id === result.id
+        && result.outcome !== "applied" && result.outcome !== "persistence_failed") {
       pendingAudioProfile = null
       unconfirmedAudioProfile = null
       audioProfilePendingTimeout.stop()
-    } else {
-      audioProfileSetError = ""
-      if (code === 2 && audioPreferencesError === "")
-        audioPreferenceWriteError = "Audio mode is active, but its preference could not be saved"
-      if (pendingAudioProfile || unconfirmedAudioProfile)
-        audioProfilePendingTimeout.restart()
-      else
-        audioProfilePendingTimeout.stop()
-    }
+    } else if (operation && operation.id === result.id && pendingAudioProfile)
+      audioProfilePendingTimeout.restart()
     audioProfileSettleTimer.restart()
   }
 
@@ -940,16 +916,15 @@ Panel {
         "The Bluetooth operation was interrupted. Try again.")
   }
 
-  function adoptInterruptedAudioProfile(operation) {
+  function adoptManualProfileOperation(operation) {
     if (!operation || !operation.address || !operation.profile) return
     var device = deviceByAddress(operation.address)
     if (!device || !device.connected) return
     pendingAudioProfile = {
       address: Model.normalizedAddress(operation.address),
-      profile: String(operation.profile)
+      profile: String(operation.profile), id: operation.id
     }
     unconfirmedAudioProfile = pendingAudioProfile
-    activeAudioProfileOperation = null
     audioProfileSetError = ""
     audioProfilePendingTimeout.restart()
     audioProfileRefreshTimer.restart()
@@ -1739,7 +1714,6 @@ Panel {
       if (!expectedDevice || !expectedDevice.connected) {
         pendingAudioProfile = null
         unconfirmedAudioProfile = null
-        activeAudioProfileOperation = null
         audioProfilePendingTimeout.stop()
         audioProfileSetError = connectedDevices.length > 0
           ? "The Bluetooth audio device disconnected before its mode was confirmed" : ""
@@ -1886,8 +1860,6 @@ Panel {
   Component.onDestruction: {
     if (bluetoothService) bluetoothService.unregisterPanel(root)
     var items = bar && typeof bar.moduleWidgets === "function" ? bar.moduleWidgets(moduleName) : []
-    var interruptedProfile = activeAudioProfileOperation
-      || pendingAudioProfile || unconfirmedAudioProfile
     var propertyHandedOff = false
     for (var actionIndex = 0; actionIndex < items.length; actionIndex++) {
       var actionSibling = items[actionIndex]
@@ -1908,9 +1880,6 @@ Panel {
           && !(bluetoothService && bluetoothService.ready)
           && typeof actionSibling.adoptInterruptedDeviceAction === "function")
         actionSibling.adoptInterruptedDeviceAction(activeDeviceAction)
-      if (interruptedProfile
-          && typeof actionSibling.adoptInterruptedAudioProfile === "function")
-        actionSibling.adoptInterruptedAudioProfile(interruptedProfile)
       if (!propertyHandedOff && pendingDeviceProperty
           && typeof actionSibling.adoptInterruptedDeviceProperty === "function") {
         propertyHandedOff = actionSibling.adoptInterruptedDeviceProperty(
@@ -1927,6 +1896,8 @@ Panel {
 
   Component.onCompleted: {
     if (bluetoothService) bluetoothService.registerPanel(root)
+    if (bluetoothService)
+      adoptManualProfileOperation(bluetoothService.manualProfileOperation)
     refreshAudioControlInstalled()
     localPolicyEngine.initializeDevices(devices)
     // Preserve policies written by versions that stored them in the shared
@@ -2185,45 +2156,6 @@ Panel {
         audioProfilesProc.resultOutput = String(text || "")
         audioProfilesProc.outputComplete = true
         audioProfilesProc.finishCollection()
-      }
-    }
-    onExited: function(exitCode) {
-      resultCode = exitCode
-      exitComplete = true
-      finishCollection()
-    }
-  }
-
-  Process {
-    id: audioProfileSetProc
-    property bool collecting: false
-    property bool stderrComplete: false
-    property bool exitComplete: false
-    property int resultCode: 0
-
-    function prepare() {
-      collecting = true
-      stderrComplete = false
-      exitComplete = false
-      resultCode = 0
-      root.audioProfileSetStderr = ""
-    }
-
-    function finishCollection() {
-      if (!collecting || !stderrComplete || !exitComplete) return
-      var code = resultCode
-      collecting = false
-      stderrComplete = false
-      exitComplete = false
-      root.finishAudioProfileOperation(code, root.audioProfileSetStderr)
-    }
-
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.audioProfileSetStderr = String(text || "").trim()
-        audioProfileSetProc.stderrComplete = true
-        audioProfileSetProc.finishCollection()
       }
     }
     onExited: function(exitCode) {
@@ -2695,6 +2627,16 @@ Panel {
         Text {
           visible: root.audioProfileError !== ""
           text: root.audioProfileError
+          color: root.bar.urgent
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+          width: parent.width
+        }
+
+        Text {
+          visible: root.audioForgetError !== ""
+          text: root.audioForgetError
           color: root.bar.urgent
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.bodySmall
