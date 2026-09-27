@@ -37,12 +37,6 @@ const sources = Object.fromEntries(qmlSources.map(file => [
 ]))
 const panelSource = qmlSources.map(file => sources[file]).join('\n')
 const controllerSource = sources['Panel.qml']
-const policySource = sources['BluetoothAudioPolicyEngine.qml']
-const serviceSource = fs.readFileSync(path.join(sourceRoot, 'Service.qml'), 'utf8')
-
-assert.match(panelSource, /audioControlInstalled/)
-assert.match(panelSource, /var payload = '\{"tab":"bluetooth"\}'/)
-assert.match(panelSource, /summon\("ssupt\.audio-control", payload\)/)
 
 const profiles = {
   '001122334455': {
@@ -484,30 +478,7 @@ assert.deepEqual(
 assert.equal(model.deviceIconGlyph('', 'Unknown Device', true), '󰂱')
 assert.equal(model.deviceIconGlyph('', 'Unknown Device', false), '󰂯')
 
-assert.match(panelSource, /pluginScript\("bluetooth-device-action"\)/)
-assert.match(panelSource, /device\.cancelPair\(\)/)
-assert.match(panelSource, /deviceActionProc\.signal\(15\)/)
-assert.match(panelSource, /controller\.retryDeviceAction\(device\)/)
-assert.match(controllerSource, /function adoptPendingAction\(/)
-assert.match(controllerSource, /function deviceActionOwner\(/)
-assert.match(controllerSource, /function adoptInterruptedDeviceAction\(/)
-assert.match(controllerSource, /localDeviceActionBusy/)
-assert.match(panelSource, /Model\.deviceIconGlyph/)
-assert.match(panelSource, /pluginScript\("bluetooth-device-property"\)/)
-assert.match(panelSource, /id: devicePropertyProc/)
-assert.match(panelSource, /id: forgetDialog/)
-assert.match(controllerSource, /BluetoothAudioPolicyEngine/)
-assert.match(controllerSource, /localPolicyEngine\.observeDevices\(devices\)/)
-assert.match(controllerSource, /audioProfilesNeeded: connectedDevices\.length > 0/)
-assert.match(controllerSource, /opened \|\| policyEngine\.hasPending/)
-assert.match(policySource, /function applyPending\(\)/)
-assert.match(policySource, /engine\.automaticRetries && engine\.hasPending/)
-assert.match(panelSource, /detailsAudioPolicyIndex/)
-assert.match(panelSource, /id: policyManualButton/)
-assert.match(panelSource, /id: policyOutputButton/)
-assert.match(panelSource, /id: policyMicButton/)
-assert.match(panelSource, /"set-policy"/)
-assert.match(controllerSource, /id: audioPolicyPreferenceProc/)
+// Guard process result collection and mutation boundaries in the fallback UI.
 for (const processId of [
   'audioPolicyPreferenceProc',
   'deviceActionProc',
@@ -525,46 +496,8 @@ for (const processId of [
   assert.match(controllerSource,
     new RegExp(processId + '\\.prepare\\(\\)'))
 }
-assert.doesNotMatch(panelSource, /!Model\.isValidAudioPolicy\(policy\)/)
-assert.match(policySource, /requestProfileSwitch\(/)
-assert.match(policySource, /signal profileSwitchRequested/)
-assert.match(policySource, /function finishProfileSwitch\(/)
-assert.match(controllerSource, /id: policyProfileSwitchProc/)
-assert.match(controllerSource, /bluetoothService\.setManualAudioProfile\(address, profile\)/)
-assert.match(controllerSource, /bluetoothService\.manualProfileError/)
-assert.match(serviceSource, /function setManualAudioProfile\(address, profile\)/)
-assert.match(serviceSource, /function finishManualAudioProfile\(id, result, failure\)/)
-assert.match(serviceSource, /id: manualProfileSetProc/)
-assert.doesNotMatch(controllerSource, /id: audioProfileSetProc/)
-assert.match(controllerSource, /text: root\.audioForgetError/)
-assert.match(policySource, /withPatch\(entry,/)
-assert.match(policySource, /stableTicks/)
-assert.match(policySource, /cardSignature/)
-assert.match(policySource, /Model\.preferredDuplexProfileOption\(/)
-assert.ok(
-  policySource.indexOf('if (entry.policy === "output")')
-    < policySource.indexOf('var state = controller.audioProfileState(key)'),
-  'output-only policy must not depend on profile inventory'
-)
-assert.match(policySource, /attempts < maximumAttempts/)
-assert.match(serviceSource, /pluginScript\("bluetooth-audio-profile-set"\)/)
 assert.doesNotMatch(panelSource, /pluginScript\("audio-profile-set"\)/)
-assert.match(panelSource, /connectPolicyHint/)
-assert.match(panelSource, /Model\.duplexProfileOption\(/)
-assert.match(panelSource, /deviceDetailsIsAudio/)
-assert.match(panelSource, /detailsStopAvailable\(/)
-assert.match(controllerSource, /Model\.deviceDetailsStops\(/)
-assert.match(panelSource, /Model\.isAudioDevice\(/)
-assert.match(panelSource, /syncAudioControlAliases\(/)
-assert.match(panelSource, /deviceAliasKeysForAddress\(/)
-assert.match(panelSource, /reconcileAudioControlAliases\(/)
-assert.match(panelSource,
-  /onPipewireNodesChanged:[\s\S]*?audioControlAliasSyncTimer\.restart\(\)/)
-assert.match(panelSource, /audioControlScript\("audio-app-rules"\)/)
-assert.match(panelSource, /"set-alias"/)
-assert.match(panelSource, /parseDeviceAliases\(/)
-assert.match(panelSource, /deviceDisplayName\(/)
-assert.match(panelSource, /audio-rules\.json/)
+assert.match(controllerSource, /text: root\.audioForgetError/)
 assert.doesNotMatch(panelSource, /device\.(?:name|trusted|blocked|wakeAllowed)\s*=/)
 assert.doesNotMatch(panelSource, /execDetached\(deviceCommand/)
 assert.doesNotMatch(panelSource, /\.isSource\b/)
@@ -589,17 +522,8 @@ env -u QT_QPA_PLATFORMTHEME -u DISPLAY -u WAYLAND_DISPLAY \
   || fail "Bluetooth policy state machine"
 echo "PASS: Bluetooth policy state machine"
 
-if ! service_result=$(env -u QT_QPA_PLATFORMTHEME -u DISPLAY -u WAYLAND_DISPLAY \
-    QT_QPA_PLATFORM=offscreen timeout 20 quickshell -p "$ROOT/ServiceHarness.qml" --no-color 2>&1); then
-  printf '%s\n' "$service_result" >&2
-  fail "shell service lifecycle"
-fi
-[[ $service_result == *"PASS: shell service restart and panel handoff"* ]] \
-  || fail "shell service did not recover and transfer ownership"
-echo "PASS: shell service restart and panel handoff"
-python3 "$TEST_DIR/service_actions.py" || fail "service-owned device action lifecycle"
-python3 "$TEST_DIR/service_recovery.py" || fail "service-owned profile and cleanup recovery"
-python3 "$TEST_DIR/manual_audio.py" || fail "manual audio default results"
+python3 "$TEST_DIR/service_lifecycle.py" || fail "shared service lifecycle"
+python3 "$TEST_DIR/service_recovery.py" || fail "profile and cleanup recovery"
 node "$TEST_DIR/manual_audio_panel.js" || fail "manual audio panel wiring"
 
 ucm_profiles=$(

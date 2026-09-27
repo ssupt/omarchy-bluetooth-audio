@@ -87,8 +87,39 @@ With Advanced Audio Control installed, default-device changes wait for that
 service's confirmed result and the live audio state. The panel can still use
 its local helpers when the Bluetooth service is unavailable.
 
-See [development and release](DEVELOPMENT.md) for builds and packaged
-source checks, and [Audio integration](INTEGRATION.md) for policy, storage,
-and companion details.
+## Saved preferences
+
+Under `~/.config/omarchy`, `audio-preferences.json` stores preferred devices and
+profiles shared with Advanced Audio Control. Per-device connection policies
+live in `bluetooth-audio-policies.json`; older shared-file policies migrate
+automatically. Unsupported future schemas are left unchanged.
+
+**Output + Microphone** selects and remembers a supported microphone mode when
+needed. A manual mode change lasts for the current connection; the policy
+applies again on the next connection. With Advanced Audio Control enabled,
+device renames update its aliases and forgetting clears its saved audio routes.
+
+## Contributing
+
+The QML files own presentation and shared operation state; `backend/src/` owns
+command execution, and `scripts/` contains system helpers. Tests and QML
+fixtures live under `test/` and use temporary data and mock devices.
+Use Rust/Cargo **1.85+**, Python, Node.js, jq, and Qt/Quickshell test tools.
+
+```bash
+cargo build --locked --release --manifest-path backend/Cargo.toml
+python3 packaging/release.py --prepare . --binary backend/target/release/omarchy-bluetooth-service
+./test/all
+omarchy-plugin-validate .
+```
+
+Build in a development checkout outside the live plugin directory. Commit the
+matching bundled binary and `backend-release.json` when changing runtime
+sources. The release check rejects mismatched sources and binaries; docs and
+test fixtures do not affect the runtime fingerprint.
+
+The audio companion's `default.compat` request validates the live node ID and
+name. Wait for its result before completing a default switch, and coordinate
+releases when changing the shared preference or command contract.
 
 More plugins by `ssupt`: [omarchy-plugins](https://github.com/ssupt/omarchy-plugins).
