@@ -9,18 +9,18 @@ unchanged, become the output, or become both output and microphone.
 
 Pairing failures include their reason and a retry action. Device details
 provide rename, trust, block, supported wake controls, and confirmed forgetting.
-Install it alongside [Advanced Audio Control](https://github.com/ssupt/omarchy-audio-control)
-for shared audio preferences and routing integration.
+It works independently. [Advanced Audio Control](https://github.com/ssupt/omarchy-audio-control)
+adds application routing and shared audio integration.
 
 ## What it adds to Omarchy
 
-Compared with the [stock Omarchy Quattro Bluetooth panel](https://github.com/omacom/omarchy/blob/quattro/shell/plugins/panels/bluetooth/Panel.qml),
+Compared with the [stock Omarchy Quattro Bluetooth panel](https://github.com/omacom/omarchy/blob/c5b4db77d68e7fbce5cf11120712ea322557e967/shell/plugins/panels/bluetooth/Panel.qml),
 checked **27 September 2026**:
 
 | Stock panel | Advanced Bluetooth Audio adds |
 | --- | --- |
-| Device list, pairing, connection, battery, and manual audio selection | Active codec and a selector for supported playback or headset modes |
-| Manual connection and audio selection | Per-device **Audio on connect** choices: Manual, Output, or Output + Microphone |
+| Device list, pairing, connection, and battery | Active codec and a selector for supported playback or headset modes |
+| Selects the audio output after connecting a device from the panel | Per-device **Audio on connect** choices: Manual, Output, or Output + Microphone |
 | Basic device actions | Failure reasons and retry, device details, and confirmed forgetting |
 
 For example, keep a headset in a high-fidelity playback mode for music, then
