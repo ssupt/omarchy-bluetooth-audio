@@ -66,6 +66,16 @@ if [[ -n ${AUDIO_CONTROL_PROFILE_LOG:-} && -n ${AUDIO_CONTROL_PROFILE_STATE:-} ]
       exit 0
       ;;
     "-f json list sources")
+      source_endpoint_card=$endpoint_card
+      if [[ ${AUDIO_CONTROL_PROFILE_LOOPBACK_SOURCE:-0} == 1 ]]; then
+        if [[ ${AUDIO_CONTROL_PROFILE_LEGACY_CARD_FIELD:-0} == 1 ]]; then
+          source_endpoint_card=$(printf \
+            '"card":%s,"properties":{"bluez5.loopback":"true"}' "$card_index")
+        else
+          source_endpoint_card=$(printf \
+            '"properties":{"device.name":"%s","bluez5.loopback":"true"}' "$card_name")
+        fi
+      fi
       if [[ $state == new && -n ${AUDIO_CONTROL_PROFILE_READ_DELAY:-} ]]; then
         sleep "$AUDIO_CONTROL_PROFILE_READ_DELAY"
       fi
@@ -79,7 +89,7 @@ if [[ -n ${AUDIO_CONTROL_PROFILE_LOG:-} && -n ${AUDIO_CONTROL_PROFILE_STATE:-} ]
             || [[ $state == new && ${AUDIO_CONTROL_PROFILE_NEW_SOURCE_UNMUTED:-0} == 1 ]]; then
           source_mute=false
         fi
-        printf '[{"index":200,%s,"name":"bluez_input.example","monitor_source":"","volume":{"mono":{"value_percent":"36%%"}},"mute":%s},{"index":201,"name":"bluez_output.example.monitor","monitor_source":"bluez_output.example","properties":{"device.name":"%s","media.class":"Audio/Sink"},"volume":{"mono":{"value_percent":"100%%"}},"mute":false}]\n' "$endpoint_card" "$source_mute" "$card_name"
+        printf '[{"index":200,%s,"name":"bluez_input.example","monitor_source":"","volume":{"mono":{"value_percent":"36%%"}},"mute":%s},{"index":201,"name":"bluez_output.example.monitor","monitor_source":"bluez_output.example","properties":{"device.name":"%s","media.class":"Audio/Sink"},"volume":{"mono":{"value_percent":"100%%"}},"mute":false}]\n' "$source_endpoint_card" "$source_mute" "$card_name"
       fi
       exit 0
       ;;
