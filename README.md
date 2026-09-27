@@ -14,8 +14,7 @@ adds application routing and shared audio integration.
 
 ## What it adds to Omarchy
 
-Compared with the [stock Omarchy Quattro Bluetooth panel](https://github.com/omacom/omarchy/blob/c5b4db77d68e7fbce5cf11120712ea322557e967/shell/plugins/panels/bluetooth/Panel.qml),
-checked **27 September 2026**:
+Compared with the [stock Bluetooth panel in Omarchy 4.0.4](https://github.com/omacom/omarchy/blob/c668141e9c42b13c80c9ca4ea108e11708c5e8a5/shell/plugins/panels/bluetooth/Panel.qml):
 
 | Stock panel | Advanced Bluetooth Audio adds |
 | --- | --- |
