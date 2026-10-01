@@ -17,6 +17,7 @@ Item {
   implicitHeight: Style.space(26)
 
   Text {
+    textFormat: Text.PlainText
     anchors.centerIn: parent
     text: Model.deviceIconGlyph(icon.iconName, icon.deviceName, icon.connected)
     color: icon.foreground

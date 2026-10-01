@@ -30,7 +30,9 @@ jobs:
           repository: basecamp/omarchy
           ref: 7be59e1f4b7451d352d4673c560168290792590f
           path: omarchy
-          sparse-checkout: bin/omarchy-plugin-validate
+          sparse-checkout: |
+            bin/omarchy-plugin-validate
+            shell
           sparse-checkout-cone-mode: false
       - name: Check Rust and bundled service
         run: |
@@ -41,6 +43,8 @@ jobs:
           python3 packaging/release.py --check .
           python3 packaging/release.py --check-binary backend/target/release/omarchy-bluetooth-service
       - name: Run plugin regression suite
+        env:
+          AUDIO_TEST_OMARCHY_SHELL: "${{ github.workspace }}/omarchy/shell"
         run: ./test/all
       - name: Validate Omarchy manifest
         run: ./omarchy/bin/omarchy-plugin-validate .

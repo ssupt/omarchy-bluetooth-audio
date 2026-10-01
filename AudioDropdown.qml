@@ -89,6 +89,7 @@ Item {
     spacing: Style.spacing.labelGap
 
     Text {
+      textFormat: Text.PlainText
       visible: root.showLabel && root.label !== ""
       text: root.label
       color: Qt.darker(root.foreground, 1.4)
@@ -138,6 +139,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: !root.chevronOnly
         anchors.left: parent.left
         anchors.right: chevron.left
@@ -152,6 +154,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         id: chevron
         visible: root.showChevron
         anchors.right: root.chevronOnly ? undefined : parent.right
@@ -320,6 +323,7 @@ Item {
               : "transparent"
 
             Text {
+              textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter

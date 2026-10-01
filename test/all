@@ -522,6 +522,7 @@ env -u QT_QPA_PLATFORMTHEME -u DISPLAY -u WAYLAND_DISPLAY \
   || fail "Bluetooth policy state machine"
 echo "PASS: Bluetooth policy state machine"
 
+python3 "$TEST_DIR/text_rendering.py" || fail "plain text labels"
 python3 "$TEST_DIR/service_lifecycle.py" || fail "shared service lifecycle"
 python3 "$TEST_DIR/service_recovery.py" || fail "profile and cleanup recovery"
 node "$TEST_DIR/manual_audio_panel.js" || fail "manual audio panel wiring"
