@@ -166,6 +166,7 @@ CursorSurface {
       anchors.verticalCenter: parent.verticalCenter
 
       Text {
+        textFormat: Text.PlainText
         text: controller.deviceDisplayName(row.dev) || "Device"
         color: controller.bar.foreground
         font.family: controller.bar.fontFamily
@@ -174,6 +175,7 @@ CursorSurface {
         width: parent.width
       }
       Text {
+        textFormat: Text.PlainText
         visible: row.statusText !== ""
         text: row.statusText
         color: row.statusColor

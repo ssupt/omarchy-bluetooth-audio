@@ -138,6 +138,7 @@ Item {
           spacing: Style.space(1)
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: controller.deviceDetailsRow
               ? (controller.deviceDisplayName(controller.deviceDetailsRow)
@@ -150,6 +151,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: !controller.deviceDetailsRow ? "NO LONGER VISIBLE"
               : controller.deviceDetailsRow.blocked ? "BLOCKED"
@@ -170,6 +172,7 @@ Item {
       PanelSeparator { foreground: controller.bar.foreground }
 
       Text {
+        textFormat: Text.PlainText
         visible: !controller.deviceDetailsRow
         width: parent.width
         text: "This Bluetooth device disappeared. It may be out of range or no longer remembered."
@@ -219,6 +222,7 @@ Item {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           text: "Press Enter to rename. Leave empty to restore the device's original name."
           color: Qt.darker(controller.bar.foreground, 1.5)
@@ -313,6 +317,7 @@ Item {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           text: controller.connectPolicyHint
           color: Qt.darker(controller.bar.foreground, 1.5)
@@ -403,6 +408,7 @@ Item {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           text: controller.deviceDetailsRow
             ? String(controller.deviceDetailsRow.address || "—") : "—"
@@ -415,6 +421,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: controller.deviceDetailsControlsBusy
         width: parent.width
         text: controller.deviceDetailsBusyText
@@ -424,6 +431,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: controller.devicePropertyError !== ""
         width: parent.width
         text: controller.devicePropertyError
@@ -463,9 +471,7 @@ Item {
     anchors.fill: parent
     z: 20
     opened: controller.forgetConfirmationOpen
-    message: "Forget “" + (controller.deviceDetailsRow
-      ? (controller.deviceDisplayName(controller.deviceDetailsRow) || "this device")
-      : "this device") + "”? You will need to pair it again before reconnecting."
+    message: "Forget this device? You will need to pair it again before reconnecting."
     cancelText: "Cancel"
     confirmText: "Forget"
     background: Color.popups.background

@@ -103,6 +103,7 @@ device renames update its aliases and forgetting clears its saved audio routes.
 The QML files own presentation and shared operation state; `backend/src/` owns
 command execution, and `scripts/` contains system helpers. Tests and QML
 fixtures live under `test/` and use temporary data and mock devices.
+Use `Text.PlainText` for labels; external names and saved text can contain markup.
 Use Rust/Cargo **1.85+**, Python, Node.js, jq, and Qt/Quickshell test tools.
 
 ```bash
