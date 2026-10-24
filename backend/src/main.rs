@@ -98,6 +98,19 @@ fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 160 && !value.chars().any(char::is_control)
 }
 
+fn device_path(value: &str, device: &str) -> bool {
+    let Some((adapter, suffix)) = value
+        .strip_prefix("/org/bluez/hci")
+        .and_then(|path| path.split_once("/dev_"))
+    else {
+        return false;
+    };
+    !adapter.is_empty()
+        && adapter.len() <= 10
+        && adapter.bytes().all(|byte| byte.is_ascii_digit())
+        && suffix.eq_ignore_ascii_case(&device.replace(':', "_"))
+}
+
 async fn read_frame<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     frame: &mut Vec<u8>,
@@ -258,8 +271,19 @@ impl Service {
             "device.action" => {
                 let action = string(&request.params, "action")?;
                 let device = string(&request.params, "address")?;
+                let path = match request.params.get("path") {
+                    None => "",
+                    Some(Value::String(path)) => path.as_str(),
+                    _ => {
+                        return Err(Failure::rejected(
+                            "invalid_params",
+                            "Invalid Bluetooth path",
+                        ));
+                    }
+                };
                 if !["pair", "connect", "disconnect", "forget"].contains(&action)
                     || !address(device)
+                    || (!path.is_empty() && !device_path(path, device))
                 {
                     return Err(Failure::rejected(
                         "invalid_params",
@@ -268,7 +292,7 @@ impl Service {
                 }
                 self.script(
                     "bluetooth-device-action",
-                    &[action, device],
+                    &[action, device, path],
                     remaining.unwrap_or(Duration::from_secs(50)),
                     Some((&request.id, device)),
                 )
@@ -571,5 +595,19 @@ mod tests {
         assert!(address("00:11:22:aa:BB:cc"));
         assert!(!address("00:11:22:aa:BB:c-"));
         assert!(!address("00-11-22-aa-BB-cc"));
+    }
+    #[test]
+    fn device_path_preserves_controller_and_matches_address() {
+        assert!(device_path(
+            "/org/bluez/hci12/dev_00_11_22_AA_BB_CC",
+            "00:11:22:aa:bb:cc"
+        ));
+        for path in [
+            "/org/bluez/hci1/dev_00_11_22_AA_BB_DD",
+            "/org/bluez/hci/dev_00_11_22_AA_BB_CC",
+            "/org/bluez/hci1/../dev_00_11_22_AA_BB_CC",
+        ] {
+            assert!(!device_path(path, "00:11:22:aa:bb:cc"));
+        }
     }
 }

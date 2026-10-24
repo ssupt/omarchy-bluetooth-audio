@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Bluetooth
+import "Model.js" as Model
 
 // One backend connection for all Bluetooth bar widgets. A widget may be
 // destroyed when a monitor changes without cancelling an admitted command.
@@ -34,6 +35,14 @@ Item {
   }
   property var deviceActions: ({})
   property var deviceActionResults: ({})
+  property var queuedConnection: null
+  readonly property var activeConnection: {
+    for (var key in deviceActions) {
+      var operation = deviceActions[key]
+      if (isConnectionAction(operation.action)) return operation
+    }
+    return null
+  }
   property var manualAudioSelection: null
   property string manualAudioError: ""
   property int manualAudioSequence: 0
@@ -229,12 +238,61 @@ Item {
     return String(address || "").toLowerCase().replace(/[:_-]/g, "")
   }
 
-  function startDeviceAction(action, address, pendingState) {
+  function isConnectionAction(action) {
+    return action === "pair" || action === "connect"
+  }
+
+  function chooseDeviceConnection(action, address, devicePath) {
+    if (destroying || !isConnectionAction(action) || actionKey(address) === "") return false
+    var active = activeConnection
+    if (!active) {
+      if (Object.keys(deviceActions).length > 0) return false
+      return startDeviceAction(action, address, "connecting", devicePath)
+    }
     var key = actionKey(address)
-    if (key === "" || Object.keys(deviceActions).length > 0) return false
+    if ((queuedConnection && actionKey(queuedConnection.address) === key)
+        || (!active.cancelled && actionKey(active.address) === key)) {
+      queuedConnection = null
+    } else {
+      queuedConnection = {
+        action: action, address: String(address), path: String(devicePath || "")
+      }
+    }
+    cancelDeviceAction(active.address, true)
+    return true
+  }
+
+  function flushQueuedConnection() {
+    if (destroying) {
+      queuedConnection = null
+      return
+    }
+    if (!queuedConnection || Object.keys(deviceActions).length > 0) return
+    var choice = queuedConnection
+    queuedConnection = null
+    startDeviceAction(choice.action, choice.address, "connecting", choice.path)
+  }
+
+  function executeDeviceAction(operation, callback) {
+    if (ready) {
+      return request("device.action", {
+        action: operation.action, address: operation.address, path: operation.path
+      }, callback)
+    }
+    fallbackDeviceAction.command = [pluginScript("bluetooth-device-action"),
+      operation.action, operation.address, operation.path]
+    fallbackDeviceAction.prepare(callback)
+    fallbackDeviceAction.running = true
+    return ""
+  }
+
+  function startDeviceAction(action, address, pendingState, devicePath) {
+    var key = actionKey(address)
+    if (destroying || key === "" || Object.keys(deviceActions).length > 0) return false
     var operation = {
       action: String(action), address: String(address),
-      pending: String(pendingState), cancelled: false, requestId: ""
+      pending: String(pendingState), path: String(devicePath || ""),
+      cancelled: false, requestId: ""
     }
     var actions = Object.assign({}, deviceActions)
     actions[key] = operation
@@ -242,46 +300,66 @@ Item {
     var results = Object.assign({}, deviceActionResults)
     delete results[key]
     deviceActionResults = results
-    var id = request("device.action", { action: operation.action, address: operation.address },
-      function(result, failure) {
-        // The service survives every panel. Successful forget cleanup belongs
-        // here even when the initiating widget disappeared mid-command.
-        if (!failure && result && result.outcome === "applied"
-            && operation.action === "forget")
-          root.forgetAudioRoutes(operation.address)
-        var current = Object.assign({}, root.deviceActions)
-        var completedOperation = Object.assign({}, operation, {
-          cancelled: !!(current[key] && current[key].cancelled)
+    var id = executeDeviceAction(operation, function(result, failure) {
+      var current = root.deviceActions[key]
+      if (!root.destroying && current && current.cancelled && root.isConnectionAction(operation.action)
+          && ((!failure && result && result.outcome === "applied")
+            || (failure && failure.outcome === "unknown"))) {
+        // A successful reply can race the cancel click. Stop that connection
+        // before starting the replacement even when its helper already exited.
+        root.executeDeviceAction({ action: "disconnect", address: operation.address,
+          path: operation.path }, function(stopped, stopFailure) {
+          root.completeDeviceAction(operation, stopped, stopFailure, !!stopFailure)
         })
-        delete current[key]
-        root.deviceActions = current
-        var completed = Object.assign({}, root.deviceActionResults)
-        completed[key] = {
-          action: operation.action,
-          message: failure && !completedOperation.cancelled
-            ? String(failure.message || "Bluetooth operation failed") : "",
-          outcome: failure ? String(failure.outcome || "unknown") : "applied"
-        }
-        root.deviceActionResults = completed
-        root.deviceActionFinished(completedOperation, result, failure)
-      })
+      } else root.completeDeviceAction(operation, result, failure, false)
+    })
     if (id) {
       operation.requestId = id
       actions = Object.assign({}, deviceActions)
       actions[key] = operation
       deviceActions = actions
     }
-    return id !== ""
+    return !!deviceActions[key]
   }
 
-  function cancelDeviceAction(address) {
+  function completeDeviceAction(operation, result, failure, cancellationFailed) {
+    var key = actionKey(operation.address)
+    // Completion belongs to the service even after the initiating panel closes.
+    if (!failure && result && result.outcome === "applied" && operation.action === "forget")
+      forgetAudioRoutes(operation.address)
+    var current = Object.assign({}, deviceActions)
+    var completedOperation = Object.assign({}, operation, {
+      action: cancellationFailed ? "disconnect" : operation.action,
+      cancelled: !cancellationFailed && !!(current[key] && current[key].cancelled)
+    })
+    delete current[key]
+    deviceActions = current
+    var completed = Object.assign({}, deviceActionResults)
+    completed[key] = {
+      action: completedOperation.action,
+      message: failure && !completedOperation.cancelled
+        ? String(failure.message || "Bluetooth operation failed") : "",
+      outcome: failure ? String(failure.outcome || "unknown") : "applied"
+    }
+    deviceActionResults = completed
+    deviceActionFinished(completedOperation, result, failure)
+    reconcileDeviceActionResults()
+    flushQueuedConnection()
+  }
+
+  function cancelDeviceAction(address, keepQueued) {
     var key = actionKey(address)
+    var queued = queuedConnection && actionKey(queuedConnection.address) === key
+    if (queued && !keepQueued) queuedConnection = null
     var operation = deviceActions[key]
-    if (!operation) return false
+    if (!operation) return !!queued
+    if (!isConnectionAction(operation.action)) return false
+    if (operation.cancelled) return true
     var next = Object.assign({}, deviceActions)
     next[key] = Object.assign({}, operation, { cancelled: true })
     deviceActions = next
-    request("device.cancel", { address: operation.address, requestId: operation.requestId })
+    if (fallbackDeviceAction.running) fallbackDeviceAction.signal(15)
+    else request("device.cancel", { address: operation.address, requestId: operation.requestId })
     return true
   }
 
@@ -401,7 +479,7 @@ Item {
       })
       return ""
     }
-    if (Object.keys(pending).length >= 32) {
+    if (Object.keys(pending).length >= 32 && method !== "device.cancel") {
       if (callback) callback(null, {
         code: "busy", message: "Too many Bluetooth commands are pending", outcome: "rejected"
       })
@@ -504,7 +582,45 @@ Item {
     })
   }
 
-  onDevicesChanged: sharedPolicy.observeDevices(devices)
+  function reconcileDeviceActionResults() {
+    var next = Object.assign({}, deviceActionResults)
+    var changed = false
+    for (var key in next) {
+      var result = next[key]
+      if (!result.message) continue
+      var device = null
+      for (var i = 0; i < devices.length; i++) {
+        if (devices[i] && Model.normalizedAddress(devices[i].address) === key) {
+          device = devices[i]
+          break
+        }
+      }
+      if (Model.deviceActionReachedState(result.action, device)) {
+        delete next[key]
+        changed = true
+      }
+    }
+    if (changed) deviceActionResults = next
+  }
+
+  function observeDeviceState() {
+    sharedPolicy.observeDevices(devices)
+    reconcileDeviceActionResults()
+  }
+
+  onDevicesChanged: observeDeviceState()
+  Instantiator {
+    model: root.devices
+    delegate: Connections {
+      required property var modelData
+      target: modelData
+      function onConnectedChanged() { root.observeDeviceState() }
+      function onPairedChanged() { root.reconcileDeviceActionResults() }
+      function onBondedChanged() { root.reconcileDeviceActionResults() }
+      function onTrustedChanged() { root.reconcileDeviceActionResults() }
+      function onBlockedChanged() { root.reconcileDeviceActionResults() }
+    }
+  }
   Component.onCompleted: {
     sharedPolicy.initializeDevices(devices)
     launchTimer.start()
@@ -536,6 +652,48 @@ Item {
       root.expired = ({})
       root.failPending("Bluetooth service disconnected; check the operation's live state")
       if (!root.destroying && !reconnectTimer.running) reconnectTimer.start()
+    }
+  }
+  Process {
+    id: fallbackDeviceAction
+    property var callback: null
+    property bool collecting: false
+    property bool stderrComplete: false
+    property bool exitComplete: false
+    property int resultCode: 0
+    property string resultMessage: ""
+
+    function prepare(finished) {
+      callback = finished
+      collecting = true
+      stderrComplete = false
+      exitComplete = false
+      resultCode = 0
+      resultMessage = ""
+    }
+
+    function finishCollection() {
+      if (!collecting || !stderrComplete || !exitComplete) return
+      var finished = callback
+      callback = null
+      collecting = false
+      if (resultCode === 0) finished({ outcome: "applied" }, null)
+      else finished(null, { outcome: "rejected", code: "helper_failed",
+        message: resultMessage || "Bluetooth operation failed" })
+    }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        fallbackDeviceAction.resultMessage = String(text || "").trim()
+        fallbackDeviceAction.stderrComplete = true
+        fallbackDeviceAction.finishCollection()
+      }
+    }
+    onExited: function(exitCode) {
+      resultCode = exitCode
+      exitComplete = true
+      finishCollection()
     }
   }
   Process {

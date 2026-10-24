@@ -49,8 +49,10 @@ call. A device without a microphone mode provides output only.
 - Open the gear on a device row, or right-click it, for device details. Under
   **Audio on connect**, choose **Manual** (the default), **Output**, or
   **Output + Microphone** for future connections.
-- Retry a failed pairing or connection from its row. Cancel an active pairing
-  attempt with the row's cancel button. Forgetting asks for confirmation.
+- Retry a failed pairing or connection from its row. While a device is
+  connecting, click it again or use its cancel button to stop the attempt.
+  Click another device to replace the pending connection; the latest choice
+  wins if you change your mind again. Forgetting asks for confirmation.
 
 The panel also supports keyboard navigation: `j`/`k` or Up/Down moves among
 devices, `h`/`l` or Left/Right reaches row actions, Enter activates the selected

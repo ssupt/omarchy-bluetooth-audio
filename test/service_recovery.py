@@ -209,11 +209,131 @@ ShellRoot {
 '''
 
 
-for name, qml in (("profile", profile_qml), ("forget", forget_qml)):
+state_qml = r'''
+import QtQuick
+import Quickshell
+import "Model.js" as Model
+ShellRoot {
+  id: harness
+  property int stage: 0
+  readonly property string key: "001122334455"
+  function check(value, message) {
+    if (value) return true
+    console.error(message); Qt.exit(1); return false
+  }
+  QtObject {
+    id: device
+    property string address: "00:11:22:33:44:55"
+    property bool connected: false
+    property bool paired: true
+    property bool bonded: true
+    property bool trusted: true
+    property bool blocked: false
+  }
+  Item {
+    id: root
+    property bool audioPreferencesReady: true
+    property var audioPreferences: ({bluetoothAudioPolicies: {"001122334455":"output"}})
+    property var bluetoothService: service
+    property var bar: null
+    property var devices: [device]
+    property var pendingActions: ({})
+    property var pendingActionKinds: ({})
+    property var pendingActionDeadlines: ({})
+    readonly property int pendingActionTimeoutMs: 20000
+    property var deviceActionFailures: ({})
+    property var activeDeviceAction: null
+    property bool deviceActionCancelRequested: false
+    function refreshAudioProfiles() {}
+    function cloneMap(value) { return Model.cloneMap(value) }
+    function pendingAction(address) { return "" }
+    __METHODS__
+  }
+  Service { id: service }
+  Timer {
+    interval: 50; running: true; repeat: true
+    onTriggered: {
+      if (harness.stage === 0) {
+        service.policyEngine.automaticRetries = false
+        service.registerPanel(root)
+        service.devices = [device]
+        harness.stage = 1
+      } else if (harness.stage === 1) {
+        service.deviceActionResults = {
+          "001122334455": {action:"connect", message:"Connection failed", outcome:"rejected"}
+        }
+        root.deviceActionFailures = {
+          "001122334455": {action:"connect", message:"Connection failed"}
+        }
+        device.connected = true
+        root.syncPendingActions()
+        harness.stage = 2
+      } else if (harness.stage === 2) {
+        if (!harness.check(service.policyEngine.pendingApplications[harness.key]
+            && service.policyEngine.connectionStates[harness.key] === true,
+            "Existing device connection did not queue its policy")) return
+        if (!harness.check(!service.deviceActionResults[harness.key]
+            && root.deviceActionFailure(device.address) === null,
+            "Recovered connection retained a visible failure")) return
+        service.policyEngine.pendingApplications = ({})
+        device.connected = false
+        service.deviceActionResults = {
+          "001122334455": {action:"disconnect", message:"Disconnect failed", outcome:"rejected"}
+        }
+        service.reconcileDeviceActionResults()
+        if (!harness.check(!service.deviceActionResults[harness.key],
+            "Recovered disconnect retained a failure")) return
+        device.connected = true
+        harness.stage = 3
+      } else {
+        if (!harness.check(service.policyEngine.pendingApplications[harness.key],
+            "Second reconnect did not queue its policy")) return
+        service.deviceActionResults = {
+          "001122334455": {action:"forget", message:"Forget failed", outcome:"rejected"}
+        }
+        device.paired = false
+        device.bonded = false
+        if (!harness.check(service.deviceActionResults[harness.key],
+            "Forget failure cleared while the device remained trusted")) return
+        device.trusted = false
+        if (!harness.check(!service.deviceActionResults[harness.key],
+            "Recovered forget retained a failure")) return
+        service.deviceActionResults = {
+          "001122334455": {action:"connect", message:"Connection failed", outcome:"rejected"}
+        }
+        service.reconcileDeviceActionResults()
+        if (!harness.check(!service.deviceActionResults[harness.key],
+            "Failure arriving after recovery was retained")) return
+        root.finishServiceDeviceAction({address:device.address, action:"connect"}, null,
+          {message:"Connection failed", outcome:"rejected"})
+        if (!harness.check(root.deviceActionFailure(device.address) === null,
+            "Late command failure restored an already recovered panel error")) return
+        console.info("PASS: existing-device reconnects queue policies and recovered errors disappear")
+        Qt.quit()
+      }
+    }
+  }
+  Timer { interval: 3000; running: true; onTriggered: Qt.exit(1) }
+}
+'''.replace("__METHODS__", "\n".join(panel_method(name) for name in (
+    "deviceActionFailure", "syncPendingActions", "setDeviceActionFailure",
+    "adoptDeviceActionFailure", "finishServiceDeviceAction",
+    "adoptPendingAction", "defaultDeviceActionError")))
+
+
+for name, qml in (("profile", profile_qml), ("forget", forget_qml), ("state", state_qml)):
     with tempfile.TemporaryDirectory(prefix="bluetooth-service-recovery-") as temporary:
         work = Path(temporary)
         for filename in ("Service.qml", "BluetoothAudioPolicyEngine.qml", "Model.js"):
             shutil.copy2(ROOT / filename, work / filename)
+        if name == "state":
+            # Inject fake device QObjects while retaining the service's real
+            # per-device signal subscriptions and reconciliation behavior.
+            service = work / "Service.qml"
+            source = service.read_text()
+            binding = "readonly property var devices: Bluetooth.devices ? Bluetooth.devices.values : []"
+            assert binding in source
+            service.write_text(source.replace(binding, "property var devices: []"))
         (work / "bin").mkdir()
         (work / "scripts").mkdir()
         shutil.copy2(ROOT / "bin/omarchy-bluetooth-service",
@@ -231,7 +351,10 @@ for name, qml in (("profile", profile_qml), ("forget", forget_qml)):
         result = subprocess.run(["quickshell", "-p", str(work / "Probe.qml"), "--no-color"],
                                 env=env, capture_output=True, text=True, timeout=12)
         output = result.stdout + result.stderr
-        expected = "PASS: shared profile completion" if name == "profile" else "PASS: busy cleanup retries"
+        expected = {"profile": "PASS: shared profile completion",
+                    "forget": "PASS: busy cleanup retries",
+                    "state": "PASS: existing-device reconnects"}[name]
         assert result.returncode == 0 and expected in output, output
-        assert "Cannot call method" not in output, output
+        assert not any(error in output for error in (
+            "Cannot call method", "TypeError:", "ReferenceError:")), output
         print(next(line.strip() for line in output.splitlines() if expected in line))

@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 // Device-type glyph rendered with the panel font for crisp themed icons.
@@ -9,7 +10,7 @@ Item {
   property string iconName: ""
   property string deviceName: ""
   property bool connected: false
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property real iconSize: Style.font.heading
   property string fontFamily: Style.font.family
 

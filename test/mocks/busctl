@@ -1,5 +1,24 @@
 #!/bin/bash
 
+if [[ -n ${BLUETOOTH_ACTION_LOG:-} ]]; then
+  printf '%s\n' "$*" >>"$BLUETOOTH_ACTION_LOG"
+  case "${1:-}:${5:-}" in
+    get-property:Powered) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_POWERED:-true}" ;;
+    get-property:Blocked) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_BLOCKED:-false}" ;;
+    call:Pair|call:CancelPairing|call:Connect|call:Disconnect|call:RemoveDevice|set-property:Trusted)
+      if [[ ${5:-} == "${BLUETOOTH_ACTION_BUS_DELAY_METHOD:-}" ]]; then
+        sleep "${BLUETOOTH_ACTION_DELAY_SECONDS:-1}"
+      fi
+      if [[ ${5:-} == "${BLUETOOTH_ACTION_BUS_FAIL_METHOD:-}" ]]; then
+        echo "${BLUETOOTH_ACTION_FAIL_MESSAGE:-Call failed: Failed}" >&2
+        exit "${BLUETOOTH_ACTION_FAIL_STATUS:-1}"
+      fi
+      ;;
+    *) echo "Unexpected busctl device action: $*" >&2; exit 1 ;;
+  esac
+  exit 0
+fi
+
 [[ -n ${BLUETOOTH_PROPERTY_LOG:-} ]] || {
   echo "Unexpected busctl call: $*" >&2
   exit 1

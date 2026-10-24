@@ -18,6 +18,7 @@ for script in "$ROOT"/scripts/* "$TEST_DIR"/mocks/*; do
 done
 echo "PASS: helper syntax"
 python3 "$TEST_DIR/backend.py" || fail "Rust command service"
+python3 "$TEST_DIR/device_actions.py" || fail "controller-specific Bluetooth actions"
 
 node - "$ROOT/Model.js" "$ROOT" <<'JS'
 const assert = require('node:assert/strict')
@@ -526,6 +527,7 @@ python3 "$TEST_DIR/text_rendering.py" || fail "plain text labels"
 python3 "$TEST_DIR/service_lifecycle.py" || fail "shared service lifecycle"
 python3 "$TEST_DIR/service_recovery.py" || fail "profile and cleanup recovery"
 node "$TEST_DIR/manual_audio_panel.js" || fail "manual audio panel wiring"
+node "$TEST_DIR/connection_panel.js" || fail "connection replacement panel actions"
 
 ucm_profiles=$(
   AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards-ucm.json" \
@@ -1466,7 +1468,7 @@ echo "PASS: unknown input state is preserved"
 jq -e '
   .schemaVersion == 1
   and .id == "ssupt.bluetooth-audio"
-  and .version == "0.7.0"
+  and .version == "0.7.1"
   and .author == "ssupt"
   and (.kinds | index("bar-widget") != null)
   and .entryPoints.barWidget == "Panel.qml"

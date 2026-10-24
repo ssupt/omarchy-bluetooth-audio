@@ -6,6 +6,7 @@ import Quickshell.Bluetooth
 import Quickshell.Services.Pipewire
 import qs.Ui
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 Panel {
@@ -280,10 +281,10 @@ Panel {
   readonly property string toggleHint: root.adapter && root.adapter.enabled ? "Turn Bluetooth off" : "Turn Bluetooth on"
 
   readonly property color hoverFill: bar
-    ? Style.hoverFillFor(bar.foreground, Color.accent)
+    ? Style.hoverFillFor(bar.foreground, Commons.Color.accent)
     : "transparent"
   readonly property color selectedFill: bar
-    ? Style.selectedFillFor(bar.foreground, Color.accent)
+    ? Style.selectedFillFor(bar.foreground, Commons.Color.accent)
     : "transparent"
 
   function sectionCount(section) {
@@ -371,7 +372,8 @@ Panel {
   readonly property bool audioPolicyPreferenceBusy: pendingAudioPolicy !== null
   readonly property bool localDeviceActionBusy: deviceActionProc.running
     || deviceActionProc.collecting || activeDeviceAction !== null
-    || (bluetoothService && Object.keys(bluetoothService.deviceActions).length > 0)
+    || (bluetoothService && (Object.keys(bluetoothService.deviceActions).length > 0
+      || bluetoothService.queuedConnection !== null))
   readonly property bool hasPendingDeviceActions: {
     if (Object.keys(pendingActions).length > 0) return true
     if (!bar || typeof bar.moduleWidgets !== "function") return false
@@ -811,6 +813,9 @@ Panel {
 
   function pendingAction(address) {
     if (bluetoothService) {
+      var queued = bluetoothService.queuedConnection
+      if (queued && Model.normalizedAddress(queued.address) === Model.normalizedAddress(address))
+        return "connecting"
       var serviceAction = bluetoothService.deviceActions[
         Model.normalizedAddress(address)]
       if (serviceAction) return serviceAction.pending
@@ -898,13 +903,18 @@ Panel {
     return null
   }
 
-  function pairingCancellationPending(address) {
+  function connectionCancellationPending(address) {
     if (bluetoothService) {
+      var queued = bluetoothService.queuedConnection
+      if (queued && Model.normalizedAddress(queued.address) === Model.normalizedAddress(address))
+        return false
       var active = bluetoothService.deviceActions[Model.normalizedAddress(address)]
-      if (active && active.action === "pair") return active.cancelled === true
+      if (active && (active.action === "pair" || active.action === "connect"))
+        return active.cancelled === true
     }
-    var owner = deviceActionOwner(address, "pair")
-    return !!owner && owner.deviceActionCancelRequested === true
+    var owner = deviceActionOwner(address)
+    return !!owner && (owner.activeDeviceAction.action === "pair"
+      || owner.activeDeviceAction.action === "connect") && owner.deviceActionCancelRequested === true
   }
 
   function adoptInterruptedDeviceAction(operation) {
@@ -940,17 +950,22 @@ Panel {
 
   function recoveryAction(address) {
     if (bluetoothService) {
+      var queued = bluetoothService.queuedConnection
+      if (queued && Model.normalizedAddress(queued.address) === Model.normalizedAddress(address))
+        return "cancel"
       var active = bluetoothService.deviceActions[Model.normalizedAddress(address)]
-      if (active && active.action === "pair" && !active.cancelled) return "cancel"
+      if (active && (active.action === "pair" || active.action === "connect")
+          && !active.cancelled) return "cancel"
     }
-    var owner = deviceActionOwner(address, "pair")
-    if (owner && !owner.deviceActionCancelRequested)
+    var owner = deviceActionOwner(address)
+    if (owner && (owner.activeDeviceAction.action === "pair"
+        || owner.activeDeviceAction.action === "connect") && !owner.deviceActionCancelRequested)
       return "cancel"
     return deviceActionFailure(address) ? "retry" : ""
   }
 
-  function deviceCommand(action, address) {
-    return [pluginScript("bluetooth-device-action"), action, address]
+  function deviceCommand(action, address, devicePath) {
+    return [pluginScript("bluetooth-device-action"), action, address, String(devicePath || "")]
   }
 
   function devicePropertyCommand(propertyName, dbusPath, value) {
@@ -967,9 +982,14 @@ Panel {
   }
 
   function runDeviceAction(device, action, pending) {
-    if (!device || !device.address || deviceActionBusy || devicePropertyBusy
-        || audioProfileChangeBusy
-        || pendingAction(device.address) !== "") return
+    if (!device || !device.address || devicePropertyBusy || audioProfileChangeBusy) return
+    if ((action === "pair" || action === "connect") && bluetoothService) {
+      if (deviceActionBusy && !bluetoothService.activeConnection) return
+      setDeviceActionFailure(device.address, "", "")
+      bluetoothService.chooseDeviceConnection(action, device.address, device.dbusPath)
+      return
+    }
+    if (deviceActionBusy || pendingAction(device.address) !== "") return
     setDeviceActionFailure(device.address, "", "")
     deviceActionCancelRequested = false
     activeDeviceAction = {
@@ -978,14 +998,14 @@ Panel {
       pending: String(pending)
     }
     setPendingAction(device.address, pending, action)
-    if (bluetoothService && bluetoothService.ready) {
-      if (!bluetoothService.startDeviceAction(action, device.address, pending)) {
+    if (bluetoothService) {
+      if (!bluetoothService.startDeviceAction(action, device.address, pending, device.dbusPath)) {
         activeDeviceAction = null
         setPendingAction(device.address, "")
       }
       return
     }
-    deviceActionProc.command = deviceCommand(action, device.address)
+    deviceActionProc.command = deviceCommand(action, device.address, device.dbusPath)
     deviceActionProc.prepare()
     deviceActionProc.running = true
   }
@@ -1033,10 +1053,12 @@ Panel {
       adoptPendingAction(operation.address, "", "")
       adoptDeviceActionFailure(operation.address, operation.action,
         String(failure.message || "") || defaultDeviceActionError(operation.action))
+      syncPendingActions()
     } else {
       adoptDeviceActionFailure(operation.address, "", "")
       syncPendingActions()
-      if (pendingAction(operation.address) !== "")
+      if (pendingAction(operation.address) !== ""
+          || !Model.deviceActionReachedState(operation.action, deviceByAddress(operation.address)))
         adoptPendingAction(operation.address, operation.pending, operation.action)
     }
   }
@@ -1049,6 +1071,7 @@ Panel {
 
   function disconnectDevice(device) {
     if (!device || !device.address) return
+    if (bluetoothService && bluetoothService.cancelDeviceAction(device.address)) return
     if (!device.connected) return
     runDeviceAction(device, "disconnect", "disconnecting")
   }
@@ -1359,17 +1382,14 @@ Panel {
     else if (failure.action === "forget") forgetDevice(device)
   }
 
-  function cancelPairing(device) {
+  function cancelDeviceConnection(device) {
     if (!device || !device.address) return
-    if (bluetoothService && bluetoothService.ready
-        && bluetoothService.cancelDeviceAction(device.address)) {
-      if (typeof device.cancelPair === "function") device.cancelPair()
-      return
-    }
-    var owner = deviceActionOwner(device.address, "pair")
-    if (!owner) return
+    if (bluetoothService && bluetoothService.cancelDeviceAction(device.address)) return
+    var owner = deviceActionOwner(device.address)
+    if (!owner || (owner.activeDeviceAction.action !== "pair"
+        && owner.activeDeviceAction.action !== "connect")) return
     if (owner !== root) {
-      owner.cancelPairing(device)
+      owner.cancelDeviceConnection(device)
       return
     }
 
@@ -1589,7 +1609,7 @@ Panel {
       return
     }
     if (focusedAction === "cancel") {
-      cancelPairing(deviceAt(focusSection, selectedIndex))
+      cancelDeviceConnection(deviceAt(focusSection, selectedIndex))
       return
     }
     if (focusedAction === "profile") {

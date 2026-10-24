@@ -1,7 +1,7 @@
 {
   "protocolVersion": 1,
-  "sha256": "cf37f0fc885f0c4519b69d506821bbec6a7cd4b6dc73435b3b0e3c27eb28e689",
-  "sourceId": "af370fc2b4c1120413ea082800caaa7f2096216cde17b696a00bac421fe9a69c",
+  "sha256": "71628cab53ff877bf33e3a547fa32e19367c9b61c7e1a432bc4b9cfa590d9b29",
+  "sourceId": "38061bd751d61a848dc142429c99c63350ffa427ce3a9a38aa31709e3f70a4ba",
   "target": "x86_64-unknown-linux-gnu",
-  "version": "0.7.0"
+  "version": "0.7.1"
 }

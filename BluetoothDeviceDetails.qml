@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import qs.Ui
 import qs.Commons
+import qs.Commons as Commons
 
 // Device-details page and confirmation overlay. Public methods keep focus and
 // scroll mechanics here while Panel owns Bluetooth operations and state.
@@ -201,7 +202,7 @@ Item {
           placeholderText: controller.deviceDetailsRow
             ? String(controller.deviceDetailsRow.deviceName || "Device name") : "Device name"
           foreground: controller.bar.foreground
-          accent: Color.accent
+          accent: Commons.Color.accent
           font.family: controller.bar.fontFamily
           font.pixelSize: Style.font.body
           hasCursor: !activeFocus && controller.deviceDetailsOpen
@@ -257,7 +258,7 @@ Item {
             horizontalPadding: Style.space(6)
             verticalPadding: Style.space(2)
             foreground: controller.bar.foreground
-            accent: Color.accent
+            accent: Commons.Color.accent
             fontFamily: controller.bar.fontFamily
             enabled: !!controller.deviceDetailsRow && !controller.deviceDetailsControlsBusy
             opacity: enabled ? 1 : 0.55
@@ -279,7 +280,7 @@ Item {
             horizontalPadding: Style.space(6)
             verticalPadding: Style.space(2)
             foreground: controller.bar.foreground
-            accent: Color.accent
+            accent: Commons.Color.accent
             fontFamily: controller.bar.fontFamily
             enabled: !!controller.deviceDetailsRow && !controller.deviceDetailsControlsBusy
             opacity: enabled ? 1 : 0.55
@@ -301,7 +302,7 @@ Item {
             horizontalPadding: Style.space(6)
             verticalPadding: Style.space(2)
             foreground: controller.bar.foreground
-            accent: Color.accent
+            accent: Commons.Color.accent
             fontFamily: controller.bar.fontFamily
             enabled: !!controller.deviceDetailsRow && !controller.deviceDetailsControlsBusy
             opacity: enabled ? 1 : 0.55
@@ -337,7 +338,7 @@ Item {
         enabled: !controller.deviceDetailsControlsBusy
         opacity: enabled ? 1 : 0.55
         foreground: controller.bar.foreground
-        accent: Color.accent
+        accent: Commons.Color.accent
         fontFamily: controller.bar.fontFamily
         hasCursor: controller.deviceDetailsOpen && !controller.forgetConfirmationOpen
           && controller.deviceDetailsIndex === controller.detailsTrustedIndex
@@ -360,7 +361,7 @@ Item {
         enabled: !controller.deviceDetailsControlsBusy
         opacity: enabled ? 1 : 0.55
         foreground: controller.bar.foreground
-        accent: Color.accent
+        accent: Commons.Color.accent
         fontFamily: controller.bar.fontFamily
         hasCursor: controller.deviceDetailsOpen && !controller.forgetConfirmationOpen
           && controller.deviceDetailsIndex === controller.detailsBlockedIndex
@@ -383,7 +384,7 @@ Item {
         enabled: !controller.deviceDetailsControlsBusy
         opacity: enabled ? 1 : 0.55
         foreground: controller.bar.foreground
-        accent: Color.accent
+        accent: Commons.Color.accent
         fontFamily: controller.bar.fontFamily
         hasCursor: controller.deviceDetailsOpen && !controller.forgetConfirmationOpen
           && controller.deviceDetailsIndex === controller.detailsWakeIndex
@@ -474,7 +475,7 @@ Item {
     message: "Forget this device? You will need to pair it again before reconnecting."
     cancelText: "Cancel"
     confirmText: "Forget"
-    background: Color.popups.background
+    background: Commons.Color.popups.background
     foreground: controller.bar.foreground
     onCanceled: controller.cancelForgetConfirmation()
     onConfirmed: controller.confirmForgetDevice()

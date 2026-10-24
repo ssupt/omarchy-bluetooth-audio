@@ -1,6 +1,7 @@
 import QtQuick
 import qs.Ui
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 // Two-line device row. The controller owns live BlueZ/PipeWire objects and
@@ -22,10 +23,11 @@ CursorSurface {
     ? String(actionFailure.message || "") : ""
   readonly property string recoveryAction: controller.recoveryAction(dev ? dev.address : "")
   readonly property bool recoveryVisible: recoveryAction !== ""
-  readonly property bool cancellingPair: dev
-    && controller.pairingCancellationPending(dev.address)
+  readonly property bool cancellingConnection: dev
+    && controller.connectionCancellationPending(dev.address)
   readonly property string actionTooltip: {
     if (!dev) return ""
+    if (recoveryAction === "cancel") return "Cancel connection"
     if (isConnected) return "Disconnect"
     if (isDiscovered) return "Pair"
     return "Connect"
@@ -69,7 +71,7 @@ CursorSurface {
 
   readonly property string statusText: {
     if (!dev) return ""
-    if (cancellingPair) return "Cancelling pairing…"
+    if (cancellingConnection) return "Cancelling connection…"
     if (action === "forgetting") return "Forgetting…"
     if (action === "disconnecting" || devState === 2) return "Disconnecting…"
     if (actionFailureMessage !== "") return actionFailureMessage
@@ -280,7 +282,7 @@ CursorSurface {
       tooltipText: row.usingForAudio ? "Default audio device"
         : (row.deviceAudioSource ? "Use for audio input and output" : "Use for audio output")
       foreground: row.usingForAudio
-        ? Style.selectedStateColor(controller.bar.foreground, Color.accent)
+        ? Style.selectedStateColor(controller.bar.foreground, Commons.Color.accent)
         : controller.bar.foreground
       hoverColor: controller.bar.foreground
       fontFamily: controller.bar.fontFamily
@@ -311,7 +313,7 @@ CursorSurface {
         || (!controller.deviceActionBusy && !controller.devicePropertyBusy
           && !controller.audioProfileChangeBusy)
       iconText: row.recoveryAction === "cancel" ? "󰅙" : "󰑐"
-      tooltipText: row.recoveryAction === "cancel" ? "Cancel pairing"
+      tooltipText: row.recoveryAction === "cancel" ? "Cancel connection"
         : (row.actionFailureMessage !== ""
           ? "Retry · " + row.actionFailureMessage : "Retry")
       foreground: controller.bar.foreground
@@ -333,7 +335,7 @@ CursorSurface {
       onClicked: {
         var device = controller.deviceFor(row)
         if (!device) return
-        if (row.recoveryAction === "cancel") controller.cancelPairing(device)
+        if (row.recoveryAction === "cancel") controller.cancelDeviceConnection(device)
         else controller.retryDeviceAction(device)
       }
     }
