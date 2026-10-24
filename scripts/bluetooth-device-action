@@ -2,20 +2,31 @@
 
 # omarchy:summary=Control a Bluetooth device and report actionable failures
 # omarchy:group=bluetooth
-# omarchy:args=<pair|connect|disconnect|forget> <address>
+# omarchy:args=<pair|connect|disconnect|forget> <address> [dbus-path]
 
 set -uo pipefail
 export LC_ALL=C
 
 action=${1:-}
 address=${2:-}
+device_path=${3:-}
 
-if (( $# != 2 )) \
+if (( $# < 2 || $# > 3 )) \
   || [[ $action != pair && $action != connect && $action != disconnect && $action != forget ]] \
   || [[ ! $address =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
-  echo "Usage: bluetooth-device-action <pair|connect|disconnect|forget> <address>" >&2
+  echo "Usage: bluetooth-device-action <pair|connect|disconnect|forget> <address> [dbus-path]" >&2
   exit 1
 fi
+if [[ -n $device_path ]]; then
+  path_address=${device_path##*/dev_}
+  path_address=${path_address//_/:}
+  if [[ ! $device_path =~ ^/org/bluez/hci[0-9]+/dev_([0-9A-Fa-f]{2}_){5}[0-9A-Fa-f]{2}$ ]] \
+      || [[ ${path_address^^} != "${address^^}" ]]; then
+    echo "The Bluetooth device path does not match its address." >&2
+    exit 1
+  fi
+fi
+adapter_path=${device_path%/dev_*}
 
 active_control_pid=
 active_output_file=
@@ -108,11 +119,24 @@ run_control() {
   shift 2
 
   local output status lower failed=false
+  local -a command=(bluetoothctl "$@")
+  if [[ -n $device_path ]]; then
+    # Use the owning BlueZ object, including for a device on a secondary
+    # controller. Non-interactive bluetoothctl also uses BlueZ's default agent.
+    case "$phase" in
+      pair) command=(busctl call org.bluez "$device_path" org.bluez.Device1 Pair) ;;
+      connect) command=(busctl call org.bluez "$device_path" org.bluez.Device1 Connect) ;;
+      disconnect) command=(busctl call org.bluez "$device_path" org.bluez.Device1 Disconnect) ;;
+      remove) command=(busctl call org.bluez "$adapter_path" org.bluez.Adapter1 RemoveDevice o "$device_path") ;;
+      trust) command=(busctl set-property org.bluez "$device_path" org.bluez.Device1 Trusted b true) ;;
+      *) return 1 ;;
+    esac
+  fi
   active_output_file=$(mktemp) || {
     echo "Could not start the Bluetooth operation." >&2
     return 1
   }
-  timeout --kill-after=2s "${seconds}s" bluetoothctl "$@" >"$active_output_file" 2>&1 &
+  timeout --kill-after=2s "${seconds}s" "${command[@]}" >"$active_output_file" 2>&1 &
   active_control_pid=$!
   status=0
   wait "$active_control_pid" || status=$?
@@ -127,13 +151,14 @@ run_control() {
   if [[ $phase == connect && ( $lower == *alreadyconnected* || $lower == *already\ connected* ) ]]; then
     return 0
   fi
-  if [[ $phase == pair && ( $lower == *alreadyexists* || $lower == *already\ paired* ) ]]; then
+  if [[ $phase == pair && ( $lower == *alreadyexists* || $lower == *already\ exists* || $lower == *already\ paired* ) ]]; then
     return 0
   fi
   if [[ $phase == disconnect && ( $lower == *notconnected* || $lower == *not\ connected* ) ]]; then
     return 0
   fi
-  if [[ $phase == remove && ( $lower == *doesnotexist* || $lower == *not\ available* ) ]]; then
+  if [[ $phase == remove && -n $device_path
+      && ( $lower == *doesnotexist* || $lower == *does\ not\ exist* ) ]]; then
     return 0
   fi
 
@@ -151,8 +176,14 @@ run_control() {
 
 ensure_powered() {
   local state
-  state=$(timeout --kill-after=1s 2s bluetoothctl show 2>/dev/null | strip_terminal_codes) || state=
-  [[ $state == *"Powered: yes"* ]] && return 0
+  if [[ -n $device_path ]]; then
+    state=$(timeout --kill-after=1s 2s busctl get-property \
+      org.bluez "$adapter_path" org.bluez.Adapter1 Powered 2>/dev/null) || state=
+    [[ $state == "b true" ]] && return 0
+  else
+    state=$(timeout --kill-after=1s 2s bluetoothctl show 2>/dev/null | strip_terminal_codes) || state=
+    [[ $state == *"Powered: yes"* ]] && return 0
+  fi
 
   if ! omarchy-bluetooth-power on >/dev/null 2>&1; then
     echo "The Bluetooth adapter could not be powered on." >&2
@@ -166,8 +197,13 @@ ensure_powered() {
 
 ensure_not_blocked() {
   local info
-  info=$(timeout --kill-after=1s 2s bluetoothctl info "$address" 2>/dev/null | strip_terminal_codes) || return 0
-  if [[ $info == *"Blocked: yes"* ]]; then
+  if [[ -n $device_path ]]; then
+    info=$(timeout --kill-after=1s 2s busctl get-property \
+      org.bluez "$device_path" org.bluez.Device1 Blocked 2>/dev/null) || return 0
+  else
+    info=$(timeout --kill-after=1s 2s bluetoothctl info "$address" 2>/dev/null | strip_terminal_codes) || return 0
+  fi
+  if [[ $info == "b true" || $info == *"Blocked: yes"* ]]; then
     echo "This device is blocked. Unblock it before trying again." >&2
     return 1
   fi

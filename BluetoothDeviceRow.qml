@@ -1,6 +1,7 @@
 import QtQuick
 import qs.Ui
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 // Two-line device row. The controller owns live BlueZ/PipeWire objects and
@@ -280,7 +281,7 @@ CursorSurface {
       tooltipText: row.usingForAudio ? "Default audio device"
         : (row.deviceAudioSource ? "Use for audio input and output" : "Use for audio output")
       foreground: row.usingForAudio
-        ? Style.selectedStateColor(controller.bar.foreground, Color.accent)
+        ? Style.selectedStateColor(controller.bar.foreground, Commons.Color.accent)
         : controller.bar.foreground
       hoverColor: controller.bar.foreground
       fontFamily: controller.bar.fontFamily

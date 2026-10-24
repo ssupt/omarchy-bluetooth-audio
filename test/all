@@ -18,6 +18,7 @@ for script in "$ROOT"/scripts/* "$TEST_DIR"/mocks/*; do
 done
 echo "PASS: helper syntax"
 python3 "$TEST_DIR/backend.py" || fail "Rust command service"
+python3 "$TEST_DIR/device_actions.py" || fail "controller-specific Bluetooth actions"
 
 node - "$ROOT/Model.js" "$ROOT" <<'JS'
 const assert = require('node:assert/strict')

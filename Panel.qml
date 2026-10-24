@@ -6,6 +6,7 @@ import Quickshell.Bluetooth
 import Quickshell.Services.Pipewire
 import qs.Ui
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 Panel {
@@ -280,10 +281,10 @@ Panel {
   readonly property string toggleHint: root.adapter && root.adapter.enabled ? "Turn Bluetooth off" : "Turn Bluetooth on"
 
   readonly property color hoverFill: bar
-    ? Style.hoverFillFor(bar.foreground, Color.accent)
+    ? Style.hoverFillFor(bar.foreground, Commons.Color.accent)
     : "transparent"
   readonly property color selectedFill: bar
-    ? Style.selectedFillFor(bar.foreground, Color.accent)
+    ? Style.selectedFillFor(bar.foreground, Commons.Color.accent)
     : "transparent"
 
   function sectionCount(section) {
@@ -949,8 +950,8 @@ Panel {
     return deviceActionFailure(address) ? "retry" : ""
   }
 
-  function deviceCommand(action, address) {
-    return [pluginScript("bluetooth-device-action"), action, address]
+  function deviceCommand(action, address, devicePath) {
+    return [pluginScript("bluetooth-device-action"), action, address, String(devicePath || "")]
   }
 
   function devicePropertyCommand(propertyName, dbusPath, value) {
@@ -979,13 +980,13 @@ Panel {
     }
     setPendingAction(device.address, pending, action)
     if (bluetoothService && bluetoothService.ready) {
-      if (!bluetoothService.startDeviceAction(action, device.address, pending)) {
+      if (!bluetoothService.startDeviceAction(action, device.address, pending, device.dbusPath)) {
         activeDeviceAction = null
         setPendingAction(device.address, "")
       }
       return
     }
-    deviceActionProc.command = deviceCommand(action, device.address)
+    deviceActionProc.command = deviceCommand(action, device.address, device.dbusPath)
     deviceActionProc.prepare()
     deviceActionProc.running = true
   }
@@ -1033,6 +1034,7 @@ Panel {
       adoptPendingAction(operation.address, "", "")
       adoptDeviceActionFailure(operation.address, operation.action,
         String(failure.message || "") || defaultDeviceActionError(operation.action))
+      syncPendingActions()
     } else {
       adoptDeviceActionFailure(operation.address, "", "")
       syncPendingActions()

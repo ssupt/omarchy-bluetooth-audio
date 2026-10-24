@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Bluetooth
+import "Model.js" as Model
 
 // One backend connection for all Bluetooth bar widgets. A widget may be
 // destroyed when a monitor changes without cancelling an admitted command.
@@ -229,12 +230,13 @@ Item {
     return String(address || "").toLowerCase().replace(/[:_-]/g, "")
   }
 
-  function startDeviceAction(action, address, pendingState) {
+  function startDeviceAction(action, address, pendingState, devicePath) {
     var key = actionKey(address)
     if (key === "" || Object.keys(deviceActions).length > 0) return false
     var operation = {
       action: String(action), address: String(address),
-      pending: String(pendingState), cancelled: false, requestId: ""
+      pending: String(pendingState), path: String(devicePath || ""),
+      cancelled: false, requestId: ""
     }
     var actions = Object.assign({}, deviceActions)
     actions[key] = operation
@@ -242,7 +244,9 @@ Item {
     var results = Object.assign({}, deviceActionResults)
     delete results[key]
     deviceActionResults = results
-    var id = request("device.action", { action: operation.action, address: operation.address },
+    var id = request("device.action", {
+      action: operation.action, address: operation.address, path: operation.path
+    },
       function(result, failure) {
         // The service survives every panel. Successful forget cleanup belongs
         // here even when the initiating widget disappeared mid-command.
@@ -264,6 +268,7 @@ Item {
         }
         root.deviceActionResults = completed
         root.deviceActionFinished(completedOperation, result, failure)
+        root.reconcileDeviceActionResults()
       })
     if (id) {
       operation.requestId = id
@@ -504,7 +509,45 @@ Item {
     })
   }
 
-  onDevicesChanged: sharedPolicy.observeDevices(devices)
+  function reconcileDeviceActionResults() {
+    var next = Object.assign({}, deviceActionResults)
+    var changed = false
+    for (var key in next) {
+      var result = next[key]
+      if (!result.message) continue
+      var device = null
+      for (var i = 0; i < devices.length; i++) {
+        if (devices[i] && Model.normalizedAddress(devices[i].address) === key) {
+          device = devices[i]
+          break
+        }
+      }
+      if (Model.deviceActionReachedState(result.action, device)) {
+        delete next[key]
+        changed = true
+      }
+    }
+    if (changed) deviceActionResults = next
+  }
+
+  function observeDeviceState() {
+    sharedPolicy.observeDevices(devices)
+    reconcileDeviceActionResults()
+  }
+
+  onDevicesChanged: observeDeviceState()
+  Instantiator {
+    model: root.devices
+    delegate: Connections {
+      required property var modelData
+      target: modelData
+      function onConnectedChanged() { root.observeDeviceState() }
+      function onPairedChanged() { root.reconcileDeviceActionResults() }
+      function onBondedChanged() { root.reconcileDeviceActionResults() }
+      function onTrustedChanged() { root.reconcileDeviceActionResults() }
+      function onBlockedChanged() { root.reconcileDeviceActionResults() }
+    }
+  }
   Component.onCompleted: {
     sharedPolicy.initializeDevices(devices)
     launchTimer.start()

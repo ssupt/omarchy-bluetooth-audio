@@ -45,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-service-test-") as temporary:
     scripts = {
         "bluetooth-audio-profiles": '#!/bin/sh\nprintf \'{"card":{}}\\n\'\n',
         "bluetooth-audio-profile-set": '#!/bin/sh\necho "saved preference failed" >&2\nexit 2\n',
-        "bluetooth-device-action": '#!/bin/sh\nprintf "start:%s\\n" "$1" >> "$BT_TEST_LOG"\nif [ "$2" = "$BT_TEST_HOLD_ADDRESS" ]; then sleep 9; else sleep .15; fi\nprintf "end:%s\\n" "$1" >> "$BT_TEST_LOG"\n',
+        "bluetooth-device-action": '#!/bin/sh\nprintf "start:%s\\n" "$1" >> "$BT_TEST_LOG"\nif [ -n "$3" ]; then printf "path:%s\\n" "$3" >> "$BT_TEST_LOG"; fi\nif [ "$2" = "$BT_TEST_HOLD_ADDRESS" ]; then sleep 9; else sleep .15; fi\nprintf "end:%s\\n" "$1" >> "$BT_TEST_LOG"\n',
         "bluetooth-device-property": '#!/bin/sh\nexit 0\n',
         "audio-preferences": '#!/bin/sh\nprintf "policy\\n" >> "$BT_TEST_LOG"\nexit 0\n',
     }
@@ -73,6 +73,16 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-service-test-") as temporary:
         assert {receive(process)["id"], receive(process)["id"]} == {"5", "6"}
         lines = log.read_text().splitlines()
         assert lines == ["start:connect", "end:connect", "start:disconnect", "end:disconnect"], lines
+        device_path = "/org/bluez/hci1/dev_00_11_22_33_44_55"
+        send(process, "path", "device.action", action="disconnect",
+             address="00:11:22:33:44:55", path=device_path)
+        assert receive(process)["result"]["outcome"] == "applied"
+        assert "path:" + device_path in log.read_text().splitlines()
+        for invalid_path in ("/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF",
+                             "/org/bluez/hci1/../dev_00_11_22_33_44_55", 7):
+            send(process, "bad-path", "device.action", action="connect",
+                 address="00:11:22:33:44:55", path=invalid_path)
+            assert receive(process)["error"]["code"] == "invalid_params"
         send(process, 9, "device.action", action="connect", address="00:11:22:33:44:55")
         deadline = time.monotonic() + 3
         while log.read_text().splitlines().count("start:connect") < 2:
