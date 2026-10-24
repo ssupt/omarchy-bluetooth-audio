@@ -28,7 +28,7 @@ ShellRoot {
     detailsBlockedIndex: 3, detailsWakeIndex: 4, detailsForgetIndex: 5,
     deviceDisplayName: function(dev) { return Model.deviceLabel(dev) },
     pendingAction: function() { return "" }, deviceActionFailure: function() { return null },
-    recoveryAction: function() { return "" }, pairingCancellationPending: function() { return false },
+    recoveryAction: function() { return "" }, connectionCancellationPending: function() { return false },
     audioProfileState: function() { return null }, audioProfileActionAvailable: function() { return false },
     bluetoothAudioSink: function() { return null }, bluetoothAudioSource: function() { return null },
     audioUseActionAvailable: function() { return false }, restorePanelFocus: function() {},

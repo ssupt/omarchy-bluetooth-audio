@@ -36,16 +36,33 @@ cleanup() {
 }
 
 cancel_active_control() {
-  trap - INT TERM
+  trap - INT TERM HUP
   if [[ -n $active_control_pid ]]; then
     kill -TERM "$active_control_pid" >/dev/null 2>&1 || true
     wait "$active_control_pid" >/dev/null 2>&1 || true
+  fi
+  # Stopping the client does not cancel BlueZ's outstanding Connect request.
+  # Disconnect aborts it on the daemon before a replacement device is tried.
+  if [[ $action == pair || $action == connect ]]; then
+    if [[ -n $device_path ]]; then
+      if [[ $action == pair ]]; then
+        timeout --kill-after=1s 2s busctl call org.bluez "$device_path" \
+          org.bluez.Device1 CancelPairing >/dev/null 2>&1 || true
+      fi
+      timeout --kill-after=1s 2s busctl call org.bluez "$device_path" \
+        org.bluez.Device1 Disconnect >/dev/null 2>&1 || true
+    else
+      if [[ $action == pair ]]; then
+        timeout --kill-after=1s 2s bluetoothctl cancel-pairing "$address" >/dev/null 2>&1 || true
+      fi
+      timeout --kill-after=1s 2s bluetoothctl disconnect "$address" >/dev/null 2>&1 || true
+    fi
   fi
   exit 130
 }
 
 trap cleanup EXIT
-trap cancel_active_control INT TERM
+trap cancel_active_control INT TERM HUP
 
 strip_terminal_codes() {
   sed $'s/\033\[[0-9;?]*[ -\/]*[@-~]//g'

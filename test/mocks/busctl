@@ -5,7 +5,7 @@ if [[ -n ${BLUETOOTH_ACTION_LOG:-} ]]; then
   case "${1:-}:${5:-}" in
     get-property:Powered) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_POWERED:-true}" ;;
     get-property:Blocked) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_BLOCKED:-false}" ;;
-    call:Pair|call:Connect|call:Disconnect|call:RemoveDevice|set-property:Trusted)
+    call:Pair|call:CancelPairing|call:Connect|call:Disconnect|call:RemoveDevice|set-property:Trusted)
       if [[ ${5:-} == "${BLUETOOTH_ACTION_BUS_DELAY_METHOD:-}" ]]; then
         sleep "${BLUETOOTH_ACTION_DELAY_SECONDS:-1}"
       fi

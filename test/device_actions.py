@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 ADDRESS = "00:11:22:33:44:55"
@@ -57,4 +58,25 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-device-actions-") as temporar
                     BLUETOOTH_ACTION_FAIL_MESSAGE="Call failed: Authentication Rejected")
     assert result.returncode != 0 and "Pairing was rejected" in result.stderr, result
 
-print("PASS: secondary-controller actions preserve ownership and reject unconfirmed removal")
+    for action, method in (("connect", "Connect"), ("pair", "Pair")):
+        log.write_text("")
+        with subprocess.Popen([str(ROOT / "scripts/bluetooth-device-action"), action,
+                               ADDRESS, DEVICE],
+                              env=dict(environment, BLUETOOTH_ACTION_BUS_DELAY_METHOD=method,
+                                       BLUETOOTH_ACTION_DELAY_SECONDS="10"),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            deadline = time.monotonic() + 3
+            while f"org.bluez.Device1 {method}" not in log.read_text():
+                assert time.monotonic() < deadline, "Connection helper did not start"
+                time.sleep(.01)
+            cancelled_at = time.monotonic()
+            process.terminate()
+            process.communicate(timeout=4)
+            assert process.returncode != 0 and time.monotonic() - cancelled_at < 4
+            calls = log.read_text().splitlines()
+            assert calls[-1] == f"call org.bluez {DEVICE} org.bluez.Device1 Disconnect", calls
+            if action == "pair":
+                assert calls[-2] == f"call org.bluez {DEVICE} org.bluez.Device1 CancelPairing", calls
+                assert not any(" Trusted " in call or call.endswith(" Connect") for call in calls), calls
+
+print("PASS: controller-specific actions preserve ownership, reject unconfirmed removal, and cancel promptly")

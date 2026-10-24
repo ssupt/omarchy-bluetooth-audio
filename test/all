@@ -527,6 +527,7 @@ python3 "$TEST_DIR/text_rendering.py" || fail "plain text labels"
 python3 "$TEST_DIR/service_lifecycle.py" || fail "shared service lifecycle"
 python3 "$TEST_DIR/service_recovery.py" || fail "profile and cleanup recovery"
 node "$TEST_DIR/manual_audio_panel.js" || fail "manual audio panel wiring"
+node "$TEST_DIR/connection_panel.js" || fail "connection replacement panel actions"
 
 ucm_profiles=$(
   AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards-ucm.json" \
