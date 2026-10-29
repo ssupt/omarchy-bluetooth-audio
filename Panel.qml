@@ -59,6 +59,11 @@ Panel {
   property var pendingAudioPolicy: null
 
   readonly property var adapter: Bluetooth.defaultAdapter
+  // On some laptops (Dell's dell-rfkill among them) the rfkill soft block cuts
+  // power to the radio, so the adapter vanishes from BlueZ instead of reading
+  // Powered: no. Track the block so "off" still shows and can be switched on.
+  property var rfkillBlocks: ({})
+  readonly property bool radioBlocked: Model.rfkillBluetoothBlocked(rfkillBlocks)
   readonly property var bluetoothService: bar && bar.shell
     ? bar.shell.serviceFor("ssupt.bluetooth-audio") : null
   readonly property bool manualAudioBusy: !!bluetoothService
@@ -229,7 +234,7 @@ Panel {
   readonly property var discoveredDevices: deviceGroups.discovered || []
 
   readonly property string icon: {
-    if (!adapter) return ""
+    if (!adapter) return radioBlocked ? "󰂲" : ""
     if (!adapter.enabled) return "󰂲"
     if (connectedDevices.length > 0) return "󰂱"
     return "󰂯"
@@ -248,7 +253,7 @@ Panel {
   ]
   readonly property bool rotatingPhrases: adapter && adapter.enabled
   readonly property string heroStatusText: {
-    if (!adapter) return "No adapter"
+    if (!adapter) return radioBlocked ? "Turned Off" : "No adapter"
     if (!adapter.enabled) return "Turned Off"
     return activePhrases[phraseIndex % activePhrases.length]
   }
@@ -1807,7 +1812,7 @@ Panel {
     if (selectedIndex < 0) selectedIndex = 0
   }
 
-  visible: adapter !== null
+  visible: adapter !== null || radioBlocked
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -2335,7 +2340,11 @@ Panel {
   }
 
   function toggleBluetooth() {
-    if (!adapter || deviceActionBusy || devicePropertyBusy || hasPendingDeviceActions
+    if (!adapter) {
+      if (radioBlocked) Quickshell.execDetached(["omarchy-bluetooth-power", "on"])
+      return
+    }
+    if (deviceActionBusy || devicePropertyBusy || hasPendingDeviceActions
         || audioProfileChangeBusy) return
     Quickshell.execDetached(["omarchy-bluetooth-power", adapter.enabled ? "off" : "on"])
   }
@@ -2349,6 +2358,19 @@ Panel {
     function hide() { root.close() }
     function toggle() { root.toggle() }
     function toggleBluetooth() { root.toggleBluetooth() }
+  }
+
+  // Only needed while BlueZ has no adapter. rfkill reports every switch on
+  // start and then waits for changes, so nothing polls; stdbuf because rfkill
+  // does not flush its output into a pipe.
+  Process {
+    id: rfkillWatch
+    command: ["stdbuf", "-oL", "rfkill", "event"]
+    running: !root.adapter
+    stdout: SplitParser {
+      onRead: function(line) { root.rfkillBlocks = Model.rfkillBluetoothEvent(root.rfkillBlocks, line) }
+    }
+    onExited: root.rfkillBlocks = ({})
   }
 
   BarIconButton {
@@ -2475,7 +2497,7 @@ Panel {
 
             ToggleSwitch {
               id: powerSwitch
-              visible: !!root.adapter
+              visible: !!root.adapter || root.radioBlocked
               checked: !!root.adapter && root.adapter.enabled
               enabled: !root.deviceActionBusy && !root.devicePropertyBusy
                 && !root.hasPendingDeviceActions
@@ -2638,7 +2660,7 @@ Panel {
         Text {
           textFormat: Text.PlainText
           visible: root.connectedDevices.length === 0 && root.scrollRows.length === 0
-          text: !root.adapter ? "No Bluetooth adapter"
+          text: !root.adapter ? (root.radioBlocked ? "Turn Bluetooth on to scan" : "No Bluetooth adapter")
               : !root.adapter.enabled ? "Turn Bluetooth on to scan"
               : "Scanning for devices…"
           color: Qt.darker(root.bar.foreground, 1.5)

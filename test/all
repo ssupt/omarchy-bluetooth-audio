@@ -461,6 +461,25 @@ pendingActions = model.withPendingAction(
   pendingActions, '001122334455', '')
 assert.equal(model.pendingAction(pendingActions, '00:11:22:33:44:55'), '')
 
+// A soft-blocked radio that took its adapter with it still reads as "off".
+let rfkill = ({})
+for (const line of [
+  '2026-10-29 06:29:38,885930+02:00: idx 1 type 1 op 0 soft 0 hard 0',
+  '2026-10-29 06:29:38,886052+02:00: idx 2 type 2 op 0 soft 1 hard 0',
+  'not an rfkill event'
+]) rfkill = model.rfkillBluetoothEvent(rfkill, line)
+assert.deepEqual(rfkill, { 2: true })
+assert.equal(model.rfkillBluetoothBlocked(rfkill), true)
+const unblocked = model.rfkillBluetoothEvent(rfkill, 'idx 2 type 2 op 2 soft 0 hard 0')
+assert.equal(model.rfkillBluetoothBlocked(unblocked), false)
+assert.equal(model.rfkillBluetoothBlocked(rfkill), true, 'events do not mutate earlier state')
+assert.deepEqual(model.rfkillBluetoothEvent(rfkill, 'idx 2 type 2 op 1 soft 1 hard 0'), {})
+assert.equal(model.rfkillBluetoothBlocked(model.rfkillBluetoothEvent({}, 'idx 0 type 1 op 0 soft 1 hard 0')), false)
+assert.equal(model.rfkillBluetoothBlocked({}), false)
+assert.match(controllerSource, /visible: adapter !== null \|\| radioBlocked/)
+assert.match(controllerSource, /if \(radioBlocked\) Quickshell\.execDetached\(\["omarchy-bluetooth-power", "on"\]\)/)
+assert.match(controllerSource, /running: !root\.adapter/)
+
 assert.equal(model.deviceIconGlyph('audio-headset', 'Galaxy Buds FEee', true), '󰋋')
 assert.equal(model.deviceIconGlyph('audio-headset', 'MOMENTUM 4', false), '󰋋')
 assert.equal(model.deviceIconGlyph('audio-card', 'GoogleTV3764', false), '󰍹')
