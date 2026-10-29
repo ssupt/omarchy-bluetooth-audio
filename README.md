@@ -40,6 +40,9 @@ call. A device without a microphone mode provides output only.
 
 ## Controls
 
+- Right-click the bar icon, or use the switch in the panel, to turn Bluetooth on
+  or off. The icon stays in the bar while Bluetooth is off, including on laptops
+  where turning it off removes the adapter.
 - Click a device row to connect or disconnect it. Click the audio action on a
   connected device to make it the default output; if its current mode exposes a
   microphone, that becomes the default input too.
