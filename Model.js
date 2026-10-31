@@ -647,6 +647,25 @@ function sectionDevices(lists, section) {
   return []
 }
 
+// Folds one `rfkill event` line into Bluetooth switches' soft and hard block
+// states. rfkill prints every switch when it starts, then each change; other
+// radio types and anything unparseable leave the map as it was.
+function rfkillBluetoothEvent(blocks, line) {
+  var match = /\bidx (\d+) type (\d+) op ([012]) soft ([01]) hard ([01])(?:\s|$)/.exec(String(line || ""))
+  if (!match || match[2] !== "2") return blocks
+  var next = cloneMap(blocks)
+  if (match[3] === "1") delete next[match[1]]
+  else next[match[1]] = { soft: match[4] === "1", hard: match[5] === "1" }
+  return next
+}
+
+function rfkillBluetoothBlocked(blocks) {
+  for (var key in blocks || {}) {
+    if (blocks[key] && blocks[key].soft && !blocks[key].hard) return true
+  }
+  return false
+}
+
 function deviceIconGlyph(iconName, name, isConnected) {
   var icon = String(iconName || "").toLowerCase().trim()
   var label = String(name || "").toLowerCase().trim()
@@ -759,6 +778,8 @@ if (typeof module !== "undefined") {
     deviceAliasKeysForAddress: deviceAliasKeysForAddress,
     visibleSections: visibleSections,
     sectionDevices: sectionDevices,
+    rfkillBluetoothEvent: rfkillBluetoothEvent,
+    rfkillBluetoothBlocked: rfkillBluetoothBlocked,
     deviceIconGlyph: deviceIconGlyph
   }
 }
