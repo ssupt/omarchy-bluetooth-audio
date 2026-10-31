@@ -468,7 +468,7 @@ for (const line of [
   '2026-10-29 06:29:38,886052+02:00: idx 2 type 2 op 0 soft 1 hard 0',
   'not an rfkill event'
 ]) rfkill = model.rfkillBluetoothEvent(rfkill, line)
-assert.deepEqual(rfkill, { 2: true })
+assert.deepEqual(rfkill, { 2: { soft: true, hard: false } })
 assert.equal(model.rfkillBluetoothBlocked(rfkill), true)
 const unblocked = model.rfkillBluetoothEvent(rfkill, 'idx 2 type 2 op 2 soft 0 hard 0')
 assert.equal(model.rfkillBluetoothBlocked(unblocked), false)
@@ -476,9 +476,20 @@ assert.equal(model.rfkillBluetoothBlocked(rfkill), true, 'events do not mutate e
 assert.deepEqual(model.rfkillBluetoothEvent(rfkill, 'idx 2 type 2 op 1 soft 1 hard 0'), {})
 assert.equal(model.rfkillBluetoothBlocked(model.rfkillBluetoothEvent({}, 'idx 0 type 1 op 0 soft 1 hard 0')), false)
 assert.equal(model.rfkillBluetoothBlocked({}), false)
+const hardwareBlocked = model.rfkillBluetoothEvent(rfkill, 'idx 2 type 2 op 2 soft 1 hard 1')
+assert.deepEqual(hardwareBlocked, { 2: { soft: true, hard: true } })
+assert.equal(model.rfkillBluetoothBlocked(hardwareBlocked), false)
+assert.equal(model.rfkillBluetoothBlocked(rfkill), true, 'hardware changes preserve earlier snapshots')
+assert.equal(model.rfkillBluetoothBlocked(model.rfkillBluetoothEvent({}, 'idx 2 type 2 op 0 soft 0 hard 1')), false)
+assert.equal(model.rfkillBluetoothBlocked(model.rfkillBluetoothEvent(hardwareBlocked, 'idx 2 type 2 op 2 soft 1 hard 0')), true)
+assert.equal(model.rfkillBluetoothBlocked(model.rfkillBluetoothEvent(hardwareBlocked, 'idx 3 type 2 op 0 soft 1 hard 0')), true)
+for (const line of ['idx 2 type 2 op 2 soft 1', 'idx 2 type 2 op 9 soft 1 hard 0',
+  'idx 2 type 2 op 2 soft 1 hard 2']) {
+  assert.equal(model.rfkillBluetoothEvent(hardwareBlocked, line), hardwareBlocked)
+}
 assert.match(controllerSource, /visible: adapter !== null \|\| radioBlocked/)
 assert.match(controllerSource, /if \(radioBlocked\) Quickshell\.execDetached\(\["omarchy-bluetooth-power", "on"\]\)/)
-assert.match(controllerSource, /running: !root\.adapter/)
+assert.match(controllerSource, /RfkillMonitor\s*\{\s*id: rfkillMonitor\s*active: !root\.adapter/)
 
 assert.equal(model.deviceIconGlyph('audio-headset', 'Galaxy Buds FEee', true), '󰋋')
 assert.equal(model.deviceIconGlyph('audio-headset', 'MOMENTUM 4', false), '󰋋')
@@ -545,6 +556,7 @@ echo "PASS: Bluetooth policy state machine"
 python3 "$TEST_DIR/text_rendering.py" || fail "plain text labels"
 python3 "$TEST_DIR/service_lifecycle.py" || fail "shared service lifecycle"
 python3 "$TEST_DIR/service_recovery.py" || fail "profile and cleanup recovery"
+python3 "$TEST_DIR/rfkill_monitor.py" || fail "rfkill watcher recovery"
 node "$TEST_DIR/manual_audio_panel.js" || fail "manual audio panel wiring"
 node "$TEST_DIR/connection_panel.js" || fail "connection replacement panel actions"
 

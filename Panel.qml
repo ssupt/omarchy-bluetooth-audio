@@ -62,8 +62,7 @@ Panel {
   // On some laptops (Dell's dell-rfkill among them) the rfkill soft block cuts
   // power to the radio, so the adapter vanishes from BlueZ instead of reading
   // Powered: no. Track the block so "off" still shows and can be switched on.
-  property var rfkillBlocks: ({})
-  readonly property bool radioBlocked: Model.rfkillBluetoothBlocked(rfkillBlocks)
+  readonly property bool radioBlocked: rfkillMonitor.softwareBlocked
   readonly property var bluetoothService: bar && bar.shell
     ? bar.shell.serviceFor("ssupt.bluetooth-audio") : null
   readonly property bool manualAudioBusy: !!bluetoothService
@@ -2360,17 +2359,9 @@ Panel {
     function toggleBluetooth() { root.toggleBluetooth() }
   }
 
-  // Only needed while BlueZ has no adapter. rfkill reports every switch on
-  // start and then waits for changes, so nothing polls; stdbuf because rfkill
-  // does not flush its output into a pipe.
-  Process {
-    id: rfkillWatch
-    command: ["stdbuf", "-oL", "rfkill", "event"]
-    running: !root.adapter
-    stdout: SplitParser {
-      onRead: function(line) { root.rfkillBlocks = Model.rfkillBluetoothEvent(root.rfkillBlocks, line) }
-    }
-    onExited: root.rfkillBlocks = ({})
+  RfkillMonitor {
+    id: rfkillMonitor
+    active: !root.adapter
   }
 
   BarIconButton {
