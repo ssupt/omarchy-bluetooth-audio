@@ -330,7 +330,9 @@ rollback_profile() {
   local rollback_signature= last_rollback_signature=
   local rollback_stable_ticks=0 rollback_sink_count rollback_source_count
   local rollback_transient_source_count
-  local rollback_sinks_ready rollback_sources_ready sink_identity source_identity endpoint_key
+  local rollback_sinks_ready=false rollback_sources_ready=false
+  local rollback_sinks_read_ok=false rollback_sources_read_ok=false
+  local sink_identity source_identity endpoint_key
   local -A muted_rollback_sinks=() muted_rollback_sources=()
 
   [[ -n $active_profile && $active_profile != "$profile" ]] || return 1
@@ -347,12 +349,22 @@ rollback_profile() {
   expected_old_sources=$(jq 'length' <<<"$old_source_states") || return 1
   rollback_deadline=$(( $(date +%s%3N) + 2500 ))
   for (( rollback_attempt = 0; rollback_attempt < 40; rollback_attempt++ )); do
-    rollback_sink_payload=$(read_endpoints sinks) || rollback_sink_payload='[]'
-    rollback_source_payload=$(read_endpoints sources) || rollback_source_payload='[]'
-    rollback_sink_states=$(project_endpoint_states \
-      "$rollback_sink_payload" "$endpoint_filter") || rollback_sink_states='[]'
-    rollback_source_states=$(project_endpoint_states \
-      "$rollback_source_payload" "$source_filter") || rollback_source_states='[]'
+    rollback_sinks_read_ok=false
+    rollback_sources_read_ok=false
+    if rollback_sink_payload=$(read_endpoints sinks) \
+        && rollback_sink_states=$(project_endpoint_states \
+          "$rollback_sink_payload" "$endpoint_filter"); then
+      rollback_sinks_read_ok=true
+    else
+      rollback_sink_states='[]'
+    fi
+    if rollback_source_payload=$(read_endpoints sources) \
+        && rollback_source_states=$(project_endpoint_states \
+          "$rollback_source_payload" "$source_filter"); then
+      rollback_sources_read_ok=true
+    else
+      rollback_source_states='[]'
+    fi
     rollback_active_profile=$(read_active_profile) || rollback_active_profile=
     first_rollback_sink_states=$(merge_first_states \
       "$first_rollback_sink_states" "$rollback_sink_states") || return 1
@@ -394,17 +406,22 @@ rollback_profile() {
       <<<"$rollback_source_states") || return 1
     rollback_sinks_ready=false
     rollback_sources_ready=false
-    if (( expected_old_sinks == 0 )); then
-      (( rollback_sink_count == 0 )) && rollback_sinks_ready=true
-    else
-      (( rollback_sink_count >= expected_old_sinks )) && rollback_sinks_ready=true
+    if [[ $rollback_sinks_read_ok == true ]]; then
+      if (( expected_old_sinks == 0 )); then
+        (( rollback_sink_count == 0 )) && rollback_sinks_ready=true
+      else
+        (( rollback_sink_count >= expected_old_sinks )) && rollback_sinks_ready=true
+      fi
     fi
-    if (( expected_old_sources == 0 )); then
-      (( rollback_transient_source_count == 0 )) && rollback_sources_ready=true
-    else
-      (( rollback_source_count >= expected_old_sources )) && rollback_sources_ready=true
+    if [[ $rollback_sources_read_ok == true ]]; then
+      if (( expected_old_sources == 0 )); then
+        (( rollback_transient_source_count == 0 )) && rollback_sources_ready=true
+      else
+        (( rollback_source_count >= expected_old_sources )) && rollback_sources_ready=true
+      fi
     fi
     if [[ $rollback_active_profile == "$active_profile"
+        && $rollback_sinks_read_ok == true && $rollback_sources_read_ok == true
         && $rollback_sinks_ready == true && $rollback_sources_ready == true ]]; then
       rollback_signature=$(jq -cn \
         --argjson sinks "$rollback_sink_states" \
@@ -430,6 +447,7 @@ rollback_profile() {
   done
 
   [[ $rollback_active_profile == "$active_profile"
+      && $rollback_sinks_read_ok == true && $rollback_sources_read_ok == true
       && $rollback_sinks_ready == true && $rollback_sources_ready == true
       && $rollback_stable_ticks -ge 2 ]] \
     || return 1
@@ -500,15 +518,25 @@ reported_profile=
 ready_signature=
 last_ready_signature=
 stable_ready_ticks=0
+sinks_read_ok=false
+sources_read_ok=false
 
 wait_deadline=$(( $(date +%s%3N) + 2500 ))
 for (( attempt = 0; attempt < 40; attempt++ )); do
-  new_sinks_payload=$(read_endpoints sinks) || new_sinks_payload='[]'
-  new_sources_payload=$(read_endpoints sources) || new_sources_payload='[]'
-  new_sink_states=$(project_endpoint_states "$new_sinks_payload" "$endpoint_filter") \
-    || new_sink_states='[]'
-  new_source_states=$(project_endpoint_states "$new_sources_payload" "$source_filter") \
-    || new_source_states='[]'
+  sinks_read_ok=false
+  sources_read_ok=false
+  if new_sinks_payload=$(read_endpoints sinks) \
+      && new_sink_states=$(project_endpoint_states "$new_sinks_payload" "$endpoint_filter"); then
+    sinks_read_ok=true
+  else
+    new_sink_states='[]'
+  fi
+  if new_sources_payload=$(read_endpoints sources) \
+      && new_source_states=$(project_endpoint_states "$new_sources_payload" "$source_filter"); then
+    sources_read_ok=true
+  else
+    new_source_states='[]'
+  fi
   reported_profile=$(read_active_profile) || reported_profile=
   if ! first_new_sink_states=$(merge_first_states \
       "$first_new_sink_states" "$new_sink_states"); then
@@ -572,19 +600,24 @@ for (( attempt = 0; attempt < 40; attempt++ )); do
   ] | @tsv' <<<"$new_source_states")
   [[ -z $transition_error ]] || break
 
-  sinks_ready=true
-  sources_ready=true
-  if (( expected_sinks == 0 )); then
-    (( ${#new_sinks[@]} == 0 )) || sinks_ready=false
-  else
-    (( ${#new_sinks[@]} >= expected_sinks )) || sinks_ready=false
+  sinks_ready=false
+  sources_ready=false
+  if [[ $sinks_read_ok == true ]]; then
+    if (( expected_sinks == 0 )); then
+      (( ${#new_sinks[@]} == 0 )) && sinks_ready=true
+    else
+      (( ${#new_sinks[@]} >= expected_sinks )) && sinks_ready=true
+    fi
   fi
-  if (( expected_sources == 0 )); then
-    (( ${#new_transient_sources[@]} == 0 )) || sources_ready=false
-  else
-    (( ${#new_sources[@]} >= expected_sources )) || sources_ready=false
+  if [[ $sources_read_ok == true ]]; then
+    if (( expected_sources == 0 )); then
+      (( ${#new_transient_sources[@]} == 0 )) && sources_ready=true
+    else
+      (( ${#new_sources[@]} >= expected_sources )) && sources_ready=true
+    fi
   fi
   if [[ $reported_profile == "$profile"
+      && $sinks_read_ok == true && $sources_read_ok == true
       && $sinks_ready == true && $sources_ready == true ]]; then
     ready_signature=$(jq -cn \
       --argjson sinks "$new_sink_states" --argjson sources "$new_source_states" '
@@ -613,6 +646,10 @@ done
 
 if [[ -z $transition_error && $reported_profile != "$profile" ]]; then
   transition_error="The new audio profile did not become active"
+elif [[ -z $transition_error && $sinks_read_ok != true ]]; then
+  transition_error="Could not read the new audio outputs"
+elif [[ -z $transition_error && $sources_read_ok != true ]]; then
+  transition_error="Could not read the new audio inputs"
 elif [[ -z $transition_error && $expected_sinks == 0
     && ${#new_sinks[@]} -ne 0 ]]; then
   transition_error="The previous audio output did not disappear"

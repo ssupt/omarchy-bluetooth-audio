@@ -396,18 +396,132 @@ TestCase {
     verify(engine.defaultError.indexOf("could not be saved") !== -1)
   }
 
-  function test_unknownOutcomeStaysPendingWithoutReplay() {
+  function test_unknownOutcomeStopsPollingWithoutReplay() {
     queue("output")
     mockController.autoCompleteDefaults = false
     mockController.sinkNode = { id: 1, name: "bluez_output.test" }
     engine.applyPending()
+    var refreshes = 0
+    engine.refreshRequested.connect(function() { refreshes += 1 })
     mockController.sinkCallback(null, {
       code: "timeout", outcome: "unknown", message: "Default outcome is unknown"
     })
-    for (var i = 0; i < 10; i++) engine.applyPending()
-    compare(mockController.sinkCalls, 1)
-    verify(engine.pendingApplications["001122334455"].defaultUnknown)
+    compare(engine.hasPending, false)
+    compare(Object.keys(engine.pendingApplications).length, 0)
+    verify(engine.terminalOutcomes["001122334455"].defaultUnknown)
     compare(engine.defaultError, "Default outcome is unknown")
+    compare(refreshes, 0)
+    // Enabling automatic retries after a terminal error must not keep polling.
+    engine.automaticRetries = true
+    wait(650)
+    compare(refreshes, 0)
+    compare(mockController.sinkCalls, 1)
+    engine.automaticRetries = false
+    // Re-queueing on the same connection must not replay, but disconnect + reconnect re-arms it.
+    engine.queueReadyConnection("00:11:22:33:44:55")
+    compare(engine.hasPending, false)
+    engine.initializeDevices([mockController.device])
+    engine.observeDevices([{ address: "00:11:22:33:44:55", connected: false }])
+    verify(!engine.terminalOutcomes["001122334455"])
+    engine.observeDevices([mockController.device])
+    verify(engine.pendingApplications["001122334455"] !== undefined)
+  }
+
+  function test_outputRetriesDoNotExhaustMicrophoneAllowance() {
+    queue("output-mic")
+    mockController.autoCompleteDefaults = false
+    mockController.profileState = outputOnlyState()
+    mockController.profileState.activeProfile = "headset-head-unit-msbc"
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+    mockController.sourceNode = { id: 2, name: "bluez_input.test" }
+
+    // Output receives two busy responses and succeeds on its third attempt.
+    engine.applyPending()
+    compare(mockController.sinkCalls, 1)
+    mockController.sinkCallback(null, {
+      code: "busy", outcome: "rejected", message: "Audio service is busy"
+    })
+    engine.applyPending()
+    compare(mockController.sinkCalls, 2)
+    mockController.sinkCallback(null, {
+      code: "busy", outcome: "rejected", message: "Audio service is busy"
+    })
+    engine.applyPending()
+    compare(mockController.sinkCalls, 3)
+    mockController.defaultAudioSink = mockController.sinkNode
+    mockController.sinkCallback({ outcome: "applied" }, null)
+
+    // Microphone must still receive its own retry allowance (not 0 requests).
+    engine.applyPending()
+    compare(mockController.sourceCalls, 1)
+    compare(engine.defaultError, "")
+    mockController.sourceCallback(null, {
+      code: "busy", outcome: "rejected", message: "Audio service is busy"
+    })
+    engine.applyPending()
+    compare(mockController.sourceCalls, 2)
+    mockController.defaultAudioSource = mockController.sourceNode
+    mockController.sourceCallback({ outcome: "applied" }, null)
+    engine.applyPending()
+    compare(Object.keys(engine.pendingApplications).length, 0)
+    compare(engine.defaultError, "")
+  }
+
+  function test_manualModeRetiresPolicyProfileSwitchUntilReconnect() {
+    mockController.audioPreferences = {
+      bluetoothProfiles: {},
+      bluetoothAudioPolicies: { "001122334455": "output-mic" }
+    }
+    engine.initializeDevices([{ address: "00:11:22:33:44:55", connected: false }])
+    engine.observeDevices([mockController.device])
+    mockController.profileState = outputOnlyState()
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+
+    // Advance partway through the grace period, then select a playback-only mode manually.
+    for (var i = 0; i < 4; i++) engine.applyPending()
+    verify(!engine.profileSwitchBusy)
+    mockController.profileState.activeProfile = "a2dp-sink-sbc"
+    engine.noteManualProfileSelection("00:11:22:33:44:55")
+
+    advanceToProfileSwitch()
+    verify(!engine.profileSwitchBusy)
+    compare(Object.keys(engine.pendingApplications).length, 0)
+
+    // Disconnect and reconnect re-arms the automatic profile switch.
+    engine.observeDevices([{ address: "00:11:22:33:44:55", connected: false }])
+    engine.observeDevices([mockController.device])
+    verify(engine.pendingApplications["001122334455"] !== undefined)
+    advanceToProfileSwitch()
+    verify(engine.profileSwitchBusy)
+  }
+
+  function test_unreadyPreferencesSuspendPendingPolicy() {
+    queue("output")
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+    engine.preferencesReady = false
+    engine.applyPending()
+    compare(mockController.sinkCalls, 0)
+    verify(engine.pendingApplications["001122334455"] !== undefined)
+
+    engine.preferencesReady = true
+    engine.applyPending()
+    compare(mockController.sinkCalls, 1)
+  }
+
+  function test_profileSwitchCompletionMatchesOperationId() {
+    queue("output-mic")
+    mockController.profileState = outputOnlyState()
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+    var lastId = 0
+    engine.profileSwitchRequested.connect(function(_k, _a, _p, opId) { lastId = opId })
+
+    advanceToProfileSwitch()
+    verify(engine.profileSwitchBusy)
+    verify(lastId > 0)
+    engine.finishProfileSwitch("001122334455", 0, lastId + 99)
+    verify(engine.profileSwitchBusy)
+    engine.finishProfileSwitch("001122334455", 0, lastId)
+    verify(!engine.profileSwitchBusy)
   }
 
   function test_microphonePolicyWaitsForBothBridgeResults() {

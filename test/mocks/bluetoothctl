@@ -18,7 +18,9 @@ if [[ $command == show ]]; then
 fi
 
 if [[ $command == info ]]; then
-  printf 'Device %s\n\tBlocked: %s\n' "${2:-}" "${BLUETOOTH_ACTION_BLOCKED:-no}"
+  printf 'Device %s\n\tPaired: %s\n\tBonded: %s\n\tBlocked: %s\n' \
+    "${2:-}" "${BLUETOOTH_ACTION_PAIRED:-yes}" \
+    "${BLUETOOTH_ACTION_BONDED:-yes}" "${BLUETOOTH_ACTION_BLOCKED:-no}"
   exit 0
 fi
 
@@ -33,6 +35,7 @@ fi
 
 case "$command" in
   pair) echo "Pairing successful" ;;
+  cancel-pairing) echo "Pairing cancelled" ;;
   connect) echo "Connection successful" ;;
   disconnect) echo "Successful disconnected" ;;
   trust) echo "Changing trust succeeded" ;;

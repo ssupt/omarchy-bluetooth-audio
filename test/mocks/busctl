@@ -5,6 +5,14 @@ if [[ -n ${BLUETOOTH_ACTION_LOG:-} ]]; then
   case "${1:-}:${5:-}" in
     get-property:Powered) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_POWERED:-true}" ;;
     get-property:Blocked) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_BLOCKED:-false}" ;;
+    get-property:Bonded)
+      if [[ ${BLUETOOTH_ACTION_BUS_BONDED:-true} == missing ]]; then
+        echo "Call failed: org.freedesktop.DBus.Error.UnknownProperty" >&2
+        exit 1
+      fi
+      printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_BONDED:-true}"
+      ;;
+    get-property:Paired) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_PAIRED:-true}" ;;
     call:Pair|call:CancelPairing|call:Connect|call:Disconnect|call:RemoveDevice|set-property:Trusted)
       if [[ ${5:-} == "${BLUETOOTH_ACTION_BUS_DELAY_METHOD:-}" ]]; then
         sleep "${BLUETOOTH_ACTION_DELAY_SECONDS:-1}"

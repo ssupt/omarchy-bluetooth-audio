@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    println!("cargo:rerun-if-changed={}", directory.display());
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         if path.is_dir() {
@@ -17,6 +18,9 @@ fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    // Track top-level directory membership so adding or removing a .qml/.js
+    // file invalidates the embedded source fingerprint on incremental builds.
+    println!("cargo:rerun-if-changed={}", root.display());
     let mut files = vec![
         PathBuf::from("manifest.json"),
         PathBuf::from("backend/Cargo.toml"),
@@ -36,7 +40,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     for directory in ["scripts", "backend/src"] {
-        println!("cargo:rerun-if-changed={}", root.join(directory).display());
         let mut children = Vec::new();
         collect(&root.join(directory), &mut children)?;
         files.extend(

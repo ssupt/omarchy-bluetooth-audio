@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -19,6 +20,16 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-release-test-") as temporary:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, destination)
     release.verify(staged)
+
+    # Adding a top-level QML file without rebuilding must fail release verification.
+    added_qml = staged / "AddedReleaseProbe.qml"
+    added_qml.write_text("import QtQuick\nItem {}\n")
+    try:
+        release.verify(staged)
+        raise AssertionError("Added top-level QML file was accepted without rebuild")
+    except ValueError:
+        pass
+    added_qml.unlink()
 
     script = staged / "scripts/bluetooth-device-action"
     original = script.read_bytes()
@@ -38,5 +49,21 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-release-test-") as temporary:
         raise AssertionError("Changed binary was accepted")
     except ValueError:
         pass
+
+    # Incremental Cargo build must update BLUETOOTH_BUILD_ID when a
+    # new top-level QML file is added as the only change.
+    target_dir = staged / "cargo-target"
+    build_cmd = [
+        "cargo", "build", "--locked", "--offline",
+        "--manifest-path", str(staged / "backend/Cargo.toml"),
+        "--target-dir", str(target_dir),
+    ]
+    subprocess.run(build_cmd, check=True, capture_output=True, text=True)
+    built_binary = target_dir / "debug/omarchy-bluetooth-service"
+    before = release.checked_info(staged, built_binary)
+    added_qml.write_text("import QtQuick\nItem {}\n")
+    subprocess.run(build_cmd, check=True, capture_output=True, text=True)
+    after = release.checked_info(staged, built_binary)
+    assert after["sourceId"] != before["sourceId"], (before, after)
 
 print("PASS: release verification rejects changed sources and binary")

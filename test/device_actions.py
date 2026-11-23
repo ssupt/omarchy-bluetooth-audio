@@ -14,6 +14,7 @@ ADAPTER = "/org/bluez/hci1"
 with tempfile.TemporaryDirectory(prefix="bluetooth-device-actions-") as temporary:
     log = Path(temporary) / "calls"
     environment = dict(os.environ, PATH=str(ROOT / "test/mocks") + ":" + os.environ["PATH"],
+                       XDG_RUNTIME_DIR=temporary,
                        BLUETOOTH_ACTION_LOG=str(log))
 
     def run(action, path=DEVICE, **overrides):
@@ -31,9 +32,31 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-device-actions-") as temporar
         f"get-property org.bluez {ADAPTER} org.bluez.Adapter1 Powered",
         f"get-property org.bluez {DEVICE} org.bluez.Device1 Blocked",
         f"call org.bluez {DEVICE} org.bluez.Device1 Pair",
+        f"get-property org.bluez {DEVICE} org.bluez.Device1 Bonded",
         f"set-property org.bluez {DEVICE} org.bluez.Device1 Trusted b true",
         f"call org.bluez {DEVICE} org.bluez.Device1 Connect",
     ], calls
+
+    # Ordinary reconnects must preserve existing Trust instead of re-enabling it.
+    result, calls = run("connect")
+    assert result.returncode == 0, result.stderr
+    assert calls == [
+        f"get-property org.bluez {ADAPTER} org.bluez.Adapter1 Powered",
+        f"get-property org.bluez {DEVICE} org.bluez.Device1 Blocked",
+        f"call org.bluez {DEVICE} org.bluez.Device1 Connect",
+    ], calls
+
+    # Pairing without a saved bond must not enable Trust.
+    result, calls = run("pair", BLUETOOTH_ACTION_BUS_BONDED="false",
+                        BLUETOOTH_ACTION_BUS_PAIRED="false")
+    assert result.returncode == 0, result.stderr
+    assert not any(" Trusted " in call for call in calls), calls
+
+    # Older BlueZ without Bonded falls back to Paired.
+    result, calls = run("pair", BLUETOOTH_ACTION_BUS_BONDED="missing",
+                        BLUETOOTH_ACTION_BUS_PAIRED="true")
+    assert result.returncode == 0, result.stderr
+    assert any(" Trusted b true" in call for call in calls), calls
     result, calls = run("connect", BLUETOOTH_ACTION_BUS_BLOCKED="true")
     assert result.returncode != 0 and "blocked" in result.stderr, (result, calls)
     assert not any(" call " in " " + call + " " for call in calls), calls
@@ -72,11 +95,34 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-device-actions-") as temporar
             cancelled_at = time.monotonic()
             process.terminate()
             process.communicate(timeout=4)
-            assert process.returncode != 0 and time.monotonic() - cancelled_at < 4
+            assert process.returncode == 130 and time.monotonic() - cancelled_at < 4
             calls = log.read_text().splitlines()
             assert calls[-1] == f"call org.bluez {DEVICE} org.bluez.Device1 Disconnect", calls
             if action == "pair":
                 assert calls[-2] == f"call org.bluez {DEVICE} org.bluez.Device1 CancelPairing", calls
                 assert not any(" Trusted " in call or call.endswith(" Connect") for call in calls), calls
+
+    # Distinguish already-disconnected (130) from a failed cleanup disconnect (131).
+    for fail_message, expected_rc in (
+        ("Call failed: org.bluez.Error.NotConnected", 130),
+        ("Call failed: org.bluez.Error.Failed", 131),
+    ):
+        log.write_text("")
+        with subprocess.Popen([str(ROOT / "scripts/bluetooth-device-action"), "connect",
+                               ADDRESS, DEVICE],
+                              env=dict(environment, BLUETOOTH_ACTION_BUS_DELAY_METHOD="Connect",
+                                       BLUETOOTH_ACTION_DELAY_SECONDS="10",
+                                       BLUETOOTH_ACTION_BUS_FAIL_METHOD="Disconnect",
+                                       BLUETOOTH_ACTION_FAIL_MESSAGE=fail_message),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            deadline = time.monotonic() + 3
+            while "org.bluez.Device1 Connect" not in log.read_text():
+                assert time.monotonic() < deadline, "Connection helper did not start"
+                time.sleep(.01)
+            process.terminate()
+            _, stderr = process.communicate(timeout=4)
+            assert process.returncode == expected_rc, (fail_message, process.returncode, stderr)
+            if expected_rc == 131:
+                assert "Could not disconnect" in stderr, stderr
 
 print("PASS: controller-specific actions preserve ownership, reject unconfirmed removal, and cancel promptly")

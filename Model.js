@@ -76,6 +76,11 @@ function safeStoredIdentifier(value, maximum) {
     && !/[\x00-\x1f\x7f-\x9f\u200e\u200f\u2028-\u202e\u2066-\u2069]/.test(value)
 }
 
+function isSupportedPreferencesVersion(parsed) {
+  return !Object.prototype.hasOwnProperty.call(parsed, "version")
+    || parsed.version === 1
+}
+
 function parseAudioPreferences(raw) {
   var parsed
   var text = String(raw || "{}")
@@ -85,7 +90,8 @@ function parseAudioPreferences(raw) {
   } catch (e) {
     parsed = {}
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = {}
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+      || !isSupportedPreferencesVersion(parsed)) parsed = {}
 
   var defaults = parsed.defaults
   if (!defaults || typeof defaults !== "object" || Array.isArray(defaults)) defaults = {}
@@ -133,7 +139,8 @@ function parseAudioPolicyOverrides(raw) {
   } catch (e) {
     parsed = {}
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = {}
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+      || !isSupportedPreferencesVersion(parsed)) parsed = {}
   var rawPolicies = parsed.bluetoothAudioPolicies
   if (!rawPolicies || typeof rawPolicies !== "object" || Array.isArray(rawPolicies)) rawPolicies = {}
 
@@ -147,11 +154,12 @@ function parseAudioPolicyOverrides(raw) {
   return policies
 }
 
-function mergeAudioPreferences(shared, policyOverrides) {
+function mergeAudioPreferences(shared, policyOverrides, allowLegacyPolicies) {
   var source = shared && typeof shared === "object"
     ? shared : parseAudioPreferences("")
   var profiles = cloneMap(source.bluetoothProfiles || {})
-  var policies = cloneMap(source.bluetoothAudioPolicies || {})
+  var policies = allowLegacyPolicies === false
+    ? {} : cloneMap(source.bluetoothAudioPolicies || {})
   var overrides = policyOverrides && typeof policyOverrides === "object"
     ? policyOverrides : {}
 
@@ -170,16 +178,26 @@ function mergeAudioPreferences(shared, policyOverrides) {
   }
 }
 
-function isAudioPreferencesDocument(raw) {
+function audioPreferencesDocumentError(raw, label) {
+  var name = String(label || "Audio preferences")
   var text = String(raw || "").trim()
-  if (text === "") return true
-  if (text.length > 1048576) return false
+  if (text === "") return ""
+  if (text.length > 1048576) return name + " are too large"
+  var parsed
   try {
-    var parsed = JSON.parse(text)
-    return !!parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    parsed = JSON.parse(text)
   } catch (e) {
-    return false
+    return name + " contain invalid JSON"
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    return name + " contain invalid JSON"
+  if (!isSupportedPreferencesVersion(parsed))
+    return name + " use an unsupported version"
+  return ""
+}
+
+function isAudioPreferencesDocument(raw) {
+  return audioPreferencesDocumentError(raw, "Audio preferences") === ""
 }
 
 // "manual" is the absence of a policy and is deliberately not stored: an
@@ -278,10 +296,39 @@ function identityLabelIsAmbiguous(label, device, peers) {
   return false
 }
 
-function bluetoothNodeMatchesDevice(node, device, direction, peers) {
-  if (!node || node.isStream || !device) return false
-  if (direction === "sink" && !node.isSink) return false
-  if (direction === "source" && !isAudioSource(node)) return false
+function isBluetoothAudioNode(node) {
+  if (!node || node.isStream) return false
+  var props = nodeProps(node)
+  var api = String(props["device.api"] || "").trim().toLowerCase()
+  if (api !== "" && api.indexOf("bluez") !== 0) return false
+  var bus = String(props["device.bus"] || "").trim().toLowerCase()
+  if (bus !== "" && bus !== "bluetooth") return false
+
+  var names = [node.name, props["node.name"], props["device.name"]]
+  var nonBluezPrefix = /^(?:alsa|v4l2|jack|oss|raop|combine)[._-]/i
+  for (var i = 0; i < names.length; i++) {
+    var candidate = String(names[i] || "").trim()
+    if (candidate !== "" && nonBluezPrefix.test(candidate)) return false
+  }
+
+  if (api.indexOf("bluez") === 0 || bus === "bluetooth") return true
+  if (String(props["api.bluez5.address"] || props["bluez5.address"]
+      || props["api.bluez5.path"] || props["api.bluez5.profile"]
+      || props["bluez5.profile"] || props["bluez5.loopback"] || "").trim() !== "")
+    return true
+  if (String(props["device.string"] || "").toLowerCase().indexOf("/org/bluez/") !== -1)
+    return true
+  for (var j = 0; j < names.length; j++) {
+    if (/^bluez[._-]/i.test(String(names[j] || "").trim())) return true
+  }
+  return false
+}
+
+function bluetoothNodeMatchKind(node, device, direction, peers) {
+  if (!node || node.isStream || !device) return ""
+  if (direction === "sink" && !node.isSink) return ""
+  if (direction === "source" && !isAudioSource(node)) return ""
+  if (!isBluetoothAudioNode(node)) return ""
 
   var address = normalizedAddress(device.address)
   var props = nodeProps(node)
@@ -305,14 +352,14 @@ function bluetoothNodeMatchesDevice(node, device, direction, peers) {
   var carriesAddress = false
   for (var field = 0; field < fields.length; field++) {
     if (isUuidLike(fields[field])) continue
-    if (textContainsAddress(fields[field], address)) return true
+    if (textContainsAddress(fields[field], address)) return "address"
     if (textContainsAnyAddress(fields[field])) carriesAddress = true
   }
 
   // An explicit address belongs to exactly one device. Never let a generic
   // model name (for example two identical headsets) override a mismatching
   // address and route audio to whichever node happens to be listed first.
-  if (carriesAddress) return false
+  if (carriesAddress) return ""
 
   // PipeWire may retain the hardware name after the user assigns a BlueZ
   // alias, so match either label when node metadata genuinely lacks an
@@ -326,9 +373,33 @@ function bluetoothNodeMatchesDevice(node, device, direction, peers) {
     if (label === "") continue
     for (var candidate = 0; candidate < fields.length; candidate++)
       if (normalizedIdentity(fields[candidate]) === label
-          && !identityLabelIsAmbiguous(label, device, peers)) return true
+          && !identityLabelIsAmbiguous(label, device, peers)) return "name"
   }
-  return false
+  return ""
+}
+
+function bluetoothNodeMatchesDevice(node, device, direction, peers) {
+  return bluetoothNodeMatchKind(node, device, direction, peers) !== ""
+}
+
+function findBluetoothAudioNode(nodes, device, direction, peers) {
+  if (!device) return null
+  var candidates = toArray(nodes)
+  var nameMatches = []
+  for (var i = 0; i < candidates.length; i++) {
+    var kind = bluetoothNodeMatchKind(candidates[i], device, direction, peers)
+    if (kind === "address") return candidates[i]
+    if (kind === "name") nameMatches.push(candidates[i])
+  }
+  return nameMatches.length === 1 ? nameMatches[0] : null
+}
+
+function findBluetoothAudioSink(sinks, device, peers) {
+  return findBluetoothAudioNode(sinks, device, "sink", peers)
+}
+
+function findBluetoothAudioSource(sources, device, peers) {
+  return findBluetoothAudioNode(sources, device, "source", peers)
 }
 
 function bluetoothSinkMatchesDevice(node, device, peers) {
@@ -631,6 +702,24 @@ function deviceActionReachedState(action, device) {
   return false
 }
 
+function isAuthenticationFailureMessage(message) {
+  var lower = String(message || "").toLowerCase()
+  return lower.indexOf("authentication") !== -1
+    || lower.indexOf("pairing was rejected") !== -1
+    || lower.indexOf("pairing failed") !== -1
+    || lower.indexOf("key is missing") !== -1
+    || lower.indexOf("key-missing") !== -1
+    || lower.indexOf("not authorized") !== -1
+    || lower.indexOf("notauthorized") !== -1
+}
+
+function shouldPairAgainOnRetry(device, failure) {
+  if (!device || device.connected || device.paired || device.bonded || !device.trusted)
+    return false
+  if (!failure || failure.action !== "connect") return false
+  return isAuthenticationFailureMessage(failure.message)
+}
+
 function visibleSections(lists, discovering) {
   var sections = []
   if (lists && lists.connected && lists.connected.length > 0) sections.push("connected")
@@ -742,6 +831,7 @@ if (typeof module !== "undefined") {
     parseAudioPreferences: parseAudioPreferences,
     parseAudioPolicyOverrides: parseAudioPolicyOverrides,
     mergeAudioPreferences: mergeAudioPreferences,
+    audioPreferencesDocumentError: audioPreferencesDocumentError,
     isAudioPreferencesDocument: isAudioPreferencesDocument,
     isValidAudioPolicy: isValidAudioPolicy,
     audioPolicyOrder: audioPolicyOrder,
@@ -753,6 +843,10 @@ if (typeof module !== "undefined") {
     hasHumanName: hasHumanName,
     nodeProps: nodeProps,
     isAudioSource: isAudioSource,
+    isBluetoothAudioNode: isBluetoothAudioNode,
+    findBluetoothAudioNode: findBluetoothAudioNode,
+    findBluetoothAudioSink: findBluetoothAudioSink,
+    findBluetoothAudioSource: findBluetoothAudioSource,
     bluetoothSinkMatchesDevice: bluetoothSinkMatchesDevice,
     bluetoothSourceMatchesDevice: bluetoothSourceMatchesDevice,
     sameAudioNode: sameAudioNode,
@@ -774,6 +868,8 @@ if (typeof module !== "undefined") {
     deviceActionFailure: deviceActionFailure,
     withDeviceActionFailure: withDeviceActionFailure,
     deviceActionReachedState: deviceActionReachedState,
+    isAuthenticationFailureMessage: isAuthenticationFailureMessage,
+    shouldPairAgainOnRetry: shouldPairAgainOnRetry,
     parseDeviceAliases: parseDeviceAliases,
     deviceAliasKeysForAddress: deviceAliasKeysForAddress,
     visibleSections: visibleSections,

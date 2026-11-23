@@ -23,11 +23,14 @@ CursorSurface {
     ? String(actionFailure.message || "") : ""
   readonly property string recoveryAction: controller.recoveryAction(dev ? dev.address : "")
   readonly property bool recoveryVisible: recoveryAction !== ""
+  readonly property bool pairAgainOnRetry: recoveryAction === "retry"
+    && Model.shouldPairAgainOnRetry(dev, actionFailure)
   readonly property bool cancellingConnection: dev
     && controller.connectionCancellationPending(dev.address)
   readonly property string actionTooltip: {
     if (!dev) return ""
     if (recoveryAction === "cancel") return "Cancel connection"
+    if (pairAgainOnRetry) return "Pair again"
     if (isConnected) return "Disconnect"
     if (isDiscovered) return "Pair"
     return "Connect"
@@ -315,7 +318,8 @@ CursorSurface {
       iconText: row.recoveryAction === "cancel" ? "󰅙" : "󰑐"
       tooltipText: row.recoveryAction === "cancel" ? "Cancel connection"
         : (row.actionFailureMessage !== ""
-          ? "Retry · " + row.actionFailureMessage : "Retry")
+          ? (row.pairAgainOnRetry ? "Pair again · " : "Retry · ") + row.actionFailureMessage
+          : (row.pairAgainOnRetry ? "Pair again" : "Retry"))
       foreground: controller.bar.foreground
       hoverColor: row.recoveryAction === "retry" ? controller.bar.urgent
         : controller.bar.foreground

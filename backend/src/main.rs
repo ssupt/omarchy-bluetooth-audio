@@ -3,12 +3,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
 const MAX_FRAME: usize = 65_536;
 const MAX_OUTPUT: usize = 131_072;
@@ -50,6 +53,81 @@ struct Service {
     scripts: PathBuf,
     active_action: Mutex<Option<(String, u32)>>,
     jobs: Mutex<HashMap<String, Job>>,
+    shutdown: watch::Receiver<bool>,
+}
+
+struct ServiceLock(#[allow(dead_code)] File);
+
+fn service_lock_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let uid = unsafe { libc::geteuid() };
+    dir.join(format!("omarchy-bluetooth-service-{uid}.lock"))
+}
+
+async fn acquire_mutation_lock(
+    deadline: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<ServiceLock, Failure> {
+    if *shutdown.borrow() {
+        return Err(Failure::rejected(
+            "cancelled",
+            "Bluetooth service is shutting down",
+        ));
+    }
+    let path = service_lock_path();
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| {
+            Failure::rejected(
+                "unavailable",
+                format!("Could not open Bluetooth service lock: {error}"),
+            )
+        })?;
+    let started = Instant::now();
+    loop {
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked == 0 {
+            return Ok(ServiceLock(file));
+        }
+        let error = std::io::Error::last_os_error();
+        let raw = error.raw_os_error();
+        if raw != Some(libc::EWOULDBLOCK) && raw != Some(libc::EAGAIN) && raw != Some(libc::EINTR) {
+            return Err(Failure::rejected(
+                "unavailable",
+                format!("Could not lock Bluetooth service: {error}"),
+            ));
+        }
+        let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
+            return Err(Failure::rejected(
+                "timeout",
+                "Another Bluetooth service operation is still finishing",
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(Failure::rejected(
+                "timeout",
+                "Another Bluetooth service operation is still finishing",
+            ));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(remaining.min(Duration::from_millis(25))) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Err(Failure::rejected(
+                        "cancelled",
+                        "Bluetooth service is shutting down",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 struct Job {
@@ -148,6 +226,13 @@ impl Service {
         deadline: Duration,
         action: Option<(&str, &str)>,
     ) -> Result<Value, Failure> {
+        let mut shutdown = self.shutdown.clone();
+        if *shutdown.borrow() {
+            return Err(Failure::rejected(
+                "cancelled",
+                "Bluetooth service is shutting down",
+            ));
+        }
         let path = self.scripts.join(name);
         let mut child = Command::new(&path)
             .args(args)
@@ -191,9 +276,21 @@ impl Service {
             err?;
             status
         });
-        let result = match tokio::time::timeout(deadline, &mut wait).await {
-            Ok(result) => result,
-            Err(_) => {
+        enum WaitOutcome {
+            Completed(std::io::Result<std::process::ExitStatus>),
+            TimedOut,
+            Shutdown,
+        }
+        let outcome = tokio::select! {
+            result = tokio::time::timeout(deadline, &mut wait) => match result {
+                Ok(status) => WaitOutcome::Completed(status),
+                Err(_) => WaitOutcome::TimedOut,
+            },
+            _ = shutdown.wait_for(|shutting_down| *shutting_down) => WaitOutcome::Shutdown,
+        };
+        let result = match outcome {
+            WaitOutcome::Completed(result) => result,
+            WaitOutcome::TimedOut => {
                 // Give the shell helper time to run its cleanup and profile
                 // rollback traps. An abrupt kill can leave endpoints muted.
                 unsafe {
@@ -213,6 +310,29 @@ impl Service {
                     }
                 }
             }
+            WaitOutcome::Shutdown => {
+                // Terminate and reap the helper with time for its cleanup trap
+                // before exiting so a restarted service cannot race it.
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+                if tokio::time::timeout(Duration::from_secs(6), &mut wait)
+                    .await
+                    .is_err()
+                {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut wait).await;
+                }
+                if action.is_some() {
+                    *self.active_action.lock().await = None;
+                }
+                return Err(Failure::rejected(
+                    "cancelled",
+                    "Bluetooth service is shutting down",
+                ));
+            }
         };
         if action.is_some() {
             *self.active_action.lock().await = None;
@@ -230,6 +350,37 @@ impl Service {
             let message = String::from_utf8_lossy(&errors).trim().to_owned();
             if status.code() == Some(2) && name == "bluetooth-audio-profile-set" {
                 return Ok(json!({"outcome":"persistence_failed", "message":message}));
+            }
+            if name == "bluetooth-device-action" {
+                if status.code() == Some(130) {
+                    return Err(Failure::rejected(
+                        "cancelled",
+                        if message.is_empty() {
+                            "Bluetooth operation was cancelled".to_owned()
+                        } else {
+                            message
+                        },
+                    ));
+                }
+                if status.code() == Some(131) {
+                    return Err(Failure {
+                        code: "cancel_failed",
+                        message: if message.is_empty() {
+                            "Could not confirm that the cancelled Bluetooth connection stopped"
+                                .to_owned()
+                        } else {
+                            message
+                        },
+                        outcome: "unknown",
+                    });
+                }
+                if status.code().is_none() {
+                    return Err(Failure::unknown(if message.is_empty() {
+                        "Bluetooth operation outcome is unknown".to_owned()
+                    } else {
+                        message
+                    }));
+                }
             }
             return Err(Failure::rejected(
                 "failed",
@@ -433,17 +584,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|path| path.parent())
         .ok_or("Backend has no plugin root")?
         .join("scripts");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sighup = signal(SignalKind::hangup())?;
     let service = Arc::new(Service {
         scripts,
         active_action: Mutex::new(None),
         jobs: Mutex::new(HashMap::new()),
+        shutdown: shutdown_rx,
     });
     let (tx, mut rx) = mpsc::channel::<Value>(32);
     let (mutation_tx, mut mutation_rx) = mpsc::channel::<Request>(32);
     let worker_service = service.clone();
     let worker_replies = tx.clone();
     let worker = tokio::spawn(async move {
+        let mut shutdown = worker_service.shutdown.clone();
         while let Some(request) = mutation_rx.recv().await {
+            if *shutdown.borrow() {
+                worker_service.jobs.lock().await.remove(&request.id);
+                continue;
+            }
             let remaining = {
                 let mut jobs = worker_service.jobs.lock().await;
                 let job = jobs.get_mut(&request.id).expect("admitted mutation");
@@ -460,7 +621,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let result = if let Some(remaining) = remaining {
-                worker_service.handle(&request, Some(remaining)).await
+                match acquire_mutation_lock(remaining, &mut shutdown).await {
+                    Ok(_lock) => {
+                        let left = {
+                            let jobs = worker_service.jobs.lock().await;
+                            jobs.get(&request.id).and_then(|job| {
+                                if job.cancelled {
+                                    None
+                                } else {
+                                    let left = job.deadline.saturating_sub(job.admitted.elapsed());
+                                    (!left.is_zero()).then_some(left)
+                                }
+                            })
+                        };
+                        if let Some(left) = left {
+                            worker_service.handle(&request, Some(left)).await
+                        } else {
+                            let jobs = worker_service.jobs.lock().await;
+                            if jobs.get(&request.id).is_some_and(|job| job.cancelled) {
+                                Err(Failure::rejected(
+                                    "cancelled",
+                                    "Queued Bluetooth command was cancelled",
+                                ))
+                            } else {
+                                Err(Failure::rejected(
+                                    "timeout",
+                                    "Bluetooth command expired while queued",
+                                ))
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
             } else {
                 let jobs = worker_service.jobs.lock().await;
                 if jobs.get(&request.id).is_some_and(|job| job.cancelled) {
@@ -495,9 +687,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut line = Vec::new();
+    let mut signaled_shutdown = false;
     loop {
         line.clear();
-        if !read_frame(&mut stdin, &mut line).await? {
+        let read_result = tokio::select! {
+            result = read_frame(&mut stdin, &mut line) => result,
+            _ = sigterm.recv() => {
+                signaled_shutdown = true;
+                break;
+            }
+            _ = sigint.recv() => {
+                signaled_shutdown = true;
+                break;
+            }
+            _ = sighup.recv() => {
+                signaled_shutdown = true;
+                break;
+            }
+        };
+        if !read_result? {
             break;
         }
         let Ok(request) = serde_json::from_slice::<Request>(&line) else {
@@ -580,9 +788,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     }
+    if signaled_shutdown {
+        {
+            let mut jobs = service.jobs.lock().await;
+            for job in jobs.values_mut() {
+                job.cancelled = true;
+            }
+        }
+        let _ = shutdown_tx.send(true);
+    }
     drop(mutation_tx);
     worker.await?;
+    let _ = other_permits.acquire_many(32).await;
+    let _ = cancel_permits.acquire_many(4).await;
     drop(tx);
+    if signaled_shutdown {
+        let _ = writer.await;
+        // All helpers are reaped and locks released. Exit directly so Tokio's
+        // blocking stdin thread cannot hold the process open if the parent has
+        // not closed stdin yet.
+        std::process::exit(0);
+    }
     writer.await??;
     Ok(())
 }

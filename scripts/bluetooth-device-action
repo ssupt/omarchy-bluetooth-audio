@@ -30,9 +30,30 @@ adapter_path=${device_path%/dev_*}
 
 active_control_pid=
 active_output_file=
+lock_acquired=false
 
 cleanup() {
   [[ -z $active_output_file ]] || rm -f -- "$active_output_file"
+}
+
+disconnect_cleanup_failed() {
+  local status=$1
+  local output=$2
+  local lower=${output,,}
+
+  if [[ $lower == *notconnected* || $lower == *not\ connected*
+      || $lower == *doesnotexist* || $lower == *does\ not\ exist*
+      || $lower == *unknownobject* || $lower == *unknown\ object*
+      || $lower == *no\ such\ object* ]]; then
+    return 1
+  fi
+  if (( status != 0 )) || [[ $lower == *org.bluez.error*
+      || $lower == *org.freedesktop.dbus.error*
+      || $lower == *"failed to "* || $lower == *"call failed"*
+      || $lower == *"not available"* || $lower == error:* ]]; then
+    return 0
+  fi
+  return 1
 }
 
 cancel_active_control() {
@@ -40,22 +61,32 @@ cancel_active_control() {
   if [[ -n $active_control_pid ]]; then
     kill -TERM "$active_control_pid" >/dev/null 2>&1 || true
     wait "$active_control_pid" >/dev/null 2>&1 || true
+    active_control_pid=
   fi
   # Stopping the client does not cancel BlueZ's outstanding Connect request.
   # Disconnect aborts it on the daemon before a replacement device is tried.
-  if [[ $action == pair || $action == connect ]]; then
+  if [[ $lock_acquired == true && ( $action == pair || $action == connect ) ]]; then
+    local disconnect_output= disconnect_status=0
     if [[ -n $device_path ]]; then
       if [[ $action == pair ]]; then
         timeout --kill-after=1s 2s busctl call org.bluez "$device_path" \
           org.bluez.Device1 CancelPairing >/dev/null 2>&1 || true
       fi
-      timeout --kill-after=1s 2s busctl call org.bluez "$device_path" \
-        org.bluez.Device1 Disconnect >/dev/null 2>&1 || true
+      disconnect_output=$(timeout --kill-after=1s 2s busctl call org.bluez "$device_path" \
+        org.bluez.Device1 Disconnect 2>&1) || disconnect_status=$?
     else
       if [[ $action == pair ]]; then
         timeout --kill-after=1s 2s bluetoothctl cancel-pairing "$address" >/dev/null 2>&1 || true
       fi
-      timeout --kill-after=1s 2s bluetoothctl disconnect "$address" >/dev/null 2>&1 || true
+      disconnect_output=$(timeout --kill-after=1s 2s bluetoothctl disconnect "$address" 2>&1) \
+        || disconnect_status=$?
+    fi
+    disconnect_output=$(printf '%s' "$disconnect_output" | strip_terminal_codes)
+    if disconnect_cleanup_failed "$disconnect_status" "$disconnect_output"; then
+      failure_message disconnect "$disconnect_status" "$disconnect_output" >&2
+      # Exit 131 signals to the service that cancellation cleanup failed and the
+      # original connection's final state is unknown.
+      exit 131
     fi
   fi
   exit 130
@@ -63,6 +94,28 @@ cancel_active_control() {
 
 trap cleanup EXIT
 trap cancel_active_control INT TERM HUP
+
+acquire_mutation_lock() {
+  local runtime_dir=${XDG_RUNTIME_DIR:-}
+  [[ -n $runtime_dir && -d $runtime_dir && -w $runtime_dir ]] || runtime_dir=/tmp
+  local bluetooth_lock="${runtime_dir}/omarchy-bluetooth-mutation-${UID}.lock"
+  local lock_deadline=$(( $(date +%s) + 30 ))
+  exec 9>>"$bluetooth_lock" || {
+    echo "Could not open the Bluetooth mutation lock." >&2
+    return 1
+  }
+  while ! flock -n 9; do
+    if (( $(date +%s) >= lock_deadline )); then
+      echo "Another Bluetooth operation is still finishing." >&2
+      return 1
+    fi
+    sleep 0.05 &
+    active_control_pid=$!
+    wait "$active_control_pid" || true
+    active_control_pid=
+  done
+  lock_acquired=true
+}
 
 strip_terminal_codes() {
   sed $'s/\033\[[0-9;?]*[ -\/]*[@-~]//g'
@@ -98,6 +151,12 @@ failure_message() {
       ;;
     *authenticationcanceled*|*authenticationcancelled*|*authentication\ canceled*|*authentication\ cancelled*)
       echo "Pairing was cancelled."
+      ;;
+    *key-missing*|*key\ missing*|*pin\ or\ key\ missing*)
+      echo "Authentication failed because the pairing key is missing. Pair the device again."
+      ;;
+    *notauthorized*|*not\ authorized*)
+      echo "Authentication was not authorized. Pair the device again."
       ;;
     *blocked*)
       echo "This device is blocked. Unblock it before trying again."
@@ -226,25 +285,54 @@ ensure_not_blocked() {
   fi
 }
 
+device_has_bond() {
+  local state
+  if [[ -n $device_path ]]; then
+    state=$(timeout --kill-after=1s 2s busctl get-property \
+      org.bluez "$device_path" org.bluez.Device1 Bonded 2>/dev/null) || state=
+    if [[ $state == "b true" ]]; then
+      return 0
+    elif [[ $state == "b false" ]]; then
+      return 1
+    fi
+    state=$(timeout --kill-after=1s 2s busctl get-property \
+      org.bluez "$device_path" org.bluez.Device1 Paired 2>/dev/null) || return 1
+    [[ $state == "b true" ]]
+    return
+  fi
+
+  state=$(timeout --kill-after=1s 2s bluetoothctl info "$address" 2>/dev/null \
+    | strip_terminal_codes) || return 1
+  if [[ $state == *"Bonded: yes"* ]]; then
+    return 0
+  elif [[ $state == *"Bonded: no"* ]]; then
+    return 1
+  fi
+  [[ $state == *"Paired: yes"* ]]
+}
+
 trust_device() {
   # Trust is a convenience for future incoming reconnects, not a condition for
-  # completing the user's immediate pair/connect request.
+  # completing the user's immediate pair request.
   run_control trust 5 trust "$address" >/dev/null 2>&1 || true
 }
+
+acquire_mutation_lock || exit 1
 
 case "$action" in
   pair)
     ensure_powered || exit 1
     ensure_not_blocked || exit 1
     run_control pair 20 pair "$address" || exit 1
-    trust_device
+    if device_has_bond; then
+      trust_device
+    fi
     run_control connect 20 connect "$address" || exit 1
     ;;
   connect)
     ensure_powered || exit 1
     ensure_not_blocked || exit 1
     run_control connect 20 connect "$address" || exit 1
-    trust_device
     ;;
   disconnect)
     run_control disconnect 10 disconnect "$address" || exit 1

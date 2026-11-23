@@ -53,6 +53,18 @@ if [[ $signature == b ]]; then
   esac
 fi
 
+runtime_dir=${XDG_RUNTIME_DIR:-}
+[[ -n $runtime_dir && -d $runtime_dir && -w $runtime_dir ]] || runtime_dir=/tmp
+bluetooth_lock="${runtime_dir}/omarchy-bluetooth-mutation-${UID}.lock"
+exec 9>>"$bluetooth_lock" || {
+  echo "Could not open the Bluetooth mutation lock." >&2
+  exit 1
+}
+flock -w 5 9 || {
+  echo "Another Bluetooth operation is still finishing." >&2
+  exit 1
+}
+
 output=
 status=0
 output=$(timeout --kill-after=2s 5s busctl set-property \

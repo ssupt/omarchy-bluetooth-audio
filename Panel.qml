@@ -38,10 +38,11 @@ Panel {
   property string deviceActionStderr: ""
   property bool deviceActionCancelRequested: false
 
-  // Device details deliberately retain only a stable address plus primitive
+  // Device details deliberately retain only a stable identity plus primitive
   // projections. Renaming can re-sort a row, blocking can move it between
   // sections, and forgetting destroys the BlueZ QObject altogether.
   property string deviceDetailsAddress: ""
+  property string deviceDetailsPath: ""
   property int deviceDetailsIndex: 0
   // Cursor stops inside the details page. The audio-policy row sits between
   // the name field and the toggles; indices are named because inserting or
@@ -53,7 +54,10 @@ Panel {
   readonly property int detailsWakeIndex: 4
   readonly property int detailsForgetIndex: 5
   property bool forgetConfirmationOpen: false
+  property string forgetConfirmationAddress: ""
+  property string forgetConfirmationPath: ""
   property var pendingDeviceProperty: null
+  property int devicePropertySequence: 0
   property string devicePropertyStderr: ""
   property string devicePropertyError: ""
   property var pendingAudioPolicy: null
@@ -126,8 +130,10 @@ Panel {
   property var audioControlAliases: ({})
   property var sharedAudioPreferences: Model.parseAudioPreferences("")
   property var audioPolicyOverrides: ({})
+  property bool hasValidAudioPolicyOverrides: false
   readonly property var audioPreferences: Model.mergeAudioPreferences(
-    sharedAudioPreferences, audioPolicyOverrides)
+    sharedAudioPreferences, audioPolicyOverrides,
+    audioPolicyOverridesReady || hasValidAudioPolicyOverrides)
   property bool sharedAudioPreferencesReady: false
   property bool audioPolicyOverridesReady: false
   readonly property bool audioPreferencesReady: sharedAudioPreferencesReady
@@ -274,8 +280,10 @@ Panel {
 
   // Stable identity for the focused device. Devices move between sections as
   // they connect, disconnect, pair, or get forgotten, so follow the BlueZ
-  // address across section changes instead of preserving a stale row index.
+  // object path (and address fallback) across section changes instead of
+  // preserving a stale row index.
   property string focusedDeviceAddress: ""
+  property string focusedDevicePath: ""
 
   // "header" is a virtual horizontal section for companion settings + power.
   // It sits above the device sections so the adapter can still be toggled by
@@ -337,16 +345,11 @@ Panel {
   }
 
   readonly property var deviceDetailsRow: {
-    var address = Model.normalizedAddress(deviceDetailsAddress)
-    if (address === "") return null
-    var devs = devices || []
-    for (var i = 0; i < devs.length; i++) {
-      if (devs[i] && Model.normalizedAddress(devs[i].address) === address)
-        return Model.deviceRow(devs[i])
-    }
-    return null
+    var dev = deviceByIdentity(deviceDetailsAddress, deviceDetailsPath)
+    return dev ? Model.deviceRow(dev) : null
   }
   readonly property bool deviceDetailsOpen: deviceDetailsAddress !== ""
+    || deviceDetailsPath !== ""
   readonly property bool deviceDetailsForgetAvailable: !!deviceDetailsRow
     && (deviceDetailsRow.connected || deviceDetailsRow.paired
       || deviceDetailsRow.bonded || deviceDetailsRow.trusted
@@ -407,7 +410,17 @@ Panel {
       : "Bluetooth operation in progress…")
   onDeviceDetailsStopsChanged: if (deviceDetailsOpen)
     setDeviceDetailsCursor(deviceDetailsIndex)
-  onDeviceDetailsRowChanged: confirmDevicePropertyIfReached()
+  onDeviceDetailsRowChanged: {
+    confirmDevicePropertyIfReached()
+    if (forgetConfirmationOpen
+        && !deviceByIdentity(forgetConfirmationAddress || deviceDetailsAddress,
+          forgetConfirmationPath || deviceDetailsPath)) {
+      forgetConfirmationOpen = false
+      forgetConfirmationAddress = ""
+      forgetConfirmationPath = ""
+      restorePanelFocus()
+    }
+  }
   onAudioControlAliasesChanged: if (deviceDetailsRow && !pendingDeviceProperty)
     deviceDetailsView.updateNameIfIdle(String(deviceDisplayName(deviceDetailsRow)
       || deviceDetailsRow.deviceName || ""))
@@ -416,6 +429,16 @@ Panel {
   // resolve the backend object here rather than holding a wrapper that can
   // dangle mid-incubation. `devices` is already the raw device array (see the
   // property declaration), so it is iterated directly.
+  function deviceByPath(dbusPath) {
+    var target = String(dbusPath || "")
+    if (target === "") return null
+    var devs = devices || []
+    for (var i = 0; i < devs.length; i++) {
+      if (devs[i] && String(devs[i].dbusPath || "") === target) return devs[i]
+    }
+    return null
+  }
+
   function deviceByAddress(address) {
     var normalized = Model.normalizedAddress(address)
     if (normalized === "") return null
@@ -426,8 +449,14 @@ Panel {
     return null
   }
 
+  function deviceByIdentity(address, dbusPath) {
+    var targetPath = String(dbusPath || "")
+    if (targetPath !== "") return deviceByPath(targetPath)
+    return deviceByAddress(address)
+  }
+
   function deviceFor(row) {
-    return row && row.dev ? deviceByAddress(row.dev.address) : null
+    return row && row.dev ? deviceByIdentity(row.dev.address, row.dev.dbusPath) : null
   }
 
   // Flat position of the keyboard cursor, or -1 while it sits on the hero or
@@ -468,19 +497,68 @@ Panel {
   readonly property string currentAudioSinkName: Model.currentAudioNodeName(
     audioPreferences, "output", defaultAudioSink, audioSinks())
 
+  function fileViewErrorDetail(error) {
+    if (typeof FileViewError !== "undefined"
+        && typeof FileViewError.toString === "function")
+      return String(FileViewError.toString(error) || "")
+    return ""
+  }
+
+  function isFileNotFoundError(error) {
+    return typeof FileViewError !== "undefined"
+      && error === FileViewError.FileNotFound
+  }
+
   function loadAudioPreferences(raw) {
-    sharedAudioPreferencesError = Model.isAudioPreferencesDocument(raw)
-      ? "" : "Audio preferences contain invalid JSON"
+    var error = Model.audioPreferencesDocumentError(raw, "Audio preferences")
+    sharedAudioPreferencesError = error
+    if (error !== "") {
+      sharedAudioPreferencesReady = false
+      return
+    }
     sharedAudioPreferences = Model.parseAudioPreferences(raw)
     sharedAudioPreferencesReady = true
-    if (sharedAudioPreferencesError === "") audioPreferenceWriteError = ""
+    audioPreferenceWriteError = ""
+  }
+
+  function handleAudioPreferencesLoadFailed(error) {
+    if (isFileNotFoundError(error)) {
+      sharedAudioPreferencesError = ""
+      sharedAudioPreferences = Model.parseAudioPreferences("")
+      sharedAudioPreferencesReady = true
+      audioPreferenceWriteError = ""
+      return
+    }
+    var detail = fileViewErrorDetail(error)
+    sharedAudioPreferencesError = "Could not read audio preferences"
+      + (detail !== "" ? ": " + detail : "")
+    sharedAudioPreferencesReady = false
   }
 
   function loadAudioPolicyOverrides(raw) {
-    audioPolicyPreferencesError = Model.isAudioPreferencesDocument(raw)
-      ? "" : "Bluetooth audio policies contain invalid JSON"
+    var error = Model.audioPreferencesDocumentError(raw, "Bluetooth audio policies")
+    audioPolicyPreferencesError = error
+    if (error !== "") {
+      audioPolicyOverridesReady = false
+      return
+    }
     audioPolicyOverrides = Model.parseAudioPolicyOverrides(raw)
+    hasValidAudioPolicyOverrides = true
     audioPolicyOverridesReady = true
+  }
+
+  function handleAudioPolicyOverridesLoadFailed(error) {
+    if (isFileNotFoundError(error)) {
+      audioPolicyPreferencesError = ""
+      audioPolicyOverrides = ({})
+      hasValidAudioPolicyOverrides = true
+      audioPolicyOverridesReady = true
+      return
+    }
+    var detail = fileViewErrorDetail(error)
+    audioPolicyPreferencesError = "Could not read Bluetooth audio policies"
+      + (detail !== "" ? ": " + detail : "")
+    audioPolicyOverridesReady = false
   }
 
   function refreshAudioControlInstalled() {
@@ -494,21 +572,11 @@ Panel {
   }
 
   function bluetoothAudioSink(device) {
-    var sinks = audioSinks()
-    for (var i = 0; i < sinks.length; i++) {
-      if (Model.bluetoothSinkMatchesDevice(
-          sinks[i], device, connectedDevices)) return sinks[i]
-    }
-    return null
+    return Model.findBluetoothAudioSink(audioSinks(), device, connectedDevices)
   }
 
   function bluetoothAudioSource(device) {
-    var sources = audioSources()
-    for (var i = 0; i < sources.length; i++) {
-      if (Model.bluetoothSourceMatchesDevice(
-          sources[i], device, connectedDevices)) return sources[i]
-    }
-    return null
+    return Model.findBluetoothAudioSource(audioSources(), device, connectedDevices)
   }
 
   function audioUseActionAvailable(device) {
@@ -588,6 +656,7 @@ Panel {
     // stopped publishing policies in the shared audio-preferences document.
     next[key] = String(policy)
     audioPolicyOverrides = next
+    hasValidAudioPolicyOverrides = true
     audioPolicyOverridesReady = true
     audioPolicyPreferencesError = ""
   }
@@ -695,6 +764,10 @@ Panel {
 
   function finishAudioProfileOperation(result) {
     if (!result) return
+    if ((result.outcome === "applied" || result.outcome === "persistence_failed")
+        && typeof localPolicyEngine !== "undefined"
+        && typeof localPolicyEngine.noteManualProfileSelection === "function")
+      localPolicyEngine.noteManualProfileSelection(result.address)
     var operation = pendingAudioProfile || unconfirmedAudioProfile
     if (operation && operation.id === result.id
         && result.outcome !== "applied" && result.outcome !== "persistence_failed") {
@@ -946,8 +1019,11 @@ Panel {
 
   function adoptInterruptedDeviceProperty(operation) {
     if (!operation || !operation.address || pendingDeviceProperty) return false
-    pendingDeviceProperty = cloneMap(operation)
+    var adopted = cloneMap(operation)
+    adopted.id = ++devicePropertySequence
+    pendingDeviceProperty = adopted
     devicePropertyStderr = ""
+    devicePropertyConfirmTimer.operationId = adopted.id
     devicePropertyConfirmTimer.restart()
     return true
   }
@@ -1027,7 +1103,13 @@ Panel {
           && audioControlService.capabilities.indexOf("devices.forget") !== -1)
         audioControlService.request("devices.forget", { address: operation.address })
     }
-    if (deviceActionCancelRequested) {
+    var cancelCleanupFailed = deviceActionCancelRequested && code === 131
+    if (cancelCleanupFailed) {
+      setPendingAction(operation.address, "")
+      setDeviceActionFailure(operation.address, "disconnect",
+        String(message || "")
+          || "Could not confirm that the cancelled Bluetooth connection stopped")
+    } else if (deviceActionCancelRequested) {
       setPendingAction(operation.address, "")
       setDeviceActionFailure(operation.address, "", "")
     } else if (code !== 0) {
@@ -1039,7 +1121,7 @@ Panel {
     }
     activeDeviceAction = null
     deviceActionCancelRequested = false
-    syncPendingActions()
+    if (!cancelCleanupFailed) syncPendingActions()
     if (code === 0 && pendingAction(operation.address) !== "")
       setPendingAction(operation.address, operation.pending, operation.action)
   }
@@ -1057,18 +1139,28 @@ Panel {
       adoptPendingAction(operation.address, "", "")
       adoptDeviceActionFailure(operation.address, operation.action,
         String(failure.message || "") || defaultDeviceActionError(operation.action))
-      syncPendingActions()
+      if (!operation.cancellationFailed) syncPendingActions()
     } else {
       adoptDeviceActionFailure(operation.address, "", "")
       syncPendingActions()
+      var targetDevice = typeof deviceByIdentity === "function"
+        ? deviceByIdentity(operation.address, operation.path)
+        : deviceByAddress(operation.address)
       if (pendingAction(operation.address) !== ""
-          || !Model.deviceActionReachedState(operation.action, deviceByAddress(operation.address)))
+          || !Model.deviceActionReachedState(operation.action, targetDevice))
         adoptPendingAction(operation.address, operation.pending, operation.action)
     }
   }
 
   function connectDevice(device) {
     if (!device || device.connected) return
+    var failure = typeof deviceActionFailure === "function"
+      ? deviceActionFailure(device.address) : null
+    if (failure && typeof Model !== "undefined"
+        && Model.shouldPairAgainOnRetry(device, failure)) {
+      runDeviceAction(device, "pair", "connecting")
+      return
+    }
     if (device.paired || device.bonded || device.trusted) runDeviceAction(device, "connect", "connecting")
     else runDeviceAction(device, "pair", "connecting")
   }
@@ -1094,9 +1186,13 @@ Panel {
     closeAudioProfileMenus(-1)
     audioProfileMenuOpen = false
     deviceDetailsAddress = String(device.address)
+    deviceDetailsPath = String(device.dbusPath || "")
     focusedDeviceAddress = String(device.address)
+    focusedDevicePath = String(device.dbusPath || "")
     deviceDetailsIndex = 0
     forgetConfirmationOpen = false
+    forgetConfirmationAddress = ""
+    forgetConfirmationPath = ""
     devicePropertyError = ""
     Qt.callLater(function() {
       if (!root.deviceDetailsOpen) return
@@ -1110,9 +1206,12 @@ Panel {
   function closeDeviceDetails() {
     if (!deviceDetailsOpen) return
     forgetConfirmationOpen = false
+    forgetConfirmationAddress = ""
+    forgetConfirmationPath = ""
     devicePropertyError = ""
     deviceDetailsView.clearNameFocus()
     deviceDetailsAddress = ""
+    deviceDetailsPath = ""
     deviceDetailsIndex = 0
     reselectFocusedDevice()
     restorePanelFocus()
@@ -1173,7 +1272,7 @@ Panel {
 
   function updateDeviceProperty(propertyName, value, expected, errorMessage) {
     if (deviceDetailsControlsBusy) return
-    var device = deviceByAddress(deviceDetailsAddress)
+    var device = deviceByIdentity(deviceDetailsAddress, deviceDetailsPath)
     if (!device) {
       devicePropertyError = "This device is no longer available."
       return
@@ -1191,7 +1290,9 @@ Panel {
       return
     }
 
+    var operationId = ++devicePropertySequence
     pendingDeviceProperty = {
+      id: operationId,
       address: String(device.address),
       dbusPath: String(details.dbusPath),
       propertyName: String(propertyName),
@@ -1207,27 +1308,29 @@ Panel {
         property: String(propertyName), path: String(details.dbusPath),
         value: typeof value === "boolean" ? (value ? "true" : "false") : String(value)
       }, function(_result, failure) {
-        root.finishDeviceProperty(failure ? 1 : 0, failure ? failure.message : "")
+        root.finishDeviceProperty(operationId, failure ? 1 : 0, failure ? failure.message : "")
       })
       return
     }
+    devicePropertyProc.operationId = operationId
     devicePropertyProc.prepare()
     devicePropertyProc.running = true
   }
 
-  function finishDeviceProperty(code, message) {
+  function finishDeviceProperty(operationId, code, message) {
     var operation = pendingDeviceProperty
-    if (!operation) return
-    var liveDevice = deviceByAddress(operation.address)
+    if (!operation || operation.id !== operationId) return
+    var liveDevice = deviceByIdentity(operation.address, operation.dbusPath)
     if (liveDevice && liveDeviceProperty(liveDevice, operation.propertyName)
         === operation.expected) {
-      confirmDeviceProperty()
+      confirmDeviceProperty(operationId)
       return
     }
     if (code !== 0) {
+      if (devicePropertyConfirmTimer.operationId === operationId)
+        devicePropertyConfirmTimer.stop()
       pendingDeviceProperty = null
-      if (Model.normalizedAddress(deviceDetailsAddress)
-          === Model.normalizedAddress(operation.address)) {
+      if (sameDetailsTarget(operation.address, operation.dbusPath)) {
         devicePropertyError = String(message || "") || operation.errorMessage
         if (operation.propertyName === "name" && deviceDetailsRow)
           deviceDetailsView.updateNameIfIdle(String(
@@ -1235,8 +1338,16 @@ Panel {
               || deviceDetailsRow.deviceName || ""))
       }
     } else {
+      devicePropertyConfirmTimer.operationId = operationId
       devicePropertyConfirmTimer.restart()
     }
+  }
+
+  function sameDetailsTarget(address, dbusPath) {
+    if (deviceDetailsPath !== "" && String(dbusPath || "") !== "")
+      return deviceDetailsPath === String(dbusPath)
+    return Model.normalizedAddress(deviceDetailsAddress)
+      === Model.normalizedAddress(address)
   }
 
   // With the companion plugin enabled, a rename must also land in its
@@ -1291,7 +1402,7 @@ Panel {
   }
 
   function commitDeviceRename() {
-    var device = deviceByAddress(deviceDetailsAddress)
+    var device = deviceByIdentity(deviceDetailsAddress, deviceDetailsPath)
     if (!device || deviceDetailsControlsBusy) return
     var requested = deviceDetailsView.renameText().trim()
     var expected = requested !== "" ? requested : String(device.deviceName || "").trim()
@@ -1304,10 +1415,12 @@ Panel {
     updateDeviceProperty(propertyName, !!value, !!value, errorMessage)
   }
 
-  function confirmDeviceProperty() {
+  function confirmDeviceProperty(operationId) {
     var operation = pendingDeviceProperty
-    if (!operation) return
-    var device = deviceByAddress(operation.address)
+    if (!operation || (operationId !== undefined && operation.id !== operationId)) return
+    if (devicePropertyConfirmTimer.operationId === operation.id)
+      devicePropertyConfirmTimer.stop()
+    var device = deviceByIdentity(operation.address, operation.dbusPath)
     var matches = device
       && liveDeviceProperty(device, operation.propertyName) === operation.expected
     pendingDeviceProperty = null
@@ -1315,8 +1428,7 @@ Panel {
     if (matches && operation.propertyName === "name")
       syncAudioControlAliases(operation.address, String(operation.value))
 
-    if (Model.normalizedAddress(deviceDetailsAddress)
-        !== Model.normalizedAddress(operation.address)) return
+    if (!sameDetailsTarget(operation.address, operation.dbusPath)) return
     devicePropertyError = matches ? ""
       : (device ? operation.errorMessage : "This device is no longer available.")
     if (operation.propertyName === "name" && deviceDetailsRow)
@@ -1327,11 +1439,11 @@ Panel {
   function confirmDevicePropertyIfReached() {
     var operation = pendingDeviceProperty
     if (!operation) return
-    var device = deviceByAddress(operation.address)
+    var device = deviceByIdentity(operation.address, operation.dbusPath)
     if (!device
         || liveDeviceProperty(device, operation.propertyName) !== operation.expected) return
     devicePropertyConfirmTimer.stop()
-    confirmDeviceProperty()
+    confirmDeviceProperty(operation.id)
   }
 
   function activateDeviceDetailsCursor() {
@@ -1355,24 +1467,34 @@ Panel {
 
   function requestForgetConfirmation(device) {
     var address = device && device.address ? String(device.address) : deviceDetailsAddress
+    var path = device && device.address ? String(device.dbusPath || "") : deviceDetailsPath
     if (deviceDetailsControlsBusy || deviceActionBusy || pendingAction(address) !== "") return
-    if (device && device.address
-        && Model.normalizedAddress(device.address) !== Model.normalizedAddress(deviceDetailsAddress))
+    if (device && device.address && !sameDetailsTarget(address, path))
       openDeviceDetails(device)
-    if (!deviceDetailsForgetAvailable && !device) return
+    var target = deviceByIdentity(address, path)
+    if (!target || !(target.connected || target.paired || target.bonded
+        || target.trusted || target.blocked)) return
+    forgetConfirmationAddress = String(target.address || address)
+    forgetConfirmationPath = String(target.dbusPath || path)
     forgetConfirmationOpen = true
     deviceDetailsView.resetConfirmation()
   }
 
   function cancelForgetConfirmation() {
     forgetConfirmationOpen = false
+    forgetConfirmationAddress = ""
+    forgetConfirmationPath = ""
     restorePanelFocus()
   }
 
   function confirmForgetDevice() {
     if (deviceDetailsControlsBusy || deviceActionBusy) return
-    var device = deviceByAddress(deviceDetailsAddress)
+    var address = forgetConfirmationAddress || deviceDetailsAddress
+    var path = forgetConfirmationPath || deviceDetailsPath
+    var device = deviceByIdentity(address, path)
     forgetConfirmationOpen = false
+    forgetConfirmationAddress = ""
+    forgetConfirmationPath = ""
     closeDeviceDetails()
     if (device) forgetDevice(device)
   }
@@ -1381,8 +1503,15 @@ Panel {
     if (!device || !device.address || deviceActionBusy) return
     var failure = deviceActionFailure(device.address)
     if (!failure) return
+    if (Model.shouldPairAgainOnRetry(device, failure)) {
+      runDeviceAction(device, "pair", "connecting")
+      return
+    }
     if (failure.action === "pair" || failure.action === "connect") connectDevice(device)
-    else if (failure.action === "disconnect") disconnectDevice(device)
+    else if (failure.action === "disconnect") {
+      if (device.connected) disconnectDevice(device)
+      else runDeviceAction(device, "disconnect", "disconnecting")
+    }
     else if (failure.action === "forget") forgetDevice(device)
   }
 
@@ -1692,16 +1821,33 @@ Panel {
   function updateFocusedAddress() {
     var d = deviceAt(focusSection, selectedIndex)
     focusedDeviceAddress = d ? (d.address || "") : ""
+    focusedDevicePath = d ? (d.dbusPath || "") : ""
   }
 
   function reselectFocusedDevice() {
-    if (focusedDeviceAddress === "") {
+    if (focusedDeviceAddress === "" && focusedDevicePath === "") {
       clampCursor()
       updateFocusedAddress()
       return
     }
 
     var sections = ["connected", "known", "discovered"]
+    if (focusedDevicePath !== "") {
+      for (var ps = 0; ps < sections.length; ps++) {
+        var pathSection = sections[ps]
+        if (!sectionVisible(pathSection)) continue
+        var pathList = devicesForSection(pathSection)
+        for (var pi = 0; pi < pathList.length; pi++) {
+          if (pathList[pi] && String(pathList[pi].dbusPath || "") === focusedDevicePath) {
+            focusSection = pathSection
+            selectedIndex = pi
+            clampCursor()
+            updateFocusedAddress()
+            return
+          }
+        }
+      }
+    }
     for (var s = 0; s < sections.length; s++) {
       var section = sections[s]
       if (!sectionVisible(section)) continue
@@ -1952,7 +2098,7 @@ Panel {
     watchChanges: true
     printErrors: false
     onLoaded: root.loadAudioPreferences(text())
-    onLoadFailed: root.loadAudioPreferences("")
+    onLoadFailed: function(error) { root.handleAudioPreferencesLoadFailed(error) }
     onFileChanged: reload()
   }
 
@@ -2015,7 +2161,7 @@ Panel {
     watchChanges: true
     printErrors: false
     onLoaded: root.loadAudioPolicyOverrides(text())
-    onLoadFailed: root.loadAudioPolicyOverrides("")
+    onLoadFailed: function(error) { root.handleAudioPolicyOverridesLoadFailed(error) }
     onFileChanged: reload()
   }
 
@@ -2080,6 +2226,7 @@ Panel {
 
   Process {
     id: devicePropertyProc
+    property int operationId: 0
     property bool collecting: false
     property bool stderrComplete: false
     property bool exitComplete: false
@@ -2095,11 +2242,12 @@ Panel {
 
     function finishCollection() {
       if (!collecting || !stderrComplete || !exitComplete) return
+      var id = operationId
       var code = resultCode
       collecting = false
       stderrComplete = false
       exitComplete = false
-      root.finishDeviceProperty(code, root.devicePropertyStderr)
+      root.finishDeviceProperty(id, code, root.devicePropertyStderr)
     }
 
     stderr: StdioCollector {
@@ -2198,7 +2346,7 @@ Panel {
     onApplicationsPublished: function(applications) {
       root.publishAudioPolicyApplications(applications)
     }
-    onProfileSwitchRequested: function(key, address, profile) {
+    onProfileSwitchRequested: function(key, address, profile, operationId) {
       if (root.bluetoothService && root.bluetoothService.ready) {
         root.bluetoothService.request("profile.set", {
           address: address, profile: profile
@@ -2207,11 +2355,12 @@ Panel {
             : result && result.outcome === "persistence_failed" ? 2 : 0
           if (code === 2 && root.audioPreferencesError === "")
             root.audioPreferenceWriteError = "Audio mode is active, but its preference could not be saved"
-          policyEngine.finishProfileSwitch(key, code)
+          localPolicyEngine.finishProfileSwitch(key, code, operationId)
         })
         return
       }
       policyProfileSwitchProc.key = key
+      policyProfileSwitchProc.operationId = operationId
       policyProfileSwitchProc.command = [
         root.pluginScript("bluetooth-audio-profile-set"),
         address,
@@ -2224,10 +2373,15 @@ Panel {
   Process {
     id: policyProfileSwitchProc
     property string key: ""
+    property int operationId: 0
     onExited: function(exitCode) {
+      var finishedKey = key
+      var finishedId = operationId
+      key = ""
+      operationId = 0
       if (exitCode === 2 && root.audioPreferencesError === "")
         root.audioPreferenceWriteError = "Audio mode is active, but its preference could not be saved"
-      policyEngine.finishProfileSwitch(key, exitCode)
+      localPolicyEngine.finishProfileSwitch(finishedKey, exitCode, finishedId)
     }
   }
 
@@ -2279,9 +2433,10 @@ Panel {
     // A synchronous D-Bus reply can still precede Quickshell's projected
     // PropertiesChanged update. Live changes short-circuit this wait through
     // onDeviceDetailsRowChanged; four seconds is only the failure deadline.
+    property int operationId: 0
     interval: 4000
     repeat: false
-    onTriggered: root.confirmDeviceProperty()
+    onTriggered: root.confirmDeviceProperty(operationId)
   }
 
   Timer {

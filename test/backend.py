@@ -54,6 +54,7 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-service-test-") as temporary:
         path.write_text(contents)
         path.chmod(0o755)
     environment = dict(os.environ, BT_TEST_LOG=str(log),
+                       XDG_RUNTIME_DIR=str(root),
                        BT_TEST_HOLD_ADDRESS="22:33:44:55:66:77")
     with subprocess.Popen([root / "bin/omarchy-bluetooth-service", "--stdio"],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -124,5 +125,70 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-service-test-") as temporary:
                                input="x" * 70000 + "\n", capture_output=True,
                                text=True, timeout=5, env=environment)
     assert oversized.returncode != 0 and not oversized.stdout
+
+    # Backend distinguishes clean cancellation (130) from failed cleanup (131).
+    action_script = root / "scripts/bluetooth-device-action"
+    action_script.write_text('''#!/bin/sh
+if [ "$2" = "00:11:22:33:44:55" ]; then
+  exit 130
+elif [ "$2" = "11:22:33:44:55:66" ]; then
+  echo "Could not disconnect the device: org.bluez.Error.Failed" >&2
+  exit 131
+fi
+exit 0
+''')
+    action_script.chmod(0o755)
+    with subprocess.Popen([root / "bin/omarchy-bluetooth-service", "--stdio"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, env=environment) as process:
+        send(process, 1, "device.action", action="connect", address="00:11:22:33:44:55")
+        cancelled = receive(process)
+        assert cancelled["error"]["code"] == "cancelled" and cancelled["error"]["outcome"] == "rejected", cancelled
+        send(process, 2, "device.action", action="connect", address="11:22:33:44:55:66")
+        failed_cancel = receive(process)
+        assert failed_cancel["error"]["code"] == "cancel_failed", failed_cancel
+        assert failed_cancel["error"]["outcome"] == "unknown", failed_cancel
+        assert "Could not disconnect" in failed_cancel["error"]["message"], failed_cancel
+        process.stdin.close()
+        assert process.wait(timeout=5) == 0
+
+    # SIGTERM terminates and reaps running helpers with cleanup time,
+    # and a replacement backend cannot finish a disconnect before the old connect ends.
+    shutdown_log = root / "shutdown.log"
+    action_script.write_text('''#!/bin/bash
+printf 'start:%s\\n' "$1" >> "$BT_SHUTDOWN_LOG"
+child=
+trap 'if [[ -n $child ]]; then kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; sleep .25; printf "cleanup:%s\\n" "$1" >> "$BT_SHUTDOWN_LOG"; exit 130' TERM INT
+if [[ $1 == connect ]]; then
+  sleep 10 &
+  child=$!
+  wait "$child"
+else
+  sleep .05
+fi
+printf 'end:%s\\n' "$1" >> "$BT_SHUTDOWN_LOG"
+''')
+    action_script.chmod(0o755)
+    shutdown_env = dict(environment, BT_SHUTDOWN_LOG=str(shutdown_log))
+    with subprocess.Popen([root / "bin/omarchy-bluetooth-service", "--stdio"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, env=shutdown_env) as first_backend:
+        send(first_backend, 1, "device.action", action="connect", address="00:11:22:33:44:55")
+        deadline = time.monotonic() + 3
+        while not shutdown_log.exists() or "start:connect" not in shutdown_log.read_text():
+            assert time.monotonic() < deadline, "slow connect helper did not start"
+            time.sleep(.01)
+        first_backend.terminate()
+        with subprocess.Popen([root / "bin/omarchy-bluetooth-service", "--stdio"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, env=shutdown_env) as second_backend:
+            send(second_backend, 1, "device.action", action="disconnect", address="00:11:22:33:44:55")
+            reply = receive(second_backend)
+            assert reply["result"]["outcome"] == "applied", reply
+            second_backend.stdin.close()
+            assert second_backend.wait(timeout=5) == 0
+        assert first_backend.wait(timeout=5) == 0
+    events = shutdown_log.read_text().splitlines()
+    assert events == ["start:connect", "cleanup:connect", "start:disconnect", "end:disconnect"], events
 
 print("PASS: Rust command service protocol, bounds, and serialization")

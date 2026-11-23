@@ -66,6 +66,12 @@ if [[ -n ${AUDIO_CONTROL_PROFILE_LOG:-} && -n ${AUDIO_CONTROL_PROFILE_STATE:-} ]
       exit 0
       ;;
     "-f json list sources")
+      if [[ $state == old && ${AUDIO_CONTROL_PROFILE_OLD_SOURCE_READ_FAIL:-0} == 1 ]]; then
+        exit 1
+      fi
+      if [[ $state == new && ${AUDIO_CONTROL_PROFILE_NEW_SOURCE_READ_FAIL:-0} == 1 ]]; then
+        exit 1
+      fi
       source_endpoint_card=$endpoint_card
       if [[ ${AUDIO_CONTROL_PROFILE_LOOPBACK_SOURCE:-0} == 1 ]]; then
         if [[ ${AUDIO_CONTROL_PROFILE_LEGACY_CARD_FIELD:-0} == 1 ]]; then
