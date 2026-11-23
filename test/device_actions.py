@@ -2,6 +2,7 @@
 """Check controller-specific device actions without touching Bluetooth hardware."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -124,5 +125,49 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-device-actions-") as temporar
             assert process.returncode == expected_rc, (fail_message, process.returncode, stderr)
             if expected_rc == 131:
                 assert "Could not disconnect" in stderr, stderr
+
+    # Cancelling while powering the adapter on (before Connect is called) must
+    # exit cleanly (130) without calling Disconnect on an unpowered adapter.
+    log.write_text("")
+    with subprocess.Popen([str(ROOT / "scripts/bluetooth-device-action"), "connect",
+                           ADDRESS, DEVICE],
+                          env=dict(environment, BLUETOOTH_ACTION_BUS_POWERED="false",
+                                   BLUETOOTH_ACTION_POWER_DELAY="10",
+                                   BLUETOOTH_ACTION_BUS_FAIL_METHOD="Disconnect",
+                                   BLUETOOTH_ACTION_FAIL_MESSAGE="Call failed: org.bluez.Error.NotReady"),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+        deadline = time.monotonic() + 3
+        while "power on" not in log.read_text():
+            assert time.monotonic() < deadline, "Power helper did not start"
+            time.sleep(.01)
+        process.terminate()
+        _, stderr = process.communicate(timeout=4)
+        assert process.returncode == 130, (process.returncode, stderr)
+        calls = log.read_text().splitlines()
+        assert not any("Disconnect" in call for call in calls), calls
+
+    # Combined AuthenticationFailed + Key Missing must report missing pairing key.
+    result, _ = run("connect", BLUETOOTH_ACTION_BUS_FAIL_METHOD="Connect",
+                    BLUETOOTH_ACTION_FAIL_MESSAGE="Call failed: org.bluez.Error.AuthenticationFailed: Key Missing")
+    assert result.returncode != 0 and "pairing key is missing" in result.stderr, result.stderr
+
+    # Child processes must not inherit the mutation lock FD 9.
+    fd_probe_dir = Path(temporary) / "fd-mocks"
+    fd_probe_dir.mkdir()
+    for name in ("busctl", "bluetoothctl", "omarchy-bluetooth-power"):
+        shutil.copy2(ROOT / "test/mocks" / name, fd_probe_dir / name)
+    busctl_probe = fd_probe_dir / "busctl"
+    busctl_probe.write_text(
+        "#!/bin/bash\nif [[ -e /proc/$$/fd/9 ]]; then echo 'FD9_LEAKED' >&2; exit 99; fi\n"
+        + f'exec "{ROOT / "test/mocks/busctl"}" "$@"\n'
+    )
+    busctl_probe.chmod(0o755)
+    log.write_text("")
+    fd_result = subprocess.run(
+        [str(ROOT / "scripts/bluetooth-device-action"), "connect", ADDRESS, DEVICE],
+        env=dict(environment, PATH=str(fd_probe_dir) + ":" + os.environ["PATH"]),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert fd_result.returncode == 0 and "FD9_LEAKED" not in fd_result.stderr, fd_result.stderr
 
 print("PASS: controller-specific actions preserve ownership, reject unconfirmed removal, and cancel promptly")

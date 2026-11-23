@@ -631,17 +631,31 @@ function observeDeviceConnections(previous, devices, includeNewConnections) {
   var before = previous && typeof previous === "object" ? previous : {}
   var values = toArray(devices)
   var states = {}
+  var addresses = {}
   var connected = []
 
+  // Aggregate per-MAC connection state across adapters first so a disconnected
+  // peer on another controller cannot overwrite a live connection and trigger
+  // spurious reconnect edges on subsequent updates.
   for (var i = 0; i < values.length; i++) {
     var device = values[i]
     var key = normalizedAddress(device ? device.address : "")
     if (key === "") continue
     var isConnected = !!device.connected
-    var wasObserved = Object.prototype.hasOwnProperty.call(before, key)
-    if (isConnected && (before[key] === false || (!!includeNewConnections && !wasObserved)))
-      connected.push({ key: key, address: String(device.address) })
-    states[key] = isConnected
+    if (!Object.prototype.hasOwnProperty.call(states, key)) {
+      states[key] = isConnected
+      addresses[key] = String(device.address)
+    } else if (isConnected) {
+      states[key] = true
+      addresses[key] = String(device.address)
+    }
+  }
+
+  for (var observedKey in states) {
+    var wasObserved = Object.prototype.hasOwnProperty.call(before, observedKey)
+    if (states[observedKey]
+        && (before[observedKey] === false || (!!includeNewConnections && !wasObserved)))
+      connected.push({ key: observedKey, address: addresses[observedKey] })
   }
 
   return { states: states, connected: connected }
@@ -685,11 +699,16 @@ function deviceActionFailure(failures, address) {
   return failure && typeof failure === "object" ? failure : null
 }
 
-function withDeviceActionFailure(failures, address, action, message) {
+function withDeviceActionFailure(failures, address, action, message, path, cancellationFailed) {
   var next = cloneMap(failures)
   var key = normalizedAddress(address)
   if (key === "") return next
-  if (action && message) next[key] = { action: String(action), message: String(message) }
+  if (action && message) {
+    var entry = { action: String(action), message: String(message) }
+    if (path) entry.path = String(path)
+    if (cancellationFailed) entry.cancellationFailed = true
+    next[key] = entry
+  }
   else delete next[key]
   return next
 }
@@ -707,6 +726,8 @@ function isAuthenticationFailureMessage(message) {
   return lower.indexOf("authentication") !== -1
     || lower.indexOf("pairing was rejected") !== -1
     || lower.indexOf("pairing failed") !== -1
+    || lower.indexOf("pairing timed out") !== -1
+    || lower.indexOf("pairing was cancelled") !== -1
     || lower.indexOf("key is missing") !== -1
     || lower.indexOf("key-missing") !== -1
     || lower.indexOf("not authorized") !== -1
@@ -716,7 +737,9 @@ function isAuthenticationFailureMessage(message) {
 function shouldPairAgainOnRetry(device, failure) {
   if (!device || device.connected || device.paired || device.bonded || !device.trusted)
     return false
-  if (!failure || failure.action !== "connect") return false
+  if (!failure) return false
+  if (failure.action === "pair") return true
+  if (failure.action !== "connect") return false
   return isAuthenticationFailureMessage(failure.message)
 }
 

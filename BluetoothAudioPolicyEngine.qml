@@ -19,6 +19,7 @@ Item {
   property var pendingApplications: ({})
   property var terminalOutcomes: ({})
   property var manualProfileConnections: ({})
+  property var defaultErrors: ({})
 
   readonly property int maximumAttempts: 90
   readonly property int stableTicksBeforeSwitch: 8
@@ -26,7 +27,12 @@ Item {
   readonly property int maximumSwitchAttempts: 3
   readonly property bool hasPending: Object.keys(pendingApplications).length > 0
   property bool profileSwitchBusy: false
-  property string defaultError: ""
+  readonly property string defaultError: {
+    for (var key in defaultErrors) {
+      if (defaultErrors[key]) return String(defaultErrors[key])
+    }
+    return ""
+  }
   property int profileSwitchSequence: 0
   property int activeProfileSwitchId: 0
   property string activeProfileSwitchKey: ""
@@ -41,6 +47,14 @@ Item {
 
   function clone(value) {
     return Model.cloneMap(value)
+  }
+
+  function setDefaultError(key, message) {
+    var text = String(message || "")
+    var next = clone(defaultErrors)
+    if (text !== "") next[key] = text
+    else delete next[key]
+    defaultErrors = next
   }
 
   function pruneConnectionMaps(states) {
@@ -59,6 +73,14 @@ Item {
       else terminalChanged = true
     }
     if (terminalChanged) terminalOutcomes = terminals
+
+    var errors = {}
+    var errorsChanged = false
+    for (var errorKey in defaultErrors) {
+      if (states[errorKey] === true) errors[errorKey] = defaultErrors[errorKey]
+      else errorsChanged = true
+    }
+    if (errorsChanged) defaultErrors = errors
   }
 
   function clearConnectionTrackers(key) {
@@ -72,6 +94,7 @@ Item {
       delete terminals[key]
       terminalOutcomes = terminals
     }
+    if (defaultErrors[key]) setDefaultError(key, "")
   }
 
   function noteManualProfileSelection(address) {
@@ -96,7 +119,7 @@ Item {
 
   function recordTerminalOutcome(key, entry, message) {
     var text = String(message || "Bluetooth audio default outcome is unknown")
-    defaultError = text
+    setDefaultError(key, text)
     var terminals = clone(terminalOutcomes)
     terminals[key] = {
       policy: entry ? String(entry.policy || "") : "",
@@ -255,7 +278,7 @@ Item {
     } else {
       var outcome = String(result && result.outcome || "")
       if (outcome === "persistence_failed")
-        defaultError = String(result.message || "Audio default changed, but its preference could not be saved")
+        setDefaultError(key, String(result.message || "Audio default changed, but its preference could not be saved"))
       pending[key] = withPatch(entry, { defaultResult: outcome || "unconfirmed" })
     }
     pendingApplications = pending
@@ -337,7 +360,10 @@ Item {
       // the choice that happened to be captured at connection time.
       var configuredPolicy = Model.deviceAudioPolicy(
         controller.audioPreferences, key)
-      if (configuredPolicy === "manual") continue
+      if (configuredPolicy === "manual") {
+        if (defaultErrors[key]) setDefaultError(key, "")
+        continue
+      }
       if (configuredPolicy !== entry.policy)
         entry = { policy: configuredPolicy, attempts: 0 }
 
@@ -356,7 +382,7 @@ Item {
         continue
       }
       if (entry.defaultUnknown) {
-        recordTerminalOutcome(key, entry, defaultError)
+        recordTerminalOutcome(key, entry, defaultErrors[key] || defaultError)
         continue
       }
       if (entry.defaultRequested && !entry.defaultResult) {

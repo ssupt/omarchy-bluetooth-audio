@@ -417,14 +417,17 @@ TestCase {
     compare(refreshes, 0)
     compare(mockController.sinkCalls, 1)
     engine.automaticRetries = false
-    // Re-queueing on the same connection must not replay, but disconnect + reconnect re-arms it.
+    // Re-queueing on the same connection must not replay, but disconnect + reconnect re-arms it
+    // and clears the stale defaultError so errors do not stick permanently.
     engine.queueReadyConnection("00:11:22:33:44:55")
     compare(engine.hasPending, false)
     engine.initializeDevices([mockController.device])
     engine.observeDevices([{ address: "00:11:22:33:44:55", connected: false }])
     verify(!engine.terminalOutcomes["001122334455"])
+    compare(engine.defaultError, "")
     engine.observeDevices([mockController.device])
     verify(engine.pendingApplications["001122334455"] !== undefined)
+    compare(engine.defaultError, "")
   }
 
   function test_outputRetriesDoNotExhaustMicrophoneAllowance() {

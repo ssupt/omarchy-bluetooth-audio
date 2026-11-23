@@ -40,8 +40,12 @@ flock -w 5 7 || {
   exit 1
 }
 
+run_pactl() {
+  timeout --kill-after=1s 2 pactl "$@" 7>&- 8>&-
+}
+
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-profile_state=$("$script_dir/audio-profiles" |
+profile_state=$("$script_dir/audio-profiles" 7>&- 8>&- |
   jq -ec --arg card "$card" --arg profile "$profile" '
     first(.[] | select(.name == $card) | .profiles[] | select(.value == $profile))
   ') || {
@@ -53,7 +57,7 @@ expected_sinks=$(jq -r '.sinks // 0' <<<"$profile_state")
 expected_sources=$(jq -r '.sources // 0' <<<"$profile_state")
 [[ $expected_sinks =~ ^[0-9]+$ && $expected_sources =~ ^[0-9]+$ ]] || exit 1
 
-card_info=$(timeout --kill-after=1s 2 pactl -f json list cards 2>/dev/null |
+card_info=$(run_pactl -f json list cards 2>/dev/null |
   jq -ec --arg card "$card" 'first(.[] | select(.name == $card))') || {
   echo "Audio card is not available" >&2
   exit 1
@@ -76,7 +80,7 @@ read_endpoints() {
   local kind=$1
   local payload
 
-  payload=$(timeout --kill-after=1s 2 pactl -f json list "$kind" 2>/dev/null) || return 1
+  payload=$(run_pactl -f json list "$kind" 2>/dev/null) || return 1
   jq -e 'type == "array"' <<<"$payload" >/dev/null || return 1
   printf '%s\n' "$payload"
 }
@@ -84,7 +88,7 @@ read_endpoints() {
 read_active_profile() {
   local payload
 
-  payload=$(timeout --kill-after=1s 2 pactl -f json list cards 2>/dev/null) || return 1
+  payload=$(run_pactl -f json list cards 2>/dev/null) || return 1
   jq -er --arg card "$card" '
     first(.[] | select(.name == $card) | .active_profile) // empty
   ' <<<"$payload"
@@ -197,7 +201,7 @@ restore_endpoint_mutes() {
   while IFS=$'\t' read -r endpoint_index endpoint_muted; do
     # Only unmuted endpoints were changed during preparation.
     [[ $endpoint_muted == false ]] || continue
-    timeout --kill-after=1s 2 pactl "set-${kind}-mute" "$endpoint_index" false \
+    run_pactl "set-${kind}-mute" "$endpoint_index" false \
       >/dev/null 2>&1 || failed=true
   done < <(jq -r '.[] | [.index, .mute] | @tsv' <<<"$states")
   [[ $failed == false ]]
@@ -228,7 +232,7 @@ restore_old_state() {
               | .index) // empty
           ' <<<"$current_sink_inputs") || current_input_index=
       if [[ -n $current_input_index ]]; then
-        timeout --kill-after=1s 2 pactl set-sink-input-mute \
+        run_pactl set-sink-input-mute \
           "$current_input_index" "${old_sink_input_mutes[$input]}" \
           >/dev/null 2>&1 || failed=true
       fi
@@ -293,10 +297,10 @@ restore_new_endpoint_states() {
       else
         volume_arguments=("${saved_volumes[0]}")
       fi
-      timeout --kill-after=1s 2 pactl "set-${kind}-volume" "$endpoint_index" \
+      run_pactl "set-${kind}-volume" "$endpoint_index" \
         "${volume_arguments[@]}" >/dev/null 2>&1 || return 1
       endpoint_muted=$(jq -r '.mute' <<<"$saved_state") || return 1
-      timeout --kill-after=1s 2 pactl "set-${kind}-mute" "$endpoint_index" "$endpoint_muted" \
+      run_pactl "set-${kind}-mute" "$endpoint_index" "$endpoint_muted" \
         >/dev/null 2>&1 || return 1
       continue
     fi
@@ -314,7 +318,7 @@ restore_new_endpoint_states() {
         then $initial.mute else empty end
     ' <<<"$first_states") || return 1
     if [[ $initial_mute == false ]]; then
-      timeout --kill-after=1s 2 pactl "set-${kind}-mute" "$endpoint_index" false \
+      run_pactl "set-${kind}-mute" "$endpoint_index" false \
         >/dev/null 2>&1 || return 1
     fi
   done
@@ -336,7 +340,7 @@ rollback_profile() {
   local -A muted_rollback_sinks=() muted_rollback_sources=()
 
   [[ -n $active_profile && $active_profile != "$profile" ]] || return 1
-  if ! timeout --kill-after=1s 2 pactl set-card-profile \
+  if ! run_pactl set-card-profile \
       "$card" "$active_profile" >/dev/null 2>&1; then
     # A timed-out client can still have delivered the request. If the card is
     # already back on the old profile, continue with endpoint restoration;
@@ -375,7 +379,7 @@ rollback_profile() {
       endpoint_key="${sink_index}:${sink_identity}"
       if [[ ! ${muted_rollback_sinks[$endpoint_key]+present} ]]; then
         if [[ $sink_muted == false ]]; then
-          timeout --kill-after=1s 2 pactl set-sink-mute "$sink_index" true >/dev/null 2>&1 \
+          run_pactl set-sink-mute "$sink_index" true >/dev/null 2>&1 \
             || return 1
         fi
         muted_rollback_sinks[$endpoint_key]=true
@@ -389,7 +393,7 @@ rollback_profile() {
       endpoint_key="${source_index}:${source_identity}"
       if [[ ! ${muted_rollback_sources[$endpoint_key]+present} ]]; then
         if [[ $source_muted == false ]]; then
-          timeout --kill-after=1s 2 pactl set-source-mute "$source_index" true >/dev/null 2>&1 \
+          run_pactl set-source-mute "$source_index" true >/dev/null 2>&1 \
             || return 1
         fi
         muted_rollback_sources[$endpoint_key]=true
@@ -476,7 +480,7 @@ trap cleanup_transition EXIT
 
 while IFS=$'\t' read -r sink_index sink_muted; do
   [[ $sink_muted == false ]] || continue
-  timeout --kill-after=1s 2 pactl set-sink-mute "$sink_index" true >/dev/null 2>&1 || {
+  run_pactl set-sink-mute "$sink_index" true >/dev/null 2>&1 || {
     echo "Could not mute the current audio output" >&2
     exit 1
   }
@@ -484,7 +488,7 @@ done < <(jq -r '.[] | [.index, .mute] | @tsv' <<<"$old_sink_states")
 
 while IFS=$'\t' read -r source_index source_muted; do
   [[ $source_muted == false ]] || continue
-  timeout --kill-after=1s 2 pactl set-source-mute "$source_index" true >/dev/null 2>&1 || {
+  run_pactl set-source-mute "$source_index" true >/dev/null 2>&1 || {
     echo "Could not mute the current audio input" >&2
     exit 1
   }
@@ -493,7 +497,7 @@ done < <(jq -r '.[] | [.index, .mute] | @tsv' <<<"$old_source_states")
 for (( input = 0; input < ${#old_sink_inputs[@]}; input++ )); do
   input_index=${old_sink_inputs[$input]}
   [[ ${old_sink_input_mutes[$input]} == false ]] || continue
-  timeout --kill-after=1s 2 pactl set-sink-input-mute "$input_index" true >/dev/null 2>&1 || {
+  run_pactl set-sink-input-mute "$input_index" true >/dev/null 2>&1 || {
     echo "Could not mute the current audio streams" >&2
     exit 1
   }
@@ -504,7 +508,7 @@ done
 # including a signal between this command and the next shell statement, enters
 # the rollback path.
 profile_changed=true
-timeout --kill-after=1s 2 pactl set-card-profile "$card" "$profile" || exit 1
+run_pactl set-card-profile "$card" "$profile" || exit 1
 
 new_sinks=()
 new_sources=()
@@ -563,7 +567,7 @@ for (( attempt = 0; attempt < 40; attempt++ )); do
     endpoint_key="${sink_index}:${sink_identity}"
     if [[ ! ${muted_new_sinks[$endpoint_key]+present} ]]; then
       if [[ $sink_muted == false ]]; then
-        if ! timeout --kill-after=1s 2 pactl set-sink-mute "$sink_index" true \
+        if ! run_pactl set-sink-mute "$sink_index" true \
             >/dev/null 2>&1; then
           transition_error="Could not mute the new audio output"
           break
@@ -585,7 +589,7 @@ for (( attempt = 0; attempt < 40; attempt++ )); do
     endpoint_key="${source_index}:${source_identity}"
     if [[ ! ${muted_new_sources[$endpoint_key]+present} ]]; then
       if [[ $source_muted == false ]]; then
-        if ! timeout --kill-after=1s 2 pactl set-source-mute "$source_index" true \
+        if ! run_pactl set-source-mute "$source_index" true \
             >/dev/null 2>&1; then
           transition_error="Could not mute the new audio input"
           break

@@ -239,8 +239,12 @@ case "$action" in
     ;;
   migrate-policies)
     (( $# == 1 )) || usage
+    if [[ ! -e $preferences_file ]]; then
+      exit 0
+    fi
     # Lock the shared document while taking the migration snapshot. Compatible
     # companion writers use the same lock path for their atomic replacements.
+    mkdir -p -- "$(dirname -- "$preferences_file")"
     exec 7>"${preferences_file}.lock"
     flock -w 5 7 || {
       echo "Timed out waiting to migrate Bluetooth audio policies" >&2

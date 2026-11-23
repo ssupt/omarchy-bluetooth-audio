@@ -352,6 +352,36 @@ connectionObservation = model.observeDeviceConnections(connectionObservation.sta
 assert.deepEqual(connectionObservation.connected, [{
   key: '001122334455', address: device.address
 }])
+// Dual-adapter same-MAC entries must aggregate connected=true instead of
+// letting a disconnected peer on another controller emit spurious reconnects.
+let dualObservation = model.observeDeviceConnections({}, [
+  { address: device.address, dbusPath: '/org/bluez/hci0/dev_00_11_22_33_44_55', connected: true },
+  { address: device.address, dbusPath: '/org/bluez/hci1/dev_00_11_22_33_44_55', connected: false }
+], false)
+assert.equal(dualObservation.states['001122334455'], true)
+assert.deepEqual(dualObservation.connected, [])
+dualObservation = model.observeDeviceConnections(dualObservation.states, [
+  { address: device.address, dbusPath: '/org/bluez/hci0/dev_00_11_22_33_44_55', connected: true },
+  { address: device.address, dbusPath: '/org/bluez/hci1/dev_00_11_22_33_44_55', connected: false }
+], true)
+assert.equal(dualObservation.states['001122334455'], true)
+assert.deepEqual(dualObservation.connected, [])
+
+const unbondedTrustedDevice = {
+  address: device.address, connected: false, paired: false, bonded: false, trusted: true
+}
+assert.equal(model.shouldPairAgainOnRetry(unbondedTrustedDevice, {
+  action: 'connect', message: 'Pairing timed out. Put the device in pairing mode and try again.'
+}), true)
+assert.equal(model.shouldPairAgainOnRetry(unbondedTrustedDevice, {
+  action: 'connect', message: 'Pairing was cancelled.'
+}), true)
+assert.equal(model.shouldPairAgainOnRetry(unbondedTrustedDevice, {
+  action: 'pair', message: 'The device is unavailable. Make sure it is nearby and in pairing mode.'
+}), true)
+assert.equal(model.shouldPairAgainOnRetry(unbondedTrustedDevice, {
+  action: 'connect', message: 'The device did not respond.'
+}), false)
 const sink = {
   id: 40,
   name: 'bluez_output.00_11_22_33_44_55.1',
@@ -932,6 +962,14 @@ OMARCHY_AUDIO_PREFERENCES_FILE="$sanitized_preferences" \
 jq -e '.bluetoothAudioPolicies == {"aabbccddeeff":"output"}' \
   "$migration_overrides" >/dev/null \
   || fail "legacy connect policies were not migrated to protected storage"
+# Clean installs with no existing preferences directory must migrate cleanly without failing.
+clean_migration_dir="$profile_runtime/fresh-omarchy-dir"
+OMARCHY_AUDIO_PREFERENCES_FILE="$clean_migration_dir/audio-preferences.json" \
+  OMARCHY_BLUETOOTH_AUDIO_POLICIES_FILE="$clean_migration_dir/bluetooth-audio-policies.json" \
+  "$ROOT/scripts/audio-preferences" migrate-policies \
+  || fail "migrate-policies failed on a missing preferences directory"
+[[ ! -e $clean_migration_dir ]] \
+  || fail "migrate-policies unexpectedly created directories when no preferences existed"
 echo "PASS: legacy connect policies migrate to protected storage"
 
 printf '%s\n' '{broken json' >"$corrupt_preferences"

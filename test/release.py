@@ -66,4 +66,9 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-release-test-") as temporary:
     after = release.checked_info(staged, built_binary)
     assert after["sourceId"] != before["sourceId"], (before, after)
 
+    # Prepared release metadata must stay world-readable (0644), not 0600.
+    release.prepare(staged, built_binary)
+    metadata_mode = (staged / release.METADATA).stat().st_mode & 0o777
+    assert metadata_mode == 0o644, oct(metadata_mode)
+
 print("PASS: release verification rejects changed sources and binary")

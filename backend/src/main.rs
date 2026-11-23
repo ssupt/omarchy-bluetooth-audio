@@ -3,15 +3,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{Mutex, Semaphore, mpsc, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, watch};
 
 const MAX_FRAME: usize = 65_536;
 const MAX_OUTPUT: usize = 131_072;
@@ -53,22 +56,47 @@ struct Service {
     scripts: PathBuf,
     active_action: Mutex<Option<(String, u32)>>,
     jobs: Mutex<HashMap<String, Job>>,
+    cancel_notify: Notify,
     shutdown: watch::Receiver<bool>,
 }
 
 struct ServiceLock(#[allow(dead_code)] File);
 
+fn is_writable_dir(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
 fn service_lock_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .filter(|path| path.is_dir())
+        .filter(|path| is_writable_dir(path))
+        .or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .filter(|path| is_writable_dir(path))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+                .filter(|path| is_writable_dir(path))
+        })
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     let uid = unsafe { libc::geteuid() };
     dir.join(format!("omarchy-bluetooth-service-{uid}.lock"))
 }
 
 async fn acquire_mutation_lock(
+    service: &Service,
+    request_id: &str,
     deadline: Duration,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<ServiceLock, Failure> {
@@ -78,11 +106,24 @@ async fn acquire_mutation_lock(
             "Bluetooth service is shutting down",
         ));
     }
+    if service
+        .jobs
+        .lock()
+        .await
+        .get(request_id)
+        .is_some_and(|job| job.cancelled)
+    {
+        return Err(Failure::rejected(
+            "cancelled",
+            "Queued Bluetooth command was cancelled",
+        ));
+    }
     let path = service_lock_path();
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
+        .mode(0o600)
         .open(&path)
         .map_err(|error| {
             Failure::rejected(
@@ -92,6 +133,26 @@ async fn acquire_mutation_lock(
         })?;
     let started = Instant::now();
     loop {
+        let notified = service.cancel_notify.notified();
+        tokio::pin!(notified);
+        if *shutdown.borrow() {
+            return Err(Failure::rejected(
+                "cancelled",
+                "Bluetooth service is shutting down",
+            ));
+        }
+        if service
+            .jobs
+            .lock()
+            .await
+            .get(request_id)
+            .is_some_and(|job| job.cancelled)
+        {
+            return Err(Failure::rejected(
+                "cancelled",
+                "Queued Bluetooth command was cancelled",
+            ));
+        }
         let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if locked == 0 {
             return Ok(ServiceLock(file));
@@ -118,6 +179,7 @@ async fn acquire_mutation_lock(
         }
         tokio::select! {
             _ = tokio::time::sleep(remaining.min(Duration::from_millis(25))) => {}
+            _ = &mut notified => {}
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Err(Failure::rejected(
@@ -132,6 +194,7 @@ async fn acquire_mutation_lock(
 
 struct Job {
     address: Option<String>,
+    is_device_action: bool,
     admitted: Instant,
     deadline: Duration,
     running: bool,
@@ -176,7 +239,7 @@ fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 160 && !value.chars().any(char::is_control)
 }
 
-fn device_path(value: &str, device: &str) -> bool {
+fn valid_device_path(value: &str) -> bool {
     let Some((adapter, suffix)) = value
         .strip_prefix("/org/bluez/hci")
         .and_then(|path| path.split_once("/dev_"))
@@ -186,7 +249,21 @@ fn device_path(value: &str, device: &str) -> bool {
     !adapter.is_empty()
         && adapter.len() <= 10
         && adapter.bytes().all(|byte| byte.is_ascii_digit())
-        && suffix.eq_ignore_ascii_case(&device.replace(':', "_"))
+        && suffix.len() == 17
+        && suffix.as_bytes().iter().enumerate().all(|(index, byte)| {
+            if index % 3 == 2 {
+                *byte == b'_'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn device_path(value: &str, device: &str) -> bool {
+    let Some((_, suffix)) = value.split_once("/dev_") else {
+        return false;
+    };
+    valid_device_path(value) && suffix.eq_ignore_ascii_case(&device.replace(':', "_"))
 }
 
 async fn read_frame<R: AsyncBufRead + Unpin>(
@@ -236,6 +313,7 @@ impl Service {
         let path = self.scripts.join(name);
         let mut child = Command::new(&path)
             .args(args)
+            .process_group(0)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -265,13 +343,22 @@ impl Service {
         let mut output = Vec::new();
         let mut errors = Vec::new();
         let mut wait = Box::pin(async {
-            let mut limited_stdout = stdout.take((MAX_OUTPUT + 1) as u64);
-            let mut limited_stderr = stderr.take((MAX_FRAME + 1) as u64);
-            let (out, err, status) = tokio::join!(
-                limited_stdout.read_to_end(&mut output),
-                limited_stderr.read_to_end(&mut errors),
-                child.wait()
-            );
+            // Drop each pipe handle as soon as the cap is reached so a noisy
+            // child gets EPIPE immediately instead of blocking on write until
+            // the deadline expires.
+            let out_fut = async {
+                let mut limited = stdout.take((MAX_OUTPUT + 1) as u64);
+                let result = limited.read_to_end(&mut output).await;
+                drop(limited);
+                result
+            };
+            let err_fut = async {
+                let mut limited = stderr.take((MAX_FRAME + 1) as u64);
+                let result = limited.read_to_end(&mut errors).await;
+                drop(limited);
+                result
+            };
+            let (out, err, status) = tokio::join!(out_fut, err_fut, child.wait());
             out?;
             err?;
             status
@@ -288,6 +375,7 @@ impl Service {
             },
             _ = shutdown.wait_for(|shutting_down| *shutting_down) => WaitOutcome::Shutdown,
         };
+        let timed_out = matches!(outcome, WaitOutcome::TimedOut);
         let result = match outcome {
             WaitOutcome::Completed(result) => result,
             WaitOutcome::TimedOut => {
@@ -300,13 +388,18 @@ impl Service {
                     Ok(result) => result,
                     Err(_) => {
                         unsafe {
+                            libc::kill(-(pid as i32), libc::SIGKILL);
                             libc::kill(pid as i32, libc::SIGKILL);
                         }
                         let _ = tokio::time::timeout(Duration::from_secs(2), &mut wait).await;
                         if action.is_some() {
                             *self.active_action.lock().await = None;
                         }
-                        return Err(Failure::unknown(format!("{name} timed out")));
+                        return Err(Failure {
+                            code: "timeout",
+                            message: format!("{name} timed out"),
+                            outcome: "unknown",
+                        });
                     }
                 }
             }
@@ -321,6 +414,7 @@ impl Service {
                     .is_err()
                 {
                     unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
                         libc::kill(pid as i32, libc::SIGKILL);
                     }
                     let _ = tokio::time::timeout(Duration::from_secs(2), &mut wait).await;
@@ -348,6 +442,17 @@ impl Service {
         }
         if !status.success() {
             let message = String::from_utf8_lossy(&errors).trim().to_owned();
+            if timed_out {
+                return Err(Failure {
+                    code: "timeout",
+                    message: if message.is_empty() {
+                        format!("{name} timed out")
+                    } else {
+                        message
+                    },
+                    outcome: "unknown",
+                });
+            }
             if status.code() == Some(2) && name == "bluetooth-audio-profile-set" {
                 return Ok(json!({"outcome":"persistence_failed", "message":message}));
             }
@@ -470,7 +575,8 @@ impl Service {
                 let target = jobs
                     .iter()
                     .filter(|(id, job)| {
-                        requested_id.is_none_or(|wanted| *id == wanted)
+                        job.is_device_action
+                            && requested_id.is_none_or(|wanted| *id == wanted)
                             && job
                                 .address
                                 .as_deref()
@@ -481,7 +587,10 @@ impl Service {
                 if let Some(target) = target {
                     let job = jobs.get_mut(&target).expect("selected job");
                     job.cancelled = true;
-                    if job.running {
+                    let running = job.running;
+                    drop(jobs);
+                    self.cancel_notify.notify_waiters();
+                    if running {
                         let active = self.active_action.lock().await;
                         if let Some((address, pid)) = active.as_ref() {
                             if address.eq_ignore_ascii_case(device) {
@@ -500,8 +609,7 @@ impl Service {
                 let path = string(&request.params, "path")?;
                 let value = string(&request.params, "value")?;
                 if !["name", "trusted", "blocked", "wakeAllowed"].contains(&property)
-                    || !path.starts_with("/org/bluez/hci")
-                    || path.len() > 100
+                    || !valid_device_path(path)
                     || (property == "name" && value.len() > 160)
                     || (property != "name" && value != "true" && value != "false")
                     || value.chars().any(char::is_control)
@@ -592,6 +700,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scripts,
         active_action: Mutex::new(None),
         jobs: Mutex::new(HashMap::new()),
+        cancel_notify: Notify::new(),
         shutdown: shutdown_rx,
     });
     let (tx, mut rx) = mpsc::channel::<Value>(32);
@@ -606,31 +715,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let remaining = {
-                let mut jobs = worker_service.jobs.lock().await;
-                let job = jobs.get_mut(&request.id).expect("admitted mutation");
+                let jobs = worker_service.jobs.lock().await;
+                let job = jobs.get(&request.id).expect("admitted mutation");
                 if job.cancelled {
                     None
                 } else {
                     let left = job.deadline.saturating_sub(job.admitted.elapsed());
-                    if left.is_zero() {
-                        None
-                    } else {
-                        job.running = true;
-                        Some(left)
-                    }
+                    (!left.is_zero()).then_some(left)
                 }
             };
             let result = if let Some(remaining) = remaining {
-                match acquire_mutation_lock(remaining, &mut shutdown).await {
+                match acquire_mutation_lock(&worker_service, &request.id, remaining, &mut shutdown)
+                    .await
+                {
                     Ok(_lock) => {
                         let left = {
-                            let jobs = worker_service.jobs.lock().await;
-                            jobs.get(&request.id).and_then(|job| {
+                            let mut jobs = worker_service.jobs.lock().await;
+                            jobs.get_mut(&request.id).and_then(|job| {
                                 if job.cancelled {
                                     None
                                 } else {
                                     let left = job.deadline.saturating_sub(job.admitted.elapsed());
-                                    (!left.is_zero()).then_some(left)
+                                    if left.is_zero() {
+                                        None
+                                    } else {
+                                        job.running = true;
+                                        Some(left)
+                                    }
                                 }
                             })
                         };
@@ -668,6 +779,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             worker_service.jobs.lock().await.remove(&request.id);
+            if *shutdown.borrow() {
+                continue;
+            }
             if worker_replies.send(reply(&request, result)).await.is_err() {
                 break;
             }
@@ -741,6 +855,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .get("address")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
+                    is_device_action: request.method == "device.action",
                     admitted: Instant::now(),
                     deadline,
                     running: false,
@@ -795,6 +910,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 job.cancelled = true;
             }
         }
+        service.cancel_notify.notify_waiters();
         let _ = shutdown_tx.send(true);
     }
     drop(mutation_tx);
@@ -803,7 +919,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = cancel_permits.acquire_many(4).await;
     drop(tx);
     if signaled_shutdown {
-        let _ = writer.await;
+        let _ = tokio::time::timeout(Duration::from_millis(250), writer).await;
         // All helpers are reaped and locks released. Exit directly so Tokio's
         // blocking stdin thread cannot hold the process open if the parent has
         // not closed stdin yet.
@@ -816,6 +932,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
     #[test]
     fn address_checks_shape() {
         assert!(address("00:11:22:aa:BB:cc"));
@@ -824,6 +942,9 @@ mod tests {
     }
     #[test]
     fn device_path_preserves_controller_and_matches_address() {
+        assert!(valid_device_path("/org/bluez/hci0/dev_00_11_22_AA_BB_CC"));
+        assert!(!valid_device_path("/org/bluez/hci0/dev_00_11_22_AA_BB_GG"));
+        assert!(!valid_device_path("/org/bluez/hci0/other"));
         assert!(device_path(
             "/org/bluez/hci12/dev_00_11_22_AA_BB_CC",
             "00:11:22:aa:bb:cc"
@@ -835,5 +956,61 @@ mod tests {
         ] {
             assert!(!device_path(path, "00:11:22:aa:bb:cc"));
         }
+    }
+
+    #[tokio::test]
+    async fn timeout_is_never_misreported_as_cancelled() {
+        let dir =
+            std::env::temp_dir().join(format!("omarchy-bt-timeout-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write_script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        };
+        write_script(
+            "bluetooth-device-action",
+            "#!/bin/bash\nchild=\ntrap 'if [[ -n $child ]]; then kill \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; fi; exit 130' TERM\nsleep 10 &\nchild=$!\nwait \"$child\"\n",
+        );
+        write_script(
+            "bluetooth-audio-profile-set",
+            "#!/bin/bash\nchild=\ntrap 'if [[ -n $child ]]; then kill \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; fi; exit 130' TERM\nsleep 10 &\nchild=$!\nwait \"$child\"\n",
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let service = Service {
+            scripts: dir.clone(),
+            active_action: Mutex::new(None),
+            jobs: Mutex::new(HashMap::new()),
+            cancel_notify: Notify::new(),
+            shutdown: shutdown_rx,
+        };
+        let action_err = service
+            .script(
+                "bluetooth-device-action",
+                &["connect", "00:11:22:33:44:55", ""],
+                Duration::from_millis(120),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(action_err.code, "timeout");
+        assert_eq!(action_err.outcome, "unknown");
+
+        let profile_err = service
+            .script(
+                "bluetooth-audio-profile-set",
+                &["00:11:22:33:44:55", "headset"],
+                Duration::from_millis(120),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(profile_err.code, "timeout");
+        assert_eq!(profile_err.outcome, "unknown");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

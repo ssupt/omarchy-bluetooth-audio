@@ -240,6 +240,13 @@ Item {
     return String(address || "").toLowerCase().replace(/[:_-]/g, "")
   }
 
+  function sameActionTarget(operation, address, devicePath) {
+    if (!operation || actionKey(operation.address) !== actionKey(address)) return false
+    var opPath = String(operation.path || "")
+    var targetPath = String(devicePath || "")
+    return opPath === "" || targetPath === "" || opPath === targetPath
+  }
+
   function isConnectionAction(action) {
     return action === "pair" || action === "connect"
   }
@@ -251,16 +258,15 @@ Item {
       if (Object.keys(deviceActions).length > 0) return false
       return startDeviceAction(action, address, "connecting", devicePath)
     }
-    var key = actionKey(address)
-    if ((queuedConnection && actionKey(queuedConnection.address) === key)
-        || (!active.cancelled && actionKey(active.address) === key)) {
+    if (sameActionTarget(queuedConnection, address, devicePath)
+        || (!active.cancelled && sameActionTarget(active, address, devicePath))) {
       queuedConnection = null
     } else {
       queuedConnection = {
         action: action, address: String(address), path: String(devicePath || "")
       }
     }
-    cancelDeviceAction(active.address, true)
+    cancelDeviceAction(active.address, true, active.path)
     return true
   }
 
@@ -385,12 +391,12 @@ Item {
     if (!cancellationFailed) flushQueuedConnection()
   }
 
-  function cancelDeviceAction(address, keepQueued) {
+  function cancelDeviceAction(address, keepQueued, devicePath) {
     var key = actionKey(address)
-    var queued = queuedConnection && actionKey(queuedConnection.address) === key
+    var queued = sameActionTarget(queuedConnection, address, devicePath)
     if (queued && !keepQueued) queuedConnection = null
     var operation = deviceActions[key]
-    if (!operation) return !!queued
+    if (!operation || !sameActionTarget(operation, address, devicePath)) return !!queued
     if (!isConnectionAction(operation.action)) return false
     if (operation.cancelled) return true
     var next = Object.assign({}, deviceActions)
@@ -485,12 +491,21 @@ Item {
     })
   }
 
+  function invokeCallback(callback, result, failure) {
+    if (!callback) return
+    try {
+      callback(result, failure)
+    } catch (err) {
+      console.warn("Bluetooth service callback failed:", err)
+    }
+  }
+
   function failPending(message) {
     var current = pending
     pending = ({})
     for (var key in current) {
       var item = current[key]
-      if (item.callback) item.callback(null, {
+      invokeCallback(item.callback, null, {
         code: "disconnected", message: message, outcome: "unknown"
       })
     }
@@ -512,13 +527,13 @@ Item {
 
   function request(method, params, callback) {
     if (!backend.running || (!ready && method !== "hello")) {
-      if (callback) callback(null, {
+      invokeCallback(callback, null, {
         code: "not_ready", message: "Bluetooth service is unavailable", outcome: "rejected"
       })
       return ""
     }
     if (Object.keys(pending).length >= 32 && method !== "device.cancel") {
-      if (callback) callback(null, {
+      invokeCallback(callback, null, {
         code: "busy", message: "Too many Bluetooth commands are pending", outcome: "rejected"
       })
       return ""
@@ -573,7 +588,7 @@ Item {
       var next = ({})
       for (var key in pending) if (key !== reply.id) next[key] = pending[key]
       pending = next
-      if (item.callback) item.callback(reply.result || null, reply.error || null)
+      invokeCallback(item.callback, reply.result || null, reply.error || null)
       end = buffer.indexOf("\n")
     }
     if (buffer.length > 1048576) {
@@ -601,7 +616,7 @@ Item {
     pending = next
     expired = retired
     for (var i = 0; i < timedOut.length; i++) {
-      if (timedOut[i].callback) timedOut[i].callback(null, {
+      invokeCallback(timedOut[i].callback, null, {
         code: "timeout", message: "Bluetooth command outcome is unknown", outcome: "unknown"
       })
     }

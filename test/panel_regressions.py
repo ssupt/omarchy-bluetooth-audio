@@ -170,7 +170,8 @@ ShellRoot {
     if (!harness.check(root.forgottenPaths.length === 1,
         "Expired confirmation still forgot hci0")) return
 
-    // Trusted without bond after auth failure -> Retry chooses pair.
+    // Trusted without bond after auth failure -> Retry chooses pair,
+    // and if that pair attempt fails, subsequent Retry still chooses pair.
     root.failures = {
       "aabbccddeeff": {
         action: "connect",
@@ -182,6 +183,15 @@ ShellRoot {
     root.retryDeviceAction(unbondedTrusted)
     if (!harness.check(root.actionCalls.length === 1 && root.actionCalls[0].action === "pair",
         "Retry did not choose pair: " + JSON.stringify(root.actionCalls))) return
+    root.failures = {
+      "aabbccddeeff": {
+        action: "pair",
+        message: "Pairing timed out. Put the device in pairing mode and try again."
+      }
+    }
+    root.retryDeviceAction(unbondedTrusted)
+    if (!harness.check(root.actionCalls.length === 2 && root.actionCalls[1].action === "pair",
+        "Retry after failed pair reverted to connect: " + JSON.stringify(root.actionCalls))) return
 
     console.info("PASS: adapter identity and pair-again retry")
     Qt.quit()
@@ -397,6 +407,10 @@ prop_timer_block = panel_block(
     r"^  Timer \{\n    id: devicePropertyConfirmTimer\n.*?^  \}",
     "devicePropertyConfirmTimer",
 )
+active_busy_block = panel_block(
+    r"^  readonly property bool activePolicyProfileSwitchBusy:.*?profileSwitchBusy\)",
+    "activePolicyProfileSwitchBusy",
+)
 
 recovery_and_property_qml = r'''
 import QtQuick
@@ -454,6 +468,7 @@ ShellRoot {
     property var bluetoothService: fakeService
     readonly property var policyEngine: bluetoothService && bluetoothService.ready
       ? bluetoothService.policyEngine : localPolicyEngine
+    __ACTIVE_BUSY__
     property bool audioPreferencesReady: true
     property var audioPreferences: ({
       bluetoothProfiles: {},
@@ -502,6 +517,8 @@ ShellRoot {
     if (!harness.check(started && localPolicyEngine.profileSwitchBusy,
         "Fallback profile switch did not start")) return
     fakeService.ready = true
+    if (!harness.check(root.activePolicyProfileSwitchBusy,
+        "Service recovery dropped profile-switch busy guard while fallback helper was running")) return
     harness.stage = 1
   })
 
@@ -513,7 +530,7 @@ ShellRoot {
       if (harness.stage === 1 && !policyProfileSwitchProc.running) {
         // Switching back to fallback must NOT expose a stuck busy flag.
         fakeService.ready = false
-        if (!harness.check(!localPolicyEngine.profileSwitchBusy,
+        if (!harness.check(!localPolicyEngine.profileSwitchBusy && !root.activePolicyProfileSwitchBusy,
             "Service recovery left localPolicyEngine.profileSwitchBusy stuck true")) return
 
         // Early BlueZ update clears Trust edit, Block edit starts,
@@ -558,7 +575,8 @@ ShellRoot {
   }
   Timer { interval: 6000; running: true; onTriggered: Qt.exit(1) }
 }
-'''.replace("__LOCAL_ENGINE__", local_engine_block) \
+'''.replace("__ACTIVE_BUSY__", active_busy_block) \
+   .replace("__LOCAL_ENGINE__", local_engine_block) \
    .replace("__POLICY_PROC__", policy_proc_block) \
    .replace("__PROP_TIMER__", prop_timer_block) \
    .replace("__METHODS__", "\n".join(panel_method(m) for m in (
@@ -567,6 +585,147 @@ ShellRoot {
        "sameDetailsTarget", "updateDeviceBoolean", "confirmDeviceProperty",
        "confirmDevicePropertyIfReached",
    )))
+
+
+# 5. Service callback isolation, dual-adapter sync/replacement, fallback cancel_failed, and policy override safety
+audit_hardening_qml = r'''
+import QtQuick
+import Quickshell
+import "Model.js" as Model
+
+ShellRoot {
+  id: harness
+  function check(ok, msg) {
+    if (ok) return true
+    console.error(msg)
+    Qt.exit(1)
+    return false
+  }
+
+  QtObject {
+    id: devHci0
+    property string address: "00:11:22:33:44:55"
+    property string dbusPath: "/org/bluez/hci0/dev_00_11_22_33_44_55"
+    property bool connected: false
+    property bool paired: true
+    property bool bonded: true
+    property bool trusted: true
+    property bool blocked: false
+  }
+  QtObject {
+    id: devHci1
+    property string address: "00:11:22:33:44:55"
+    property string dbusPath: "/org/bluez/hci1/dev_00_11_22_33_44_55"
+    property bool connected: false
+    property bool paired: true
+    property bool bonded: true
+    property bool trusted: true
+    property bool blocked: false
+  }
+
+  Item {
+    id: root
+    property var bar: null
+    property var bluetoothService: null
+    property var devices: [devHci0, devHci1]
+    property var pendingActions: ({})
+    property var pendingActionKinds: ({})
+    property var pendingActionPaths: ({})
+    property var pendingActionDeadlines: ({})
+    readonly property int pendingActionTimeoutMs: 20000
+    property var deviceActionFailures: ({})
+    property var activeDeviceAction: null
+    property bool deviceActionCancelRequested: false
+    property var audioPolicyOverrides: ({})
+    property bool hasValidAudioPolicyOverrides: false
+    property bool audioPolicyOverridesReady: false
+    property string audioPolicyPreferencesError: "Could not read Bluetooth audio policies"
+    function cloneMap(v) { return Model.cloneMap(v) }
+    __METHODS__
+  }
+
+  Service {
+    id: service
+    Component.onCompleted: {
+      // Stop backend launch so we can directly unit-test consume/failPending/chooseDeviceConnection.
+    }
+  }
+
+  Component.onCompleted: Qt.callLater(function() {
+    // 1. Throwing callback in Service.consume must not drop subsequent replies in the same chunk.
+    var secondDelivered = false
+    service.pending = {
+      "req-1": { callback: function() { throw new Error("destroyed panel") }, started: Date.now(), method: "profile.list" },
+      "req-2": { callback: function(res) { secondDelivered = !!(res && res.ok) }, started: Date.now(), method: "health" }
+    }
+    service.consume(
+      '{"version":1,"id":"req-1","result":{}}\n'
+      + '{"version":1,"id":"req-2","result":{"ok":true}}\n'
+    )
+    if (!harness.check(secondDelivered && Object.keys(service.pending).length === 0,
+        "Throwing callback aborted Service.consume before processing later reply")) return
+
+    // 2. Throwing callback in Service.failPending must not strand later pending callbacks.
+    var secondFailed = false
+    service.pending = {
+      "req-3": { callback: function() { throw new Error("destroyed panel") }, started: Date.now(), method: "policy.set" },
+      "req-4": { callback: function(_res, err) { secondFailed = !!(err && err.code === "disconnected") }, started: Date.now(), method: "device.action" }
+    }
+    service.failPending("disconnected")
+    if (!harness.check(secondFailed && Object.keys(service.pending).length === 0,
+        "Throwing callback aborted Service.failPending")) return
+
+    // 3. Dual-adapter same-MAC syncPendingActions and row failure isolation.
+    root.setPendingAction(devHci1.address, "forgetting", "forget", devHci1.dbusPath)
+    if (!harness.check(root.pendingAction(devHci1.address, devHci1.dbusPath) === "forgetting"
+        && root.pendingAction(devHci0.address, devHci0.dbusPath) === "",
+        "Pending action bled across adapters")) return
+    // Remove hci1 while hci0 stays paired: hci1's forget must settle immediately.
+    root.devices = [devHci0]
+    root.syncPendingActions()
+    if (!harness.check(root.pendingAction(devHci1.address, devHci1.dbusPath) === "",
+        "Forgetting hci1 stayed pending because hci0 remained paired")) return
+
+    // 4. Fallback cancel_failed error must survive syncPendingActions even when device is disconnected.
+    root.setDeviceActionFailure(devHci0.address, "disconnect",
+      "Could not confirm that the cancelled Bluetooth connection stopped",
+      devHci0.dbusPath, true)
+    root.syncPendingActions()
+    var retained = root.deviceActionFailure(devHci0.address, devHci0.dbusPath)
+    if (!harness.check(retained && retained.cancellationFailed && retained.message !== "",
+        "Fallback cancel_failed error was wiped by syncPendingActions")) return
+    if (!harness.check(root.deviceActionFailure(devHci1.address, devHci1.dbusPath) === null,
+        "hci0 failure bled onto hci1")) return
+
+    // 5. applyAudioPolicyOverride must not mark overrides ready when no valid snapshot was loaded yet.
+    root.applyAudioPolicyOverride(devHci0.address, "output")
+    if (!harness.check(!root.audioPolicyOverridesReady && !root.hasValidAudioPolicyOverrides,
+        "applyAudioPolicyOverride prematurely marked unloaded policy file ready")) return
+
+    // 6. Dual-adapter chooseDeviceConnection must queue hci1 when hci0 is actively connecting.
+    service.deviceActions = {
+      "001122334455": {
+        action: "connect", address: devHci0.address, path: devHci0.dbusPath,
+        pending: "connecting", cancelled: false, requestId: "qml-1"
+      }
+    }
+    service.queuedConnection = null
+    service.chooseDeviceConnection("connect", devHci1.address, devHci1.dbusPath)
+    if (!harness.check(service.queuedConnection
+        && service.queuedConnection.path === devHci1.dbusPath,
+        "Clicking hci1 did not queue replacement for active hci0 connection")) return
+
+    console.info("PASS: service callback isolation, dual-adapter actions, and policy safety")
+    Qt.quit()
+  })
+  Timer { interval: 5000; running: true; onTriggered: Qt.exit(1) }
+}
+'''.replace("__METHODS__", "\n".join(panel_method(m) for m in (
+    "deviceByPath", "deviceByAddress", "deviceByIdentity",
+    "pendingAction", "adoptPendingAction", "setPendingAction",
+    "deviceActionFailure", "adoptDeviceActionFailure", "setDeviceActionFailure",
+    "syncPendingActions", "applyAudioPolicyOverride",
+)))
 
 
 def run_quickshell(work, qml_text, expected, env_extra=None):
@@ -657,3 +816,11 @@ exit 0
     qml12 = recovery_and_property_qml.replace("__SCRIPTS__", str(scripts4))
     run_quickshell(work4, qml12,
                    "PASS: fallback profile switch clears busy and late property replies are ignored")
+
+    # Case 5: Audit hardening regressions
+    work5 = base / "audit-hardening"
+    work5.mkdir()
+    for name in ("Service.qml", "BluetoothAudioPolicyEngine.qml", "Model.js"):
+        shutil.copy2(ROOT / name, work5 / name)
+    run_quickshell(work5, audit_hardening_qml,
+                   "PASS: service callback isolation, dual-adapter actions, and policy safety")

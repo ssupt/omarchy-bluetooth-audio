@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the standalone Rust command boundary without Bluetooth hardware."""
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -112,12 +113,28 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-service-test-") as temporary:
         assert "policy" not in log.read_text().splitlines(), log.read_text()
         send(process, 7, "device.action", action="connect", address="not-an-address")
         assert receive(process)["error"]["code"] == "invalid_params"
+        for bad_prop_path in ("/org/bluez/hci0/not-a-device",
+                              "/org/bluez/hci0/dev_ZZ_11_22_33_44_55",
+                              "/org/bluez/hci0/dev_00_11_22_33_44_55\n"):
+            send(process, "bad-prop-path", "device.property", property="trusted",
+                 path=bad_prop_path, value="true")
+            assert receive(process)["error"]["code"] == "invalid_params"
         send(process, 70, "device.cancel", address="00:11:22:33:44:55", requestId=7)
         assert receive(process)["error"]["code"] == "invalid_params"
+        # device.cancel must only match device.action jobs, never policy.set or profile.set.
+        send(process, 71, "device.action", action="connect", address="00:11:22:33:44:55")
+        send(process, 72, "policy.set", address="55:66:77:88:99:AA", policy="output")
+        send(process, 73, "device.cancel", address="55:66:77:88:99:AA")
+        non_action_cancel = {reply["id"]: reply for reply in (receive(process), receive(process), receive(process))}
+        assert non_action_cancel["73"]["result"]["outcome"] == "already_finished", non_action_cancel
+        assert non_action_cancel["72"]["result"]["outcome"] == "applied", non_action_cancel
+        # Oversized stdout beyond pipe buffer must fail promptly without waiting for deadline.
         inventory = root / "scripts/bluetooth-audio-profiles"
-        inventory.write_text("#!/bin/sh\nhead -c 140000 /dev/zero\n")
+        inventory.write_text("#!/bin/sh\nhead -c 300000 /dev/zero\n")
+        oversize_started = time.monotonic()
         send(process, 8, "profile.list")
         assert receive(process)["error"]["code"] == "too_large"
+        assert time.monotonic() - oversize_started < 2.0, "Oversized stdout stalled until deadline"
         process.stdin.close()
         assert process.wait(timeout=5) == 0, process.stderr.read()
 
@@ -190,5 +207,26 @@ printf 'end:%s\\n' "$1" >> "$BT_SHUTDOWN_LOG"
         assert first_backend.wait(timeout=5) == 0
     events = shutdown_log.read_text().splitlines()
     assert events == ["start:connect", "cleanup:connect", "start:disconnect", "end:disconnect"], events
+
+    # device.cancel must immediately interrupt a mutation waiting on the cross-process lock.
+    lock_file = root / f"omarchy-bluetooth-service-{os.geteuid()}.lock"
+    with lock_file.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with subprocess.Popen([root / "bin/omarchy-bluetooth-service", "--stdio"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, env=shutdown_env) as blocked:
+                send(blocked, 1, "device.action", action="connect", address="00:11:22:33:44:55")
+                time.sleep(0.05)
+                cancel_started = time.monotonic()
+                send(blocked, 2, "device.cancel", address="00:11:22:33:44:55", requestId="1")
+                lock_replies = {reply["id"]: reply for reply in (receive(blocked), receive(blocked))}
+                assert time.monotonic() - cancel_started < 2.0, "Cancel waited for cross-process lock"
+                assert lock_replies["2"]["result"]["outcome"] == "cancel_requested", lock_replies
+                assert lock_replies["1"]["error"]["code"] == "cancelled", lock_replies
+                blocked.stdin.close()
+                assert blocked.wait(timeout=5) == 0
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 print("PASS: Rust command service protocol, bounds, and serialization")

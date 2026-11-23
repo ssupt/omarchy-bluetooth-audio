@@ -95,6 +95,7 @@ def prepare(root: Path, binary: Path) -> None:
         json.dump(metadata, staged, sort_keys=True, indent=2)
         staged.write("\n")
     try:
+        staged_path.chmod(0o644)
         os.replace(staged_path, root / METADATA)
     finally:
         staged_path.unlink(missing_ok=True)
