@@ -47,17 +47,33 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-device-actions-") as temporar
         f"call org.bluez {DEVICE} org.bluez.Device1 Connect",
     ], calls
 
-    # Pairing without a saved bond must not enable Trust.
+    # Pairing without a saved bond must not enable Trust, even if Paired=true.
     result, calls = run("pair", BLUETOOTH_ACTION_BUS_BONDED="false",
-                        BLUETOOTH_ACTION_BUS_PAIRED="false")
-    assert result.returncode == 0, result.stderr
-    assert not any(" Trusted " in call for call in calls), calls
-
-    # Older BlueZ without Bonded falls back to Paired.
-    result, calls = run("pair", BLUETOOTH_ACTION_BUS_BONDED="missing",
                         BLUETOOTH_ACTION_BUS_PAIRED="true")
     assert result.returncode == 0, result.stderr
-    assert any(" Trusted b true" in call for call in calls), calls
+    assert not any(" Paired" in call or " Trusted " in call for call in calls), calls
+
+    # A timeout or D-Bus error reading Bonded must not fall back to Paired=true
+    # and grant Trust without positive bond evidence.
+    for bonded_mode in ("timeout", "error"):
+        result, calls = run("pair", BLUETOOTH_ACTION_BUS_BONDED=bonded_mode,
+                            BLUETOOTH_ACTION_BUS_PAIRED="true")
+        assert result.returncode == 0, (bonded_mode, result.stderr)
+        assert not any(" Paired" in call or " Trusted " in call for call in calls), (bonded_mode, calls)
+
+    # Older BlueZ without Device1.Bonded falls back to Paired only when BlueZ
+    # reports that the Bonded property does not exist.
+    for missing_mode in ("missing", "no_such_property"):
+        result, calls = run("pair", BLUETOOTH_ACTION_BUS_BONDED=missing_mode,
+                            BLUETOOTH_ACTION_BUS_PAIRED="true")
+        assert result.returncode == 0, (missing_mode, result.stderr)
+        assert any(" Paired" in call for call in calls), (missing_mode, calls)
+        assert any(" Trusted b true" in call for call in calls), (missing_mode, calls)
+    result, calls = run("pair", BLUETOOTH_ACTION_BUS_BONDED="no_such_property",
+                        BLUETOOTH_ACTION_BUS_PAIRED="false")
+    assert result.returncode == 0, result.stderr
+    assert any(" Paired" in call for call in calls), calls
+    assert not any(" Trusted " in call for call in calls), calls
     result, calls = run("connect", BLUETOOTH_ACTION_BUS_BLOCKED="true")
     assert result.returncode != 0 and "blocked" in result.stderr, (result, calls)
     assert not any(" call " in " " + call + " " for call in calls), calls

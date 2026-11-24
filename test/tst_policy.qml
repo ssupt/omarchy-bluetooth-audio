@@ -498,6 +498,63 @@ TestCase {
     verify(engine.profileSwitchBusy)
   }
 
+  function test_quickReconnectBeforeNextTickRearmsMicrophonePolicy() {
+    mockController.audioPreferences = {
+      bluetoothProfiles: {},
+      bluetoothAudioPolicies: { "001122334455": "output-mic" }
+    }
+    engine.initializeDevices([{ address: "00:11:22:33:44:55", connected: false }])
+    engine.observeDevices([mockController.device])
+    mockController.profileState = outputOnlyState()
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+
+    // Advance partway, record a manual playback-only override, then disconnect
+    // and reconnect BEFORE the next applyPending() tick runs.
+    for (var i = 0; i < 4; i++) engine.applyPending()
+    verify(!engine.profileSwitchBusy)
+    mockController.profileState.activeProfile = "a2dp-sink-sbc"
+    engine.noteManualProfileSelection("00:11:22:33:44:55")
+    verify(engine.pendingApplications["001122334455"].manualProfileOverride === true)
+
+    engine.observeDevices([{ address: "00:11:22:33:44:55", connected: false }])
+    verify(engine.pendingApplications["001122334455"] === undefined)
+    engine.observeDevices([mockController.device])
+    verify(engine.pendingApplications["001122334455"] !== undefined)
+    verify(!engine.pendingApplications["001122334455"].manualProfileOverride)
+
+    advanceToProfileSwitch()
+    verify(engine.profileSwitchBusy)
+  }
+
+  function test_staleDefaultCallbackFromPreviousConnectionIsIgnored() {
+    mockController.audioPreferences = {
+      bluetoothProfiles: {},
+      bluetoothAudioPolicies: { "001122334455": "output" }
+    }
+    mockController.autoCompleteDefaults = false
+    engine.initializeDevices([{ address: "00:11:22:33:44:55", connected: false }])
+    engine.observeDevices([mockController.device])
+    mockController.sinkNode = { id: 1, name: "bluez_output.test" }
+
+    engine.applyPending()
+    var staleCallback = mockController.sinkCallback
+    verify(staleCallback !== null)
+
+    // Quick disconnect + reconnect before the old default callback settles.
+    engine.observeDevices([{ address: "00:11:22:33:44:55", connected: false }])
+    engine.observeDevices([mockController.device])
+    engine.applyPending()
+    compare(mockController.sinkCalls, 2)
+
+    // Late unknown failure from the previous connection must not poison the new one.
+    staleCallback(null, {
+      code: "timeout", outcome: "unknown", message: "Stale timeout"
+    })
+    verify(engine.pendingApplications["001122334455"] !== undefined)
+    compare(engine.defaultError, "")
+    verify(!engine.terminalOutcomes["001122334455"])
+  }
+
   function test_unreadyPreferencesSuspendPendingPolicy() {
     queue("output")
     mockController.sinkNode = { id: 1, name: "bluez_output.test" }

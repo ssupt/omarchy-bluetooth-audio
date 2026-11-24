@@ -6,11 +6,27 @@ if [[ -n ${BLUETOOTH_ACTION_LOG:-} ]]; then
     get-property:Powered) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_POWERED:-true}" ;;
     get-property:Blocked) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_BLOCKED:-false}" ;;
     get-property:Bonded)
-      if [[ ${BLUETOOTH_ACTION_BUS_BONDED:-true} == missing ]]; then
-        echo "Call failed: org.freedesktop.DBus.Error.UnknownProperty" >&2
-        exit 1
-      fi
-      printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_BONDED:-true}"
+      case "${BLUETOOTH_ACTION_BUS_BONDED:-true}" in
+        missing)
+          echo "Call failed: org.freedesktop.DBus.Error.UnknownProperty" >&2
+          exit 1
+          ;;
+        no_such_property)
+          echo "Failed to get property Bonded on interface org.bluez.Device1: No such property 'Bonded'" >&2
+          exit 1
+          ;;
+        timeout)
+          sleep 3
+          exit 124
+          ;;
+        error)
+          echo "${BLUETOOTH_ACTION_BUS_BONDED_ERROR:-Call failed: org.freedesktop.DBus.Error.NoReply}" >&2
+          exit 1
+          ;;
+        *)
+          printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_BONDED:-true}"
+          ;;
+      esac
       ;;
     get-property:Paired) printf 'b %s\n' "${BLUETOOTH_ACTION_BUS_PAIRED:-true}" ;;
     call:Pair|call:CancelPairing|call:Connect|call:Disconnect|call:RemoveDevice|set-property:Trusted)

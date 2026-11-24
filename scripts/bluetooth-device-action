@@ -305,29 +305,41 @@ ensure_not_blocked() {
 }
 
 device_has_bond() {
-  local state
+  local state status=0
   if [[ -n $device_path ]]; then
     state=$(timeout --kill-after=1s 2s busctl get-property \
-      org.bluez "$device_path" org.bluez.Device1 Bonded 2>/dev/null 9>&-) || state=
-    if [[ $state == "b true" ]]; then
-      return 0
-    elif [[ $state == "b false" ]]; then
+      org.bluez "$device_path" org.bluez.Device1 Bonded 2>&1 9>&-) || status=$?
+    if (( status == 0 )); then
+      [[ $state == "b true" ]]
+      return
+    fi
+    # Only fall back to Paired on older BlueZ releases where Device1.Bonded
+    # does not exist. Timeouts or other D-Bus errors must not grant Trusted
+    # from Paired alone because pairing does not imply a persisted bond.
+    if (( status == 124 || status == 137 )); then
       return 1
     fi
-    state=$(timeout --kill-after=1s 2s busctl get-property \
-      org.bluez "$device_path" org.bluez.Device1 Paired 2>/dev/null 9>&-) || return 1
-    [[ $state == "b true" ]]
-    return
+    case "${state,,}" in
+      *unknownproperty*|*"unknown property"*|*"no such property"*)
+        state=$(timeout --kill-after=1s 2s busctl get-property \
+          org.bluez "$device_path" org.bluez.Device1 Paired 2>/dev/null 9>&-) || return 1
+        [[ $state == "b true" ]]
+        return
+        ;;
+      *)
+        return 1
+        ;;
+    esac
   fi
 
   state=$(timeout --kill-after=1s 2s bluetoothctl info "$address" 2>/dev/null 9>&- \
     | strip_terminal_codes) || return 1
   if [[ $state == *"Bonded: yes"* ]]; then
     return 0
-  elif [[ $state == *"Bonded: no"* ]]; then
+  elif [[ $state == *"Bonded:"* ]]; then
     return 1
   fi
-  [[ $state == *"Paired: yes"* ]]
+  [[ $state == *"Device "* && $state == *"Paired: yes"* ]]
 }
 
 trust_device() {

@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+const SOURCES_MANIFEST: &str = "packaging/sources.txt";
 
 fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     println!("cargo:rerun-if-changed={}", directory.display());
@@ -16,18 +19,30 @@ fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    // Track top-level directory membership so adding or removing a .qml/.js
-    // file invalidates the embedded source fingerprint on incremental builds.
-    println!("cargo:rerun-if-changed={}", root.display());
-    let mut files = vec![
-        PathBuf::from("manifest.json"),
-        PathBuf::from("backend/Cargo.toml"),
-        PathBuf::from("backend/Cargo.lock"),
-        PathBuf::from("backend/build.rs"),
-        PathBuf::from("packaging/release.py"),
-    ];
+fn top_level_sources(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    // Watching the repository root directly would also watch backend/target and
+    // break incremental builds. Instead, track top-level QML/JS membership in a
+    // checked manifest and reject any unlisted or missing top-level files.
+    let manifest_path = root.join(SOURCES_MANIFEST);
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+    let contents = fs::read_to_string(&manifest_path)?;
+    let mut declared = Vec::new();
+    for line in contents.lines() {
+        if line.is_empty()
+            || line != line.trim()
+            || line.contains('/')
+            || line.contains('\\')
+            || !(line.ends_with(".qml") || line.ends_with(".js"))
+        {
+            return Err(format!("Invalid entry in {SOURCES_MANIFEST}: {line:?}").into());
+        }
+        declared.push(line.to_string());
+    }
+    if !declared.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(format!("{SOURCES_MANIFEST} must be sorted without duplicates").into());
+    }
+
+    let mut actual = Vec::new();
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
         if path.is_file()
@@ -36,9 +51,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some("qml" | "js")
             )
         {
-            files.push(path.strip_prefix(root)?.to_path_buf());
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or("Non-UTF-8 top-level QML/JS filename")?;
+            actual.push(name.to_string());
         }
     }
+    actual.sort();
+    if declared != actual {
+        let declared_set: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
+        let actual_set: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
+        let missing: Vec<&str> = declared_set.difference(&actual_set).copied().collect();
+        let unlisted: Vec<&str> = actual_set.difference(&declared_set).copied().collect();
+        return Err(format!(
+            "Top-level QML/JS files do not match {SOURCES_MANIFEST} (missing={missing:?}, unlisted={unlisted:?})"
+        )
+        .into());
+    }
+    Ok(declared.into_iter().map(PathBuf::from).collect())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut files = vec![
+        PathBuf::from("manifest.json"),
+        PathBuf::from("backend/Cargo.toml"),
+        PathBuf::from("backend/Cargo.lock"),
+        PathBuf::from("backend/build.rs"),
+        PathBuf::from("packaging/release.py"),
+        PathBuf::from(SOURCES_MANIFEST),
+    ];
+    files.extend(top_level_sources(root)?);
     for directory in ["scripts", "backend/src"] {
         let mut children = Vec::new();
         collect(&root.join(directory), &mut children)?;

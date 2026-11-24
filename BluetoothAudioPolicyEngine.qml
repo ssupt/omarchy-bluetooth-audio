@@ -20,6 +20,7 @@ Item {
   property var terminalOutcomes: ({})
   property var manualProfileConnections: ({})
   property var defaultErrors: ({})
+  property var connectionEpochs: ({})
 
   readonly property int maximumAttempts: 90
   readonly property int stableTicksBeforeSwitch: 8
@@ -35,6 +36,7 @@ Item {
   }
   property int profileSwitchSequence: 0
   property int activeProfileSwitchId: 0
+  property int activeProfileSwitchEpoch: 0
   property string activeProfileSwitchKey: ""
   property string activeProfileSwitchAddress: ""
 
@@ -81,9 +83,32 @@ Item {
       else errorsChanged = true
     }
     if (errorsChanged) defaultErrors = errors
+
+    var pending = {}
+    var pendingChanged = false
+    for (var pendingKey in pendingApplications) {
+      if (states[pendingKey] === true) pending[pendingKey] = pendingApplications[pendingKey]
+      else pendingChanged = true
+    }
+    if (pendingChanged) {
+      pendingApplications = pending
+      applicationsPublished(pending)
+    }
+
+    var deferred = {}
+    var deferredChanged = false
+    for (var deferredKey in deferredConnections) {
+      if (states[deferredKey] === true) deferred[deferredKey] = deferredConnections[deferredKey]
+      else deferredChanged = true
+    }
+    if (deferredChanged) deferredConnections = deferred
   }
 
   function clearConnectionTrackers(key) {
+    var epochs = clone(connectionEpochs)
+    epochs[key] = Number(epochs[key] || 0) + 1
+    connectionEpochs = epochs
+
     if (manualProfileConnections[key]) {
       var manuals = clone(manualProfileConnections)
       delete manuals[key]
@@ -95,6 +120,17 @@ Item {
       terminalOutcomes = terminals
     }
     if (defaultErrors[key]) setDefaultError(key, "")
+    if (pendingApplications[key]) {
+      var pending = clone(pendingApplications)
+      delete pending[key]
+      pendingApplications = pending
+      applicationsPublished(pending)
+    }
+    if (deferredConnections[key]) {
+      var deferred = clone(deferredConnections)
+      delete deferred[key]
+      deferredConnections = deferred
+    }
   }
 
   function noteManualProfileSelection(address) {
@@ -171,7 +207,11 @@ Item {
     if (policy === "manual") return
 
     var queued = clone(pendingApplications)
-    queued[key] = { policy: policy, attempts: 0 }
+    queued[key] = {
+      policy: policy,
+      attempts: 0,
+      connectionEpoch: Number(connectionEpochs[key] || 0)
+    }
     pendingApplications = queued
     applicationsPublished(queued)
     refreshRequested()
@@ -179,8 +219,17 @@ Item {
 
   function adoptApplications(applications) {
     var adopted = {}
-    for (var key in applications || {})
+    var epochs = clone(connectionEpochs)
+    var epochsChanged = false
+    for (var key in applications || {}) {
       adopted[key] = clone(applications[key])
+      var adoptedEpoch = Number(adopted[key] && adopted[key].connectionEpoch || 0)
+      if (adoptedEpoch > Number(epochs[key] || 0)) {
+        epochs[key] = adoptedEpoch
+        epochsChanged = true
+      }
+    }
+    if (epochsChanged) connectionEpochs = epochs
     pendingApplications = adopted
   }
 
@@ -253,14 +302,19 @@ Item {
       defaultSignature: signature, defaultResult: "", defaultWaitTicks: 0 }
     requestPatch[attemptField] = usedAttempts + 1
     entry = withPatch(entry, requestPatch)
-    requests.push({ key: key, direction: direction, node: node, signature: signature })
+    requests.push({
+      key: key, direction: direction, node: node, signature: signature,
+      connectionEpoch: Number(entry.connectionEpoch || 0)
+    })
     return { entry: entry, confirmed: false, terminal: false }
   }
 
-  function finishDefaultSwitch(key, direction, signature, result, failure) {
+  function finishDefaultSwitch(key, direction, signature, result, failure, connectionEpoch) {
     var entry = pendingApplications[key]
     if (!entry || entry.defaultRequested !== direction
         || entry.defaultSignature !== signature) return
+    if (connectionEpoch !== undefined
+        && Number(entry.connectionEpoch || 0) !== Number(connectionEpoch)) return
     var pending = clone(pendingApplications)
     var terminal = false
     if (failure) {
@@ -291,7 +345,9 @@ Item {
     if (profileSwitchBusy || controller.audioProfileChangeBusy) return false
 
     var operationId = ++profileSwitchSequence
+    var currentEntry = pendingApplications[key]
     activeProfileSwitchId = operationId
+    activeProfileSwitchEpoch = currentEntry ? Number(currentEntry.connectionEpoch || 0) : 0
     activeProfileSwitchKey = String(key)
     activeProfileSwitchAddress = String(state.address)
     profileSwitchBusy = true
@@ -303,8 +359,10 @@ Item {
     if (String(key) !== activeProfileSwitchKey) return
     if (operationId !== undefined && Number(operationId) !== activeProfileSwitchId) return
 
+    var finishedEpoch = activeProfileSwitchEpoch
     profileSwitchBusy = false
     activeProfileSwitchId = 0
+    activeProfileSwitchEpoch = 0
     activeProfileSwitchKey = ""
     var address = activeProfileSwitchAddress
     activeProfileSwitchAddress = ""
@@ -315,7 +373,8 @@ Item {
       console.warn("bluetooth-audio: policy profile switch failed for "
         + address + " exit " + exitCode)
       var entry = pendingApplications[key]
-      if (entry && entry.switchRequested) {
+      if (entry && entry.switchRequested
+          && Number(entry.connectionEpoch || 0) === finishedEpoch) {
         var pending = clone(pendingApplications)
         if (Number(entry.switchAttempts || 0) >= maximumSwitchAttempts) {
           delete pending[key]
@@ -365,7 +424,11 @@ Item {
         continue
       }
       if (configuredPolicy !== entry.policy)
-        entry = { policy: configuredPolicy, attempts: 0 }
+        entry = {
+          policy: configuredPolicy,
+          attempts: 0,
+          connectionEpoch: Number(entry.connectionEpoch || 0)
+        }
 
       if (typeof controller.pendingAction === "function"
           && controller.pendingAction(key) !== "") {
@@ -377,7 +440,8 @@ Item {
       // transition helper is still muting/restoring. A slow helper is bounded
       // internally and receives a fresh confirmation window after it exits.
       if (entry.switchRequested && profileSwitchBusy
-          && activeProfileSwitchKey === key) {
+          && activeProfileSwitchKey === key
+          && activeProfileSwitchEpoch === Number(entry.connectionEpoch || 0)) {
         next[key] = entry
         continue
       }
@@ -519,7 +583,7 @@ Item {
       var callback = (function(item) {
         return function(result, failure) {
           engine.finishDefaultSwitch(item.key, item.direction,
-            item.signature, result, failure)
+            item.signature, result, failure, item.connectionEpoch)
         }
       })(request)
       var accepted = request.direction === "output"

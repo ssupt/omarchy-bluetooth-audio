@@ -327,15 +327,18 @@ restore_new_endpoint_states() {
 rollback_profile() {
   local rollback_deadline rollback_sink_payload rollback_source_payload
   local rollback_sink_states='[]' rollback_source_states='[]'
+  local last_good_rollback_sink_states='[]' last_good_rollback_source_states='[]'
   local first_rollback_sink_states='[]' first_rollback_source_states='[]'
   local expected_old_sinks expected_old_sources sink_index sink_muted
   local source_index source_muted
   local rollback_active_profile=
+  local rollback_profile_confirmed=false
   local rollback_signature= last_rollback_signature=
   local rollback_stable_ticks=0 rollback_sink_count rollback_source_count
   local rollback_transient_source_count
   local rollback_sinks_ready=false rollback_sources_ready=false
   local rollback_sinks_read_ok=false rollback_sources_read_ok=false
+  local rollback_mute_failed=false rollback_complete=true
   local sink_identity source_identity endpoint_key
   local -A muted_rollback_sinks=() muted_rollback_sources=()
 
@@ -370,6 +373,15 @@ rollback_profile() {
       rollback_source_states='[]'
     fi
     rollback_active_profile=$(read_active_profile) || rollback_active_profile=
+    if [[ $rollback_active_profile == "$active_profile" ]]; then
+      rollback_profile_confirmed=true
+      if [[ $rollback_sinks_read_ok == true ]]; then
+        last_good_rollback_sink_states=$rollback_sink_states
+      fi
+      if [[ $rollback_sources_read_ok == true ]]; then
+        last_good_rollback_source_states=$rollback_source_states
+      fi
+    fi
     first_rollback_sink_states=$(merge_first_states \
       "$first_rollback_sink_states" "$rollback_sink_states") || return 1
     first_rollback_source_states=$(merge_first_states \
@@ -379,8 +391,10 @@ rollback_profile() {
       endpoint_key="${sink_index}:${sink_identity}"
       if [[ ! ${muted_rollback_sinks[$endpoint_key]+present} ]]; then
         if [[ $sink_muted == false ]]; then
-          run_pactl set-sink-mute "$sink_index" true >/dev/null 2>&1 \
-            || return 1
+          if ! run_pactl set-sink-mute "$sink_index" true >/dev/null 2>&1; then
+            rollback_mute_failed=true
+            break
+          fi
         fi
         muted_rollback_sinks[$endpoint_key]=true
       fi
@@ -389,12 +403,15 @@ rollback_profile() {
       ("n:" + (.name | @base64) + ":s:" + (.serial | @base64)),
       .mute
     ] | @tsv' <<<"$rollback_sink_states")
+    [[ $rollback_mute_failed == false ]] || break
     while IFS=$'\t' read -r source_index source_identity source_muted; do
       endpoint_key="${source_index}:${source_identity}"
       if [[ ! ${muted_rollback_sources[$endpoint_key]+present} ]]; then
         if [[ $source_muted == false ]]; then
-          run_pactl set-source-mute "$source_index" true >/dev/null 2>&1 \
-            || return 1
+          if ! run_pactl set-source-mute "$source_index" true >/dev/null 2>&1; then
+            rollback_mute_failed=true
+            break
+          fi
         fi
         muted_rollback_sources[$endpoint_key]=true
       fi
@@ -403,6 +420,7 @@ rollback_profile() {
       ("n:" + (.name | @base64) + ":s:" + (.serial | @base64)),
       .mute
     ] | @tsv' <<<"$rollback_source_states")
+    [[ $rollback_mute_failed == false ]] || break
 
     rollback_sink_count=$(jq 'length' <<<"$rollback_sink_states") || return 1
     rollback_source_count=$(jq 'length' <<<"$rollback_source_states") || return 1
@@ -450,15 +468,30 @@ rollback_profile() {
     sleep 0.05
   done
 
-  [[ $rollback_active_profile == "$active_profile"
-      && $rollback_sinks_read_ok == true && $rollback_sources_read_ok == true
-      && $rollback_sinks_ready == true && $rollback_sources_ready == true
-      && $rollback_stable_ticks -ge 2 ]] \
-    || return 1
-  restore_new_endpoint_states sink "$old_sink_states" \
-    "$first_rollback_sink_states" "$rollback_sink_states" || return 1
-  restore_new_endpoint_states source "$old_source_states" \
-    "$first_rollback_source_states" "$rollback_source_states" || return 1
+  if [[ $rollback_active_profile != "$active_profile"
+      || $rollback_sinks_read_ok != true || $rollback_sources_read_ok != true
+      || $rollback_sinks_ready != true || $rollback_sources_ready != true
+      || $rollback_stable_ticks -lt 2 || $rollback_mute_failed == true ]]; then
+    rollback_complete=false
+  fi
+
+  # Even when one direction's inventory could not be read or settled during
+  # rollback, restore every recovered endpoint whose state is known so we do
+  # not leave playback or capture endpoints stuck muted after rollback muted
+  # them. Still report incomplete rollback to the caller.
+  if [[ $rollback_profile_confirmed == true ]]; then
+    if (( $(jq 'length' <<<"$last_good_rollback_sink_states" 2>/dev/null || printf '0') > 0 )); then
+      restore_new_endpoint_states sink "$old_sink_states" \
+        "$first_rollback_sink_states" "$last_good_rollback_sink_states" || rollback_complete=false
+    fi
+
+    if (( $(jq 'length' <<<"$last_good_rollback_source_states" 2>/dev/null || printf '0') > 0 )); then
+      restore_new_endpoint_states source "$old_source_states" \
+        "$first_rollback_source_states" "$last_good_rollback_source_states" || rollback_complete=false
+    fi
+  fi
+
+  [[ $rollback_complete == true ]]
 }
 
 cleanup_transition() {

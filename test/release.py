@@ -50,18 +50,36 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-release-test-") as temporary:
     except ValueError:
         pass
 
-    # Incremental Cargo build must update BLUETOOTH_BUILD_ID when a
-    # new top-level QML file is added as the only change.
-    target_dir = staged / "cargo-target"
+    # Consecutive no-change Cargo checks using the default backend/target dir
+    # must stay incremental instead of rebuilding on build-output writes.
+    check_cmd = [
+        "cargo", "check", "--locked", "--offline",
+        "--manifest-path", str(staged / "backend/Cargo.toml"),
+    ]
+    first_check = subprocess.run(check_cmd, check=True, capture_output=True, text=True)
+    assert "omarchy-bluetooth-service" in first_check.stderr, first_check.stderr
+    second_check = subprocess.run(check_cmd, check=True, capture_output=True, text=True)
+    assert "omarchy-bluetooth-service" not in second_check.stderr, second_check.stderr
+
+    # Adding a top-level QML file without listing it in packaging/sources.txt
+    # must be rejected; listing it must trigger an incremental rebuild that
+    # updates BLUETOOTH_BUILD_ID.
     build_cmd = [
         "cargo", "build", "--locked", "--offline",
         "--manifest-path", str(staged / "backend/Cargo.toml"),
-        "--target-dir", str(target_dir),
     ]
     subprocess.run(build_cmd, check=True, capture_output=True, text=True)
-    built_binary = target_dir / "debug/omarchy-bluetooth-service"
+    built_binary = staged / "backend/target/debug/omarchy-bluetooth-service"
     before = release.checked_info(staged, built_binary)
     added_qml.write_text("import QtQuick\nItem {}\n")
+    try:
+        release.checked_info(staged, built_binary)
+        raise AssertionError("Unlisted top-level QML file was accepted")
+    except ValueError:
+        pass
+    manifest_file = staged / release.SOURCES_MANIFEST
+    listed = sorted(manifest_file.read_text().splitlines() + [added_qml.name])
+    manifest_file.write_text("\n".join(listed) + "\n")
     subprocess.run(build_cmd, check=True, capture_output=True, text=True)
     after = release.checked_info(staged, built_binary)
     assert after["sourceId"] != before["sourceId"], (before, after)

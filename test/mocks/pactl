@@ -69,6 +69,10 @@ if [[ -n ${AUDIO_CONTROL_PROFILE_LOG:-} && -n ${AUDIO_CONTROL_PROFILE_STATE:-} ]
       if [[ $state == old && ${AUDIO_CONTROL_PROFILE_OLD_SOURCE_READ_FAIL:-0} == 1 ]]; then
         exit 1
       fi
+      if [[ $state == old && ${AUDIO_CONTROL_PROFILE_ROLLBACK_SOURCE_READ_FAIL:-0} == 1 ]] \
+          && grep -q '^set-card-profile ' "$AUDIO_CONTROL_PROFILE_LOG" 2>/dev/null; then
+        exit 1
+      fi
       if [[ $state == new && ${AUDIO_CONTROL_PROFILE_NEW_SOURCE_READ_FAIL:-0} == 1 ]]; then
         exit 1
       fi

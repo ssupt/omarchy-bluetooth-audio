@@ -781,9 +781,10 @@ exit 0
     shutil.copy2(ROOT / "Model.js", work3 / "Model.js")
     shared = work3 / "shared.json"
     shared.write_text('{"version":1,"bluetoothAudioPolicies":{"001122334455":"output-mic"}}\n')
+    # A directory triggers a deterministic FileView read error (NotAFile) even
+    # when the test runs as root inside CI containers where chmod 000 is readable.
     unreadable = work3 / "unreadable.json"
-    unreadable.write_text('{"version":1,"bluetoothAudioPolicies":{"001122334455":"manual"}}\n')
-    unreadable.chmod(0o000)
+    unreadable.mkdir()
     malformed = work3 / "malformed.json"
     malformed.write_text('{broken json')
     v2 = work3 / "v2.json"
@@ -791,17 +792,14 @@ exit 0
     valid_manual = work3 / "valid-manual.json"
     valid_manual.write_text('{"version":1,"bluetoothAudioPolicies":{"001122334455":"manual"}}\n')
     missing = work3 / "does-not-exist.json"
-    try:
-        qml7 = (policy_files_qml
-                .replace("__SHARED__", str(shared))
-                .replace("__MISSING__", str(missing))
-                .replace("__UNREADABLE__", str(unreadable))
-                .replace("__MALFORMED__", str(malformed))
-                .replace("__V2__", str(v2))
-                .replace("__VALID_MANUAL__", str(valid_manual)))
-        run_quickshell(work3, qml7, "PASS: policy FileView validation and read failures fail safe")
-    finally:
-        unreadable.chmod(0o600)
+    qml7 = (policy_files_qml
+            .replace("__SHARED__", str(shared))
+            .replace("__MISSING__", str(missing))
+            .replace("__UNREADABLE__", str(unreadable))
+            .replace("__MALFORMED__", str(malformed))
+            .replace("__V2__", str(v2))
+            .replace("__VALID_MANUAL__", str(valid_manual)))
+    run_quickshell(work3, qml7, "PASS: policy FileView validation and read failures fail safe")
 
     # Case 12 & 13
     work4 = base / "recovery-prop"

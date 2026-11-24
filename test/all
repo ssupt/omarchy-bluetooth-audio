@@ -1525,6 +1525,41 @@ EOF
 [[ $(<"$profile_log") == "$expected_failure_log" ]] || fail "failed profile transition cleanup"
 echo "PASS: failed profile transition rollback"
 
+# Rollback must still restore available playback state when source inventory
+# cannot be read, while still reporting an incomplete rollback.
+: >"$profile_log"
+: >"$bluetooth_action_error"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_SET_FAIL=1 \
+  AUDIO_CONTROL_PROFILE_NO_OLD_SOURCE=1 \
+  AUDIO_CONTROL_PROFILE_ROLLBACK_SOURCE_READ_FAIL=1 \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc \
+      >/dev/null 2>"$bluetooth_action_error"; then
+  fail "failed transition with unreadable rollback sources reported success"
+fi
+rg -q 'previous audio profile could not be restored' "$bluetooth_action_error" \
+  || fail "unreadable rollback sources did not report incomplete rollback"
+expected_partial_rollback_log=$(cat <<'EOF'
+set-sink-mute 100 true
+set-sink-input-mute 300 true
+set-card-profile bluez_card.00_11_22_33_44_55 headset-head-unit-msbc
+set-card-profile bluez_card.00_11_22_33_44_55 a2dp-sink-aac
+set-sink-mute 100 true
+set-sink-volume 100 42%
+set-sink-mute 100 false
+set-sink-input-mute 300 false
+EOF
+)
+[[ $(<"$profile_log") == "$expected_partial_rollback_log" ]] \
+  || fail "rollback with unreadable sources left playback muted"
+echo "PASS: rollback restores playback even when source inventory is unreadable"
+
 : >"$profile_log"
 printf 'old\n' >"$profile_state"
 if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
