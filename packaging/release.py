@@ -14,7 +14,35 @@ import tempfile
 
 BINARY = Path("bin/omarchy-bluetooth-service")
 METADATA = Path("backend-release.json")
+SOURCES_MANIFEST = Path("packaging/sources.txt")
 TARGET = "x86_64-unknown-linux-gnu"
+
+
+def top_level_sources(root: Path) -> list[Path]:
+    manifest_path = root / SOURCES_MANIFEST
+    declared: list[str] = []
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        if not line or line != line.strip() or "/" in line or "\\" in line:
+            raise ValueError(f"Invalid entry in {SOURCES_MANIFEST}: {line!r}")
+        if not (line.endswith(".qml") or line.endswith(".js")):
+            raise ValueError(f"Unsupported entry in {SOURCES_MANIFEST}: {line!r}")
+        declared.append(line)
+    if declared != sorted(set(declared)):
+        raise ValueError(f"{SOURCES_MANIFEST} must be sorted without duplicates")
+
+    actual = sorted(
+        path.name
+        for path in root.iterdir()
+        if path.is_file() and path.suffix in (".qml", ".js")
+    )
+    if declared != actual:
+        missing = sorted(set(declared) - set(actual))
+        unlisted = sorted(set(actual) - set(declared))
+        raise ValueError(
+            f"Top-level QML/JS files do not match {SOURCES_MANIFEST} "
+            f"(missing={missing}, unlisted={unlisted})"
+        )
+    return [Path(name) for name in declared]
 
 
 def source_files(root: Path) -> list[Path]:
@@ -24,9 +52,9 @@ def source_files(root: Path) -> list[Path]:
         Path("backend/Cargo.lock"),
         Path("backend/build.rs"),
         Path("packaging/release.py"),
+        SOURCES_MANIFEST,
     ]
-    files += [path.relative_to(root) for path in root.iterdir()
-              if path.is_file() and path.suffix in (".qml", ".js")]
+    files += top_level_sources(root)
     for directory in ("scripts", "backend/src"):
         files += [path.relative_to(root) for path in (root / directory).rglob("*")
                   if path.is_file()]
@@ -95,6 +123,7 @@ def prepare(root: Path, binary: Path) -> None:
         json.dump(metadata, staged, sort_keys=True, indent=2)
         staged.write("\n")
     try:
+        staged_path.chmod(0o644)
         os.replace(staged_path, root / METADATA)
     finally:
         staged_path.unlink(missing_ok=True)

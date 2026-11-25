@@ -3,12 +3,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, watch};
 
 const MAX_FRAME: usize = 65_536;
 const MAX_OUTPUT: usize = 131_072;
@@ -50,10 +56,145 @@ struct Service {
     scripts: PathBuf,
     active_action: Mutex<Option<(String, u32)>>,
     jobs: Mutex<HashMap<String, Job>>,
+    cancel_notify: Notify,
+    shutdown: watch::Receiver<bool>,
+}
+
+struct ServiceLock(#[allow(dead_code)] File);
+
+fn is_writable_dir(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+fn service_lock_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| is_writable_dir(path))
+        .or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .filter(|path| is_writable_dir(path))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+                .filter(|path| is_writable_dir(path))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let uid = unsafe { libc::geteuid() };
+    dir.join(format!("omarchy-bluetooth-service-{uid}.lock"))
+}
+
+async fn acquire_mutation_lock(
+    service: &Service,
+    request_id: &str,
+    deadline: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<ServiceLock, Failure> {
+    if *shutdown.borrow() {
+        return Err(Failure::rejected(
+            "cancelled",
+            "Bluetooth service is shutting down",
+        ));
+    }
+    if service
+        .jobs
+        .lock()
+        .await
+        .get(request_id)
+        .is_some_and(|job| job.cancelled)
+    {
+        return Err(Failure::rejected(
+            "cancelled",
+            "Queued Bluetooth command was cancelled",
+        ));
+    }
+    let path = service_lock_path();
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| {
+            Failure::rejected(
+                "unavailable",
+                format!("Could not open Bluetooth service lock: {error}"),
+            )
+        })?;
+    let started = Instant::now();
+    loop {
+        let notified = service.cancel_notify.notified();
+        tokio::pin!(notified);
+        if *shutdown.borrow() {
+            return Err(Failure::rejected(
+                "cancelled",
+                "Bluetooth service is shutting down",
+            ));
+        }
+        if service
+            .jobs
+            .lock()
+            .await
+            .get(request_id)
+            .is_some_and(|job| job.cancelled)
+        {
+            return Err(Failure::rejected(
+                "cancelled",
+                "Queued Bluetooth command was cancelled",
+            ));
+        }
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked == 0 {
+            return Ok(ServiceLock(file));
+        }
+        let error = std::io::Error::last_os_error();
+        let raw = error.raw_os_error();
+        if raw != Some(libc::EWOULDBLOCK) && raw != Some(libc::EAGAIN) && raw != Some(libc::EINTR) {
+            return Err(Failure::rejected(
+                "unavailable",
+                format!("Could not lock Bluetooth service: {error}"),
+            ));
+        }
+        let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
+            return Err(Failure::rejected(
+                "timeout",
+                "Another Bluetooth service operation is still finishing",
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(Failure::rejected(
+                "timeout",
+                "Another Bluetooth service operation is still finishing",
+            ));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(remaining.min(Duration::from_millis(25))) => {}
+            _ = &mut notified => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Err(Failure::rejected(
+                        "cancelled",
+                        "Bluetooth service is shutting down",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 struct Job {
     address: Option<String>,
+    is_device_action: bool,
     admitted: Instant,
     deadline: Duration,
     running: bool,
@@ -98,7 +239,7 @@ fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 160 && !value.chars().any(char::is_control)
 }
 
-fn device_path(value: &str, device: &str) -> bool {
+fn valid_device_path(value: &str) -> bool {
     let Some((adapter, suffix)) = value
         .strip_prefix("/org/bluez/hci")
         .and_then(|path| path.split_once("/dev_"))
@@ -108,7 +249,21 @@ fn device_path(value: &str, device: &str) -> bool {
     !adapter.is_empty()
         && adapter.len() <= 10
         && adapter.bytes().all(|byte| byte.is_ascii_digit())
-        && suffix.eq_ignore_ascii_case(&device.replace(':', "_"))
+        && suffix.len() == 17
+        && suffix.as_bytes().iter().enumerate().all(|(index, byte)| {
+            if index % 3 == 2 {
+                *byte == b'_'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn device_path(value: &str, device: &str) -> bool {
+    let Some((_, suffix)) = value.split_once("/dev_") else {
+        return false;
+    };
+    valid_device_path(value) && suffix.eq_ignore_ascii_case(&device.replace(':', "_"))
 }
 
 async fn read_frame<R: AsyncBufRead + Unpin>(
@@ -148,16 +303,46 @@ impl Service {
         deadline: Duration,
         action: Option<(&str, &str)>,
     ) -> Result<Value, Failure> {
+        let mut shutdown = self.shutdown.clone();
+        if *shutdown.borrow() {
+            return Err(Failure::rejected(
+                "cancelled",
+                "Bluetooth service is shutting down",
+            ));
+        }
         let path = self.scripts.join(name);
-        let mut child = Command::new(&path)
+        let parent_pid = unsafe { libc::getpid() };
+        let mut command = Command::new(&path);
+        command
             .args(args)
+            .process_group(0)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| {
-                Failure::rejected("unavailable", format!("Could not run {name}: {error}"))
-            })?;
+            .kill_on_drop(true);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            command.pre_exec(move || {
+                // Ensure helpers receive SIGTERM for BlueZ/audio cleanup even if
+                // the service is abruptly SIGKILLed during shell Process teardown.
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGTERM as libc::c_ulong,
+                    0usize,
+                    0usize,
+                    0usize,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    libc::_exit(128 + libc::SIGTERM);
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| {
+            Failure::rejected("unavailable", format!("Could not run {name}: {error}"))
+        })?;
         let pid = child
             .id()
             .ok_or_else(|| Failure::unknown("Bluetooth helper has no process ID"))?;
@@ -180,20 +365,42 @@ impl Service {
         let mut output = Vec::new();
         let mut errors = Vec::new();
         let mut wait = Box::pin(async {
-            let mut limited_stdout = stdout.take((MAX_OUTPUT + 1) as u64);
-            let mut limited_stderr = stderr.take((MAX_FRAME + 1) as u64);
-            let (out, err, status) = tokio::join!(
-                limited_stdout.read_to_end(&mut output),
-                limited_stderr.read_to_end(&mut errors),
-                child.wait()
-            );
+            // Drop each pipe handle as soon as the cap is reached so a noisy
+            // child gets EPIPE immediately instead of blocking on write until
+            // the deadline expires.
+            let out_fut = async {
+                let mut limited = stdout.take((MAX_OUTPUT + 1) as u64);
+                let result = limited.read_to_end(&mut output).await;
+                drop(limited);
+                result
+            };
+            let err_fut = async {
+                let mut limited = stderr.take((MAX_FRAME + 1) as u64);
+                let result = limited.read_to_end(&mut errors).await;
+                drop(limited);
+                result
+            };
+            let (out, err, status) = tokio::join!(out_fut, err_fut, child.wait());
             out?;
             err?;
             status
         });
-        let result = match tokio::time::timeout(deadline, &mut wait).await {
-            Ok(result) => result,
-            Err(_) => {
+        enum WaitOutcome {
+            Completed(std::io::Result<std::process::ExitStatus>),
+            TimedOut,
+            Shutdown,
+        }
+        let outcome = tokio::select! {
+            result = tokio::time::timeout(deadline, &mut wait) => match result {
+                Ok(status) => WaitOutcome::Completed(status),
+                Err(_) => WaitOutcome::TimedOut,
+            },
+            _ = shutdown.wait_for(|shutting_down| *shutting_down) => WaitOutcome::Shutdown,
+        };
+        let timed_out = matches!(outcome, WaitOutcome::TimedOut);
+        let result = match outcome {
+            WaitOutcome::Completed(result) => result,
+            WaitOutcome::TimedOut => {
                 // Give the shell helper time to run its cleanup and profile
                 // rollback traps. An abrupt kill can leave endpoints muted.
                 unsafe {
@@ -203,15 +410,44 @@ impl Service {
                     Ok(result) => result,
                     Err(_) => {
                         unsafe {
+                            libc::kill(-(pid as i32), libc::SIGKILL);
                             libc::kill(pid as i32, libc::SIGKILL);
                         }
                         let _ = tokio::time::timeout(Duration::from_secs(2), &mut wait).await;
                         if action.is_some() {
                             *self.active_action.lock().await = None;
                         }
-                        return Err(Failure::unknown(format!("{name} timed out")));
+                        return Err(Failure {
+                            code: "timeout",
+                            message: format!("{name} timed out"),
+                            outcome: "unknown",
+                        });
                     }
                 }
+            }
+            WaitOutcome::Shutdown => {
+                // Terminate and reap the helper with time for its cleanup trap
+                // before exiting so a restarted service cannot race it.
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+                if tokio::time::timeout(Duration::from_secs(6), &mut wait)
+                    .await
+                    .is_err()
+                {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut wait).await;
+                }
+                if action.is_some() {
+                    *self.active_action.lock().await = None;
+                }
+                return Err(Failure::rejected(
+                    "cancelled",
+                    "Bluetooth service is shutting down",
+                ));
             }
         };
         if action.is_some() {
@@ -228,8 +464,50 @@ impl Service {
         }
         if !status.success() {
             let message = String::from_utf8_lossy(&errors).trim().to_owned();
+            if timed_out {
+                return Err(Failure {
+                    code: "timeout",
+                    message: if message.is_empty() {
+                        format!("{name} timed out")
+                    } else {
+                        message
+                    },
+                    outcome: "unknown",
+                });
+            }
             if status.code() == Some(2) && name == "bluetooth-audio-profile-set" {
                 return Ok(json!({"outcome":"persistence_failed", "message":message}));
+            }
+            if name == "bluetooth-device-action" {
+                if status.code() == Some(130) {
+                    return Err(Failure::rejected(
+                        "cancelled",
+                        if message.is_empty() {
+                            "Bluetooth operation was cancelled".to_owned()
+                        } else {
+                            message
+                        },
+                    ));
+                }
+                if status.code() == Some(131) {
+                    return Err(Failure {
+                        code: "cancel_failed",
+                        message: if message.is_empty() {
+                            "Could not confirm that the cancelled Bluetooth connection stopped"
+                                .to_owned()
+                        } else {
+                            message
+                        },
+                        outcome: "unknown",
+                    });
+                }
+                if status.code().is_none() {
+                    return Err(Failure::unknown(if message.is_empty() {
+                        "Bluetooth operation outcome is unknown".to_owned()
+                    } else {
+                        message
+                    }));
+                }
             }
             return Err(Failure::rejected(
                 "failed",
@@ -319,7 +597,8 @@ impl Service {
                 let target = jobs
                     .iter()
                     .filter(|(id, job)| {
-                        requested_id.is_none_or(|wanted| *id == wanted)
+                        job.is_device_action
+                            && requested_id.is_none_or(|wanted| *id == wanted)
                             && job
                                 .address
                                 .as_deref()
@@ -330,7 +609,10 @@ impl Service {
                 if let Some(target) = target {
                     let job = jobs.get_mut(&target).expect("selected job");
                     job.cancelled = true;
-                    if job.running {
+                    let running = job.running;
+                    drop(jobs);
+                    self.cancel_notify.notify_waiters();
+                    if running {
                         let active = self.active_action.lock().await;
                         if let Some((address, pid)) = active.as_ref() {
                             if address.eq_ignore_ascii_case(device) {
@@ -349,8 +631,7 @@ impl Service {
                 let path = string(&request.params, "path")?;
                 let value = string(&request.params, "value")?;
                 if !["name", "trusted", "blocked", "wakeAllowed"].contains(&property)
-                    || !path.starts_with("/org/bluez/hci")
-                    || path.len() > 100
+                    || !valid_device_path(path)
                     || (property == "name" && value.len() > 160)
                     || (property != "name" && value != "true" && value != "false")
                     || value.chars().any(char::is_control)
@@ -410,7 +691,7 @@ impl Service {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args == ["--build-info"] {
@@ -433,34 +714,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|path| path.parent())
         .ok_or("Backend has no plugin root")?
         .join("scripts");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sighup = signal(SignalKind::hangup())?;
     let service = Arc::new(Service {
         scripts,
         active_action: Mutex::new(None),
         jobs: Mutex::new(HashMap::new()),
+        cancel_notify: Notify::new(),
+        shutdown: shutdown_rx,
+    });
+    // Keep signal handling active even after stdin reaches EOF so queued and
+    // in-flight mutations are still cancelled cleanly if SIGTERM/SIGINT/SIGHUP
+    // arrives while the worker drains.
+    let signal_service = service.clone();
+    let signal_shutdown_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
+            _ = sighup.recv() => {}
+        }
+        {
+            let mut jobs = signal_service.jobs.lock().await;
+            for job in jobs.values_mut() {
+                job.cancelled = true;
+            }
+        }
+        signal_service.cancel_notify.notify_waiters();
+        let _ = signal_shutdown_tx.send(true);
     });
     let (tx, mut rx) = mpsc::channel::<Value>(32);
     let (mutation_tx, mut mutation_rx) = mpsc::channel::<Request>(32);
     let worker_service = service.clone();
     let worker_replies = tx.clone();
     let worker = tokio::spawn(async move {
+        let mut shutdown = worker_service.shutdown.clone();
         while let Some(request) = mutation_rx.recv().await {
+            if *shutdown.borrow() {
+                worker_service.jobs.lock().await.remove(&request.id);
+                continue;
+            }
             let remaining = {
-                let mut jobs = worker_service.jobs.lock().await;
-                let job = jobs.get_mut(&request.id).expect("admitted mutation");
+                let jobs = worker_service.jobs.lock().await;
+                let job = jobs.get(&request.id).expect("admitted mutation");
                 if job.cancelled {
                     None
                 } else {
                     let left = job.deadline.saturating_sub(job.admitted.elapsed());
-                    if left.is_zero() {
-                        None
-                    } else {
-                        job.running = true;
-                        Some(left)
-                    }
+                    (!left.is_zero()).then_some(left)
                 }
             };
             let result = if let Some(remaining) = remaining {
-                worker_service.handle(&request, Some(remaining)).await
+                match acquire_mutation_lock(&worker_service, &request.id, remaining, &mut shutdown)
+                    .await
+                {
+                    Ok(_lock) => {
+                        let left = {
+                            let mut jobs = worker_service.jobs.lock().await;
+                            jobs.get_mut(&request.id).and_then(|job| {
+                                if job.cancelled {
+                                    None
+                                } else {
+                                    let left = job.deadline.saturating_sub(job.admitted.elapsed());
+                                    if left.is_zero() {
+                                        None
+                                    } else {
+                                        job.running = true;
+                                        Some(left)
+                                    }
+                                }
+                            })
+                        };
+                        if let Some(left) = left {
+                            worker_service.handle(&request, Some(left)).await
+                        } else {
+                            let jobs = worker_service.jobs.lock().await;
+                            if jobs.get(&request.id).is_some_and(|job| job.cancelled) {
+                                Err(Failure::rejected(
+                                    "cancelled",
+                                    "Queued Bluetooth command was cancelled",
+                                ))
+                            } else {
+                                Err(Failure::rejected(
+                                    "timeout",
+                                    "Bluetooth command expired while queued",
+                                ))
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
             } else {
                 let jobs = worker_service.jobs.lock().await;
                 if jobs.get(&request.id).is_some_and(|job| job.cancelled) {
@@ -476,6 +821,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             worker_service.jobs.lock().await.remove(&request.id);
+            if *shutdown.borrow() {
+                continue;
+            }
             if worker_replies.send(reply(&request, result)).await.is_err() {
                 break;
             }
@@ -495,9 +843,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut line = Vec::new();
+    let mut read_shutdown = service.shutdown.clone();
     loop {
         line.clear();
-        if !read_frame(&mut stdin, &mut line).await? {
+        let read_result = tokio::select! {
+            biased;
+            _ = read_shutdown.wait_for(|shutting_down| *shutting_down) => {
+                break;
+            }
+            result = read_frame(&mut stdin, &mut line) => result,
+        };
+        if !read_result? {
             break;
         }
         let Ok(request) = serde_json::from_slice::<Request>(&line) else {
@@ -533,6 +889,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .get("address")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
+                    is_device_action: request.method == "device.action",
                     admitted: Instant::now(),
                     deadline,
                     running: false,
@@ -582,14 +939,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     drop(mutation_tx);
     worker.await?;
+    let _ = other_permits.acquire_many(32).await;
+    let _ = cancel_permits.acquire_many(4).await;
     drop(tx);
-    writer.await??;
+    if *service.shutdown.borrow() {
+        let _ = tokio::time::timeout(Duration::from_millis(250), writer).await;
+        // All helpers are reaped and locks released. Exit directly so Tokio's
+        // blocking stdin thread cannot hold the process open if the parent has
+        // not closed stdin yet.
+        std::process::exit(0);
+    }
+    tokio::select! {
+        result = writer => {
+            result??;
+        }
+        _ = read_shutdown.wait_for(|shutting_down| *shutting_down) => {
+            std::process::exit(0);
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
     #[test]
     fn address_checks_shape() {
         assert!(address("00:11:22:aa:BB:cc"));
@@ -598,6 +973,9 @@ mod tests {
     }
     #[test]
     fn device_path_preserves_controller_and_matches_address() {
+        assert!(valid_device_path("/org/bluez/hci0/dev_00_11_22_AA_BB_CC"));
+        assert!(!valid_device_path("/org/bluez/hci0/dev_00_11_22_AA_BB_GG"));
+        assert!(!valid_device_path("/org/bluez/hci0/other"));
         assert!(device_path(
             "/org/bluez/hci12/dev_00_11_22_AA_BB_CC",
             "00:11:22:aa:bb:cc"
@@ -609,5 +987,61 @@ mod tests {
         ] {
             assert!(!device_path(path, "00:11:22:aa:bb:cc"));
         }
+    }
+
+    #[tokio::test]
+    async fn timeout_is_never_misreported_as_cancelled() {
+        let dir =
+            std::env::temp_dir().join(format!("omarchy-bt-timeout-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write_script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        };
+        write_script(
+            "bluetooth-device-action",
+            "#!/bin/bash\nchild=\ntrap 'if [[ -n $child ]]; then kill \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; fi; exit 130' TERM\nsleep 10 &\nchild=$!\nwait \"$child\"\n",
+        );
+        write_script(
+            "bluetooth-audio-profile-set",
+            "#!/bin/bash\nchild=\ntrap 'if [[ -n $child ]]; then kill \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; fi; exit 130' TERM\nsleep 10 &\nchild=$!\nwait \"$child\"\n",
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let service = Service {
+            scripts: dir.clone(),
+            active_action: Mutex::new(None),
+            jobs: Mutex::new(HashMap::new()),
+            cancel_notify: Notify::new(),
+            shutdown: shutdown_rx,
+        };
+        let action_err = service
+            .script(
+                "bluetooth-device-action",
+                &["connect", "00:11:22:33:44:55", ""],
+                Duration::from_millis(120),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(action_err.code, "timeout");
+        assert_eq!(action_err.outcome, "unknown");
+
+        let profile_err = service
+            .script(
+                "bluetooth-audio-profile-set",
+                &["00:11:22:33:44:55", "headset"],
+                Duration::from_millis(120),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(profile_err.code, "timeout");
+        assert_eq!(profile_err.outcome, "unknown");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

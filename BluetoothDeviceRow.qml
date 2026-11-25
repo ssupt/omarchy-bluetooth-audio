@@ -17,17 +17,21 @@ CursorSurface {
 
   readonly property bool isConnected: dev && dev.connected
   readonly property int devState: dev && dev.state !== undefined ? dev.state : -1
-  readonly property string action: controller.pendingAction(dev ? dev.address : "")
-  readonly property var actionFailure: controller.deviceActionFailure(dev ? dev.address : "")
+  readonly property string devPath: dev ? String(dev.dbusPath || "") : ""
+  readonly property string action: controller.pendingAction(dev ? dev.address : "", devPath)
+  readonly property var actionFailure: controller.deviceActionFailure(dev ? dev.address : "", devPath)
   readonly property string actionFailureMessage: actionFailure
     ? String(actionFailure.message || "") : ""
-  readonly property string recoveryAction: controller.recoveryAction(dev ? dev.address : "")
+  readonly property string recoveryAction: controller.recoveryAction(dev ? dev.address : "", devPath)
   readonly property bool recoveryVisible: recoveryAction !== ""
+  readonly property bool pairAgainOnRetry: recoveryAction === "retry"
+    && Model.shouldPairAgainOnRetry(dev, actionFailure)
   readonly property bool cancellingConnection: dev
-    && controller.connectionCancellationPending(dev.address)
+    && controller.connectionCancellationPending(dev.address, devPath)
   readonly property string actionTooltip: {
     if (!dev) return ""
     if (recoveryAction === "cancel") return "Cancel connection"
+    if (pairAgainOnRetry) return "Pair again"
     if (isConnected) return "Disconnect"
     if (isDiscovered) return "Pair"
     return "Connect"
@@ -215,7 +219,7 @@ CursorSurface {
       hasCursor: row.rowSelected && controller.focusedAction === "profile"
       enabled: !controller.audioProfileChangeBusy && !controller.deviceActionBusy
         && !controller.devicePropertyBusy
-        && controller.pendingAction(row.dev ? row.dev.address : "") === ""
+        && controller.pendingAction(row.dev ? row.dev.address : "", row.devPath) === ""
       opacity: enabled ? 1 : 0.5
       foreground: controller.bar.foreground
       fontFamily: controller.bar.fontFamily
@@ -231,7 +235,9 @@ CursorSurface {
         controller.selectedIndex = row.rowIndex
         controller.focusedAction = "profile"
       }
-      onChanged: function(profile) { controller.setAudioProfile(row.dev.address, profile) }
+      onChanged: function(profile) {
+        if (row.dev) controller.setAudioProfile(row.dev.address, profile)
+      }
       onPopupOpenChanged: {
         if (popupOpen) controller.closeAudioProfileMenus(row.rowIndex)
         controller.audioProfileMenuOpen = popupOpen
@@ -315,7 +321,8 @@ CursorSurface {
       iconText: row.recoveryAction === "cancel" ? "󰅙" : "󰑐"
       tooltipText: row.recoveryAction === "cancel" ? "Cancel connection"
         : (row.actionFailureMessage !== ""
-          ? "Retry · " + row.actionFailureMessage : "Retry")
+          ? (row.pairAgainOnRetry ? "Pair again · " : "Retry · ") + row.actionFailureMessage
+          : (row.pairAgainOnRetry ? "Pair again" : "Retry"))
       foreground: controller.bar.foreground
       hoverColor: row.recoveryAction === "retry" ? controller.bar.urgent
         : controller.bar.foreground

@@ -55,7 +55,10 @@ validate_identifier() {
 }
 
 read_preferences() {
-  if [[ ! -s $preferences_file ]]; then
+  if [[ -e $preferences_file && ! -r $preferences_file ]]; then
+    echo "Could not read audio preferences" >&2
+    return 1
+  elif [[ ! -s $preferences_file ]]; then
     default_preferences
   elif (( $(stat -c %s -- "$preferences_file" 2>/dev/null \
       || printf '%s' "$((maximum_store_bytes + 1))") > maximum_store_bytes )); then
@@ -97,7 +100,10 @@ read_preferences() {
 }
 
 read_policy_overrides() {
-  if [[ ! -s $policy_file ]]; then
+  if [[ -e $policy_file && ! -r $policy_file ]]; then
+    echo "Could not read Bluetooth audio policies" >&2
+    return 1
+  elif [[ ! -s $policy_file ]]; then
     default_policy_overrides
   elif (( $(stat -c %s -- "$policy_file" 2>/dev/null \
       || printf '%s' "$((maximum_store_bytes + 1))") > maximum_store_bytes )); then
@@ -233,8 +239,12 @@ case "$action" in
     ;;
   migrate-policies)
     (( $# == 1 )) || usage
+    if [[ ! -e $preferences_file ]]; then
+      exit 0
+    fi
     # Lock the shared document while taking the migration snapshot. Compatible
     # companion writers use the same lock path for their atomic replacements.
+    mkdir -p -- "$(dirname -- "$preferences_file")"
     exec 7>"${preferences_file}.lock"
     flock -w 5 7 || {
       echo "Timed out waiting to migrate Bluetooth audio policies" >&2

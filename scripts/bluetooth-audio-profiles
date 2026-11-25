@@ -26,12 +26,12 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     [scan("[0-9a-f]{2}")] | join(":") | ascii_upcase;
 
   def codec:
-    try ((.label // "") | capture("codec (?<codec>[^)]+)"; "i").codec) catch ""
+    ((.label // "") | [capture("codec (?<codec>[^)]+)"; "i").codec] | .[0] // "")
     | if ascii_upcase == "MSBC" then "mSBC" else . end;
 
   def option_label:
     codec as $codec
-    | if $codec == "" then (.label // .value)
+    | if $codec == "" then (if (.label // "") != "" then .label else .value end)
       elif (.sources // 0) > 0 then "Headset + microphone · " + $codec
       else "High fidelity · " + $codec
       end;

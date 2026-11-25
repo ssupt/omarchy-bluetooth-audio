@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Detect stale source, binary, and metadata in a staged plugin."""
 
+import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -19,6 +21,16 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-release-test-") as temporary:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, destination)
     release.verify(staged)
+
+    # Adding a top-level QML file without rebuilding must fail release verification.
+    added_qml = staged / "AddedReleaseProbe.qml"
+    added_qml.write_text("import QtQuick\nItem {}\n")
+    try:
+        release.verify(staged)
+        raise AssertionError("Added top-level QML file was accepted without rebuild")
+    except ValueError:
+        pass
+    added_qml.unlink()
 
     script = staged / "scripts/bluetooth-device-action"
     original = script.read_bytes()
@@ -38,5 +50,49 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-release-test-") as temporary:
         raise AssertionError("Changed binary was accepted")
     except ValueError:
         pass
+
+    # Consecutive no-change Cargo checks targeting staged/backend/target must
+    # stay incremental instead of rebuilding on build-output writes, even when
+    # CARGO_TARGET_DIR is set in the caller's environment.
+    target_dir = staged / "backend/target"
+    cargo_env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
+    check_cmd = [
+        "cargo", "check", "--locked", "--offline",
+        "--manifest-path", str(staged / "backend/Cargo.toml"),
+        "--target-dir", str(target_dir),
+    ]
+    first_check = subprocess.run(check_cmd, check=True, capture_output=True, text=True, env=cargo_env)
+    assert "omarchy-bluetooth-service" in first_check.stderr, first_check.stderr
+    second_check = subprocess.run(check_cmd, check=True, capture_output=True, text=True, env=cargo_env)
+    assert "omarchy-bluetooth-service" not in second_check.stderr, second_check.stderr
+
+    # Adding a top-level QML file without listing it in packaging/sources.txt
+    # must be rejected; listing it must trigger an incremental rebuild that
+    # updates BLUETOOTH_BUILD_ID.
+    build_cmd = [
+        "cargo", "build", "--locked", "--offline",
+        "--manifest-path", str(staged / "backend/Cargo.toml"),
+        "--target-dir", str(target_dir),
+    ]
+    subprocess.run(build_cmd, check=True, capture_output=True, text=True, env=cargo_env)
+    built_binary = target_dir / "debug/omarchy-bluetooth-service"
+    before = release.checked_info(staged, built_binary)
+    added_qml.write_text("import QtQuick\nItem {}\n")
+    try:
+        release.checked_info(staged, built_binary)
+        raise AssertionError("Unlisted top-level QML file was accepted")
+    except ValueError:
+        pass
+    manifest_file = staged / release.SOURCES_MANIFEST
+    listed = sorted(manifest_file.read_text().splitlines() + [added_qml.name])
+    manifest_file.write_text("\n".join(listed) + "\n")
+    subprocess.run(build_cmd, check=True, capture_output=True, text=True, env=cargo_env)
+    after = release.checked_info(staged, built_binary)
+    assert after["sourceId"] != before["sourceId"], (before, after)
+
+    # Prepared release metadata must stay world-readable (0644), not 0600.
+    release.prepare(staged, built_binary)
+    metadata_mode = (staged / release.METADATA).stat().st_mode & 0o777
+    assert metadata_mode == 0o644, oct(metadata_mode)
 
 print("PASS: release verification rejects changed sources and binary")

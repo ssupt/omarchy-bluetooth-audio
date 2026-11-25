@@ -53,11 +53,32 @@ if [[ $signature == b ]]; then
   esac
 fi
 
+runtime_dir=/tmp
+for candidate in "${XDG_RUNTIME_DIR:-}" "${XDG_STATE_HOME:-}" "${HOME:+${HOME}/.cache}"; do
+  if [[ -n $candidate && -d $candidate && -w $candidate ]]; then
+    runtime_dir=$candidate
+    break
+  fi
+done
+bluetooth_lock="${runtime_dir}/omarchy-bluetooth-mutation-${UID}.lock"
+old_umask=$(umask)
+umask 077
+if ! exec 9>>"$bluetooth_lock"; then
+  umask "$old_umask"
+  echo "Could not open the Bluetooth mutation lock." >&2
+  exit 1
+fi
+umask "$old_umask"
+flock -w 5 9 || {
+  echo "Another Bluetooth operation is still finishing." >&2
+  exit 1
+}
+
 output=
 status=0
 output=$(timeout --kill-after=2s 5s busctl set-property \
   org.bluez "$device_path" org.bluez.Device1 \
-  "$bluez_property" "$signature" "$wire_value" 2>&1) || status=$?
+  "$bluez_property" "$signature" "$wire_value" 2>&1 9>&-) || status=$?
 if (( status == 0 )); then
   exit 0
 fi

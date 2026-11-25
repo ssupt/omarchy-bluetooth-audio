@@ -115,8 +115,13 @@ Item {
   function setManualAudioProfile(address, profile) {
     if (manualProfileBusy || sharedPolicy.profileSwitchBusy || !address || !profile)
       return false
+    var localEpoch = !ready && controller && controller.policyEngine
+      && typeof controller.policyEngine.connectionEpoch === "function"
+      ? controller.policyEngine.connectionEpoch(address) : undefined
     var operation = {
-      id: ++manualProfileSequence, address: String(address), profile: String(profile)
+      id: ++manualProfileSequence, address: String(address), profile: String(profile),
+      connectionEpoch: sharedPolicy.connectionEpoch(address),
+      localConnectionEpoch: localEpoch
     }
     manualProfileResult = null
     manualProfileOperation = operation
@@ -143,9 +148,13 @@ Item {
     if (!failure && outcome !== "applied" && outcome !== "persistence_failed")
       outcome = "unknown"
     var message = String(failure && failure.message || result && result.message || "")
+    if (outcome === "applied" || outcome === "persistence_failed")
+      sharedPolicy.noteManualProfileSelection(operation.address, operation.connectionEpoch)
     manualProfileOperation = null
     manualProfileResult = {
       id: operation.id, address: operation.address, profile: operation.profile,
+      connectionEpoch: operation.connectionEpoch,
+      localConnectionEpoch: operation.localConnectionEpoch,
       outcome: outcome, message: message
     }
   }
@@ -238,6 +247,13 @@ Item {
     return String(address || "").toLowerCase().replace(/[:_-]/g, "")
   }
 
+  function sameActionTarget(operation, address, devicePath) {
+    if (!operation || actionKey(operation.address) !== actionKey(address)) return false
+    var opPath = String(operation.path || "")
+    var targetPath = String(devicePath || "")
+    return opPath === "" || targetPath === "" || opPath === targetPath
+  }
+
   function isConnectionAction(action) {
     return action === "pair" || action === "connect"
   }
@@ -249,16 +265,15 @@ Item {
       if (Object.keys(deviceActions).length > 0) return false
       return startDeviceAction(action, address, "connecting", devicePath)
     }
-    var key = actionKey(address)
-    if ((queuedConnection && actionKey(queuedConnection.address) === key)
-        || (!active.cancelled && actionKey(active.address) === key)) {
+    if (sameActionTarget(queuedConnection, address, devicePath)
+        || (!active.cancelled && sameActionTarget(active, address, devicePath))) {
       queuedConnection = null
     } else {
       queuedConnection = {
         action: action, address: String(address), path: String(devicePath || "")
       }
     }
-    cancelDeviceAction(active.address, true)
+    cancelDeviceAction(active.address, true, active.path)
     return true
   }
 
@@ -286,6 +301,26 @@ Item {
     return ""
   }
 
+  function findDevice(address, devicePath) {
+    var targetPath = String(devicePath || "")
+    var normalized = Model.normalizedAddress(address)
+    var devs = devices || []
+    if (targetPath !== "") {
+      for (var i = 0; i < devs.length; i++) {
+        if (devs[i] && String(devs[i].dbusPath || "") === targetPath) return devs[i]
+      }
+      return null
+    }
+    if (normalized === "") return null
+    var fallback = null
+    for (var j = 0; j < devs.length; j++) {
+      if (!devs[j] || Model.normalizedAddress(devs[j].address) !== normalized) continue
+      if (devs[j].connected) return devs[j]
+      if (!fallback) fallback = devs[j]
+    }
+    return fallback
+  }
+
   function startDeviceAction(action, address, pendingState, devicePath) {
     var key = actionKey(address)
     if (destroying || key === "" || Object.keys(deviceActions).length > 0) return false
@@ -302,16 +337,27 @@ Item {
     deviceActionResults = results
     var id = executeDeviceAction(operation, function(result, failure) {
       var current = root.deviceActions[key]
-      if (!root.destroying && current && current.cancelled && root.isConnectionAction(operation.action)
-          && ((!failure && result && result.outcome === "applied")
-            || (failure && failure.outcome === "unknown"))) {
-        // A successful reply can race the cancel click. Stop that connection
-        // before starting the replacement even when its helper already exited.
-        root.executeDeviceAction({ action: "disconnect", address: operation.address,
-          path: operation.path }, function(stopped, stopFailure) {
-          root.completeDeviceAction(operation, stopped, stopFailure, !!stopFailure)
-        })
-      } else root.completeDeviceAction(operation, result, failure, false)
+      if (!root.destroying && current && current.cancelled && root.isConnectionAction(operation.action)) {
+        if (failure && failure.code === "cancel_failed") {
+          root.completeDeviceAction(operation, null, failure, true)
+          return
+        }
+        var liveDevice = root.findDevice(operation.address, operation.path)
+        var stillConnected = !!liveDevice && !!liveDevice.connected
+        if ((!failure && result && result.outcome === "applied")
+            || (failure && failure.outcome === "unknown")
+            || stillConnected) {
+          // A successful reply or live BlueZ connection can race the cancel
+          // click. Stop that connection before starting the replacement even
+          // when its helper already exited.
+          root.executeDeviceAction({ action: "disconnect", address: operation.address,
+            path: operation.path }, function(stopped, stopFailure) {
+            root.completeDeviceAction(operation, stopped, stopFailure, !!stopFailure)
+          })
+          return
+        }
+      }
+      root.completeDeviceAction(operation, result, failure, false)
     })
     if (id) {
       operation.requestId = id
@@ -330,29 +376,37 @@ Item {
     var current = Object.assign({}, deviceActions)
     var completedOperation = Object.assign({}, operation, {
       action: cancellationFailed ? "disconnect" : operation.action,
-      cancelled: !cancellationFailed && !!(current[key] && current[key].cancelled)
+      cancelled: !cancellationFailed && !!(current[key] && current[key].cancelled),
+      cancellationFailed: !!cancellationFailed
     })
     delete current[key]
     deviceActions = current
+    if (cancellationFailed) queuedConnection = null
     var completed = Object.assign({}, deviceActionResults)
     completed[key] = {
       action: completedOperation.action,
-      message: failure && !completedOperation.cancelled
-        ? String(failure.message || "Bluetooth operation failed") : "",
-      outcome: failure ? String(failure.outcome || "unknown") : "applied"
+      path: String(completedOperation.path || ""),
+      cancellationFailed: !!cancellationFailed,
+      message: (failure || cancellationFailed) && !completedOperation.cancelled
+        ? String(failure && failure.message
+          || (cancellationFailed
+            ? "Could not confirm that the cancelled Bluetooth connection stopped"
+            : "Bluetooth operation failed")) : "",
+      outcome: cancellationFailed ? "unknown"
+        : (failure ? String(failure.outcome || "unknown") : "applied")
     }
     deviceActionResults = completed
     deviceActionFinished(completedOperation, result, failure)
     reconcileDeviceActionResults()
-    flushQueuedConnection()
+    if (!cancellationFailed) flushQueuedConnection()
   }
 
-  function cancelDeviceAction(address, keepQueued) {
+  function cancelDeviceAction(address, keepQueued, devicePath) {
     var key = actionKey(address)
-    var queued = queuedConnection && actionKey(queuedConnection.address) === key
+    var queued = sameActionTarget(queuedConnection, address, devicePath)
     if (queued && !keepQueued) queuedConnection = null
     var operation = deviceActions[key]
-    if (!operation) return !!queued
+    if (!operation || !sameActionTarget(operation, address, devicePath)) return !!queued
     if (!isConnectionAction(operation.action)) return false
     if (operation.cancelled) return true
     var next = Object.assign({}, deviceActions)
@@ -447,12 +501,21 @@ Item {
     })
   }
 
+  function invokeCallback(callback, result, failure) {
+    if (!callback) return
+    try {
+      callback(result, failure)
+    } catch (err) {
+      console.warn("Bluetooth service callback failed:", err)
+    }
+  }
+
   function failPending(message) {
     var current = pending
     pending = ({})
     for (var key in current) {
       var item = current[key]
-      if (item.callback) item.callback(null, {
+      invokeCallback(item.callback, null, {
         code: "disconnected", message: message, outcome: "unknown"
       })
     }
@@ -474,13 +537,13 @@ Item {
 
   function request(method, params, callback) {
     if (!backend.running || (!ready && method !== "hello")) {
-      if (callback) callback(null, {
+      invokeCallback(callback, null, {
         code: "not_ready", message: "Bluetooth service is unavailable", outcome: "rejected"
       })
       return ""
     }
     if (Object.keys(pending).length >= 32 && method !== "device.cancel") {
-      if (callback) callback(null, {
+      invokeCallback(callback, null, {
         code: "busy", message: "Too many Bluetooth commands are pending", outcome: "rejected"
       })
       return ""
@@ -535,7 +598,7 @@ Item {
       var next = ({})
       for (var key in pending) if (key !== reply.id) next[key] = pending[key]
       pending = next
-      if (item.callback) item.callback(reply.result || null, reply.error || null)
+      invokeCallback(item.callback, reply.result || null, reply.error || null)
       end = buffer.indexOf("\n")
     }
     if (buffer.length > 1048576) {
@@ -563,7 +626,7 @@ Item {
     pending = next
     expired = retired
     for (var i = 0; i < timedOut.length; i++) {
-      if (timedOut[i].callback) timedOut[i].callback(null, {
+      invokeCallback(timedOut[i].callback, null, {
         code: "timeout", message: "Bluetooth command outcome is unknown", outcome: "unknown"
       })
     }
@@ -588,13 +651,8 @@ Item {
     for (var key in next) {
       var result = next[key]
       if (!result.message) continue
-      var device = null
-      for (var i = 0; i < devices.length; i++) {
-        if (devices[i] && Model.normalizedAddress(devices[i].address) === key) {
-          device = devices[i]
-          break
-        }
-      }
+      if (result.cancellationFailed) continue
+      var device = findDevice(key, result.path || "")
       if (Model.deviceActionReachedState(result.action, device)) {
         delete next[key]
         changed = true
@@ -629,6 +687,14 @@ Item {
     destroying = true
     launchTimer.stop()
     reconnectTimer.stop()
+    if (fallbackDeviceAction.running) {
+      fallbackDeviceAction.signal(15)
+      fallbackDeviceAction.running = false
+    }
+    if (manualProfileSetProc.running) {
+      manualProfileSetProc.signal(15)
+      manualProfileSetProc.running = false
+    }
     backend.running = false
     failPending("Bluetooth service stopped")
   }
@@ -678,6 +744,10 @@ Item {
       callback = null
       collecting = false
       if (resultCode === 0) finished({ outcome: "applied" }, null)
+      else if (resultCode === 130) finished(null, { outcome: "rejected", code: "cancelled",
+        message: resultMessage || "Bluetooth operation was cancelled" })
+      else if (resultCode === 131) finished(null, { outcome: "unknown", code: "cancel_failed",
+        message: resultMessage || "Could not confirm that the cancelled Bluetooth connection stopped" })
       else finished(null, { outcome: "rejected", code: "helper_failed",
         message: resultMessage || "Bluetooth operation failed" })
     }
@@ -752,7 +822,7 @@ Item {
     onRefreshRequested: {
       if (root.controller) root.controller.refreshAudioProfiles()
     }
-    onProfileSwitchRequested: function(key, address, profile) {
+    onProfileSwitchRequested: function(key, address, profile, operationId) {
       root.request("profile.set", { address: address, profile: profile },
         function(result, failure) {
           var code = failure ? 1
@@ -760,7 +830,7 @@ Item {
           if (code === 2 && root.controller && root.controller.audioPreferencesError === "")
             root.controller.audioPreferenceWriteError =
               "Audio mode is active, but its preference could not be saved"
-          sharedPolicy.finishProfileSwitch(key, code)
+          sharedPolicy.finishProfileSwitch(key, code, operationId)
         })
     }
   }
