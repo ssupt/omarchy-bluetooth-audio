@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 PANEL = (ROOT / "Panel.qml").read_text()
@@ -715,6 +716,46 @@ ShellRoot {
         && service.queuedConnection.path === devHci1.dbusPath,
         "Clicking hci1 did not queue replacement for active hci0 connection")) return
 
+    // 7. expirePendingActions must preserve the BlueZ device path on timeout
+    // failures so Retry does not appear on a sibling adapter with the same MAC.
+    root.devices = [devHci0, devHci1]
+    root.setDeviceActionFailure(devHci0.address, "", "")
+    root.setPendingAction(devHci1.address, "connecting", "connect", devHci1.dbusPath)
+    var past = Object.assign({}, root.pendingActionDeadlines)
+    past["001122334455"] = Date.now() - 1000
+    root.pendingActionDeadlines = past
+    root.expirePendingActions()
+    var hci1Failure = root.deviceActionFailure(devHci1.address, devHci1.dbusPath)
+    var hci0Failure = root.deviceActionFailure(devHci0.address, devHci0.dbusPath)
+    if (!harness.check(hci1Failure && hci1Failure.path === devHci1.dbusPath
+        && hci0Failure === null,
+        "Confirmation timeout leaked Retry onto sibling adapter")) return
+
+    // 8. deviceByAddress must prefer a connected adapter over a disconnected one.
+    devHci0.connected = false
+    devHci1.connected = true
+    var resolved = root.deviceByAddress(devHci0.address)
+    if (!harness.check(resolved === devHci1,
+        "deviceByAddress returned disconnected hci0 instead of connected hci1")) return
+
+    // 9. Late manual profile completion in Service.qml must not suppress the
+    // microphone policy for a newer connection epoch.
+    service.policyEngine.initializeDevices([devHci0])
+    devHci0.connected = true
+    service.policyEngine.observeDevices([devHci0])
+    var opEpoch = service.policyEngine.connectionEpoch(devHci0.address)
+    service.manualProfileOperation = {
+      id: 99, address: devHci0.address, profile: "a2dp-sink-aac",
+      connectionEpoch: opEpoch
+    }
+    devHci0.connected = false
+    service.policyEngine.observeDevices([devHci0])
+    devHci0.connected = true
+    service.policyEngine.observeDevices([devHci0])
+    service.finishManualAudioProfile(99, { outcome: "applied" }, null)
+    if (!harness.check(!service.policyEngine.manualProfileConnections["001122334455"],
+        "Late manual profile completion marked override on reconnected session")) return
+
     console.info("PASS: service callback isolation, dual-adapter actions, and policy safety")
     Qt.quit()
   })
@@ -724,6 +765,7 @@ ShellRoot {
     "deviceByPath", "deviceByAddress", "deviceByIdentity",
     "pendingAction", "adoptPendingAction", "setPendingAction",
     "deviceActionFailure", "adoptDeviceActionFailure", "setDeviceActionFailure",
+    "deviceActionOwner", "pendingActionTimeoutMessage", "expirePendingActions",
     "syncPendingActions", "applyAudioPolicyOverride",
 )))
 
@@ -822,3 +864,94 @@ exit 0
         shutil.copy2(ROOT / name, work5 / name)
     run_quickshell(work5, audit_hardening_qml,
                    "PASS: service callback isolation, dual-adapter actions, and policy safety")
+
+    # Case 6: Destroying Service.qml mid-connect must stop the helper even if
+    # Quickshell abruptly kills the backend Process on teardown.
+    work6 = base / "service-teardown"
+    work6.mkdir()
+    for name in ("Service.qml", "BluetoothAudioPolicyEngine.qml", "Model.js"):
+        shutil.copy2(ROOT / name, work6 / name)
+    (work6 / "bin").mkdir()
+    (work6 / "scripts").mkdir()
+    shutil.copy2(ROOT / "bin/omarchy-bluetooth-service", work6 / "bin/omarchy-bluetooth-service")
+    teardown_log = work6 / "teardown.log"
+    teardown_helper = work6 / "scripts/bluetooth-device-action"
+    teardown_helper.write_text('''#!/bin/bash
+printf 'start:%s\\n' "$1" >> "$BT_TEARDOWN_LOG"
+child=
+trap 'trap ":" INT TERM HUP; if [[ -n $child ]]; then kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; sleep .15; printf "cleanup:%s\\n" "$1" >> "$BT_TEARDOWN_LOG"; exit 130' TERM INT HUP
+sleep .6 &
+child=$!
+wait "$child"
+printf 'end:%s\\n' "$1" >> "$BT_TEARDOWN_LOG"
+''')
+    teardown_helper.chmod(0o755)
+    teardown_qml = '''import QtQuick
+import Quickshell
+
+ShellRoot {
+  id: harness
+  property var serviceInstance: null
+  property bool destroyedService: false
+
+  Component {
+    id: serviceComp
+    Service {
+      onReadyChanged: {
+        if (!ready || harness.destroyedService) return
+        if (!startDeviceAction("connect", "00:11:22:33:44:55", "connecting")) {
+          console.error("Could not start connect action before teardown")
+          Qt.exit(1)
+        }
+      }
+    }
+  }
+
+  Component.onCompleted: {
+    serviceInstance = serviceComp.createObject(harness)
+  }
+
+  Timer {
+    interval: 20
+    repeat: true
+    running: !harness.destroyedService
+    onTriggered: {
+      if (harness.serviceInstance && harness.serviceInstance.ready
+          && Object.keys(harness.serviceInstance.deviceActions).length > 0) {
+        // Give the helper a moment to spawn before destroying Service.
+        destroyDelay.start()
+        running = false
+      }
+    }
+  }
+  Timer {
+    id: destroyDelay
+    interval: 120
+    onTriggered: {
+      harness.destroyedService = true
+      harness.serviceInstance.destroy()
+      harness.serviceInstance = null
+      console.info("PASS: service teardown requested")
+      quitDelay.start()
+    }
+  }
+  Timer {
+    id: quitDelay
+    interval: 50
+    onTriggered: Qt.quit()
+  }
+  Timer { interval: 8000; running: true; onTriggered: Qt.exit(1) }
+}
+'''
+    for run_index in range(3):
+        teardown_log.write_text("")
+        run_quickshell(work6, teardown_qml, "PASS: service teardown requested",
+                       env_extra={"BT_TEARDOWN_LOG": str(teardown_log)})
+        deadline = time.monotonic() + 3
+        while "cleanup:connect" not in teardown_log.read_text():
+            assert time.monotonic() < deadline, (run_index, teardown_log.read_text())
+            time.sleep(0.02)
+        time.sleep(0.7)
+        events = teardown_log.read_text().splitlines()
+        assert events == ["start:connect", "cleanup:connect"], (run_index, events)
+    print("PASS: service destruction stops in-flight helper cleanly across teardown runs")

@@ -133,9 +133,17 @@ Item {
     }
   }
 
-  function noteManualProfileSelection(address) {
+  function connectionEpoch(address) {
+    var key = Model.normalizedAddress(address)
+    return key === "" ? 0 : Number(connectionEpochs[key] || 0)
+  }
+
+  function noteManualProfileSelection(address, expectedEpoch) {
     var key = Model.normalizedAddress(address)
     if (key === "") return
+    if (expectedEpoch !== undefined && expectedEpoch !== null
+        && Number(connectionEpochs[key] || 0) !== Number(expectedEpoch))
+      return
     var manuals = clone(manualProfileConnections)
     manuals[key] = true
     manualProfileConnections = manuals
@@ -173,9 +181,20 @@ Item {
   }
 
   function observeDevices(devices) {
+    var previousStates = connectionStates
     var observation = Model.observeDeviceConnections(
-      connectionStates, devices, connectionBaselineReady)
+      previousStates, devices, connectionBaselineReady)
     connectionStates = observation.states
+    if (connectionBaselineReady) {
+      var epochs = null
+      for (var prevKey in previousStates) {
+        if (previousStates[prevKey] === true && observation.states[prevKey] !== true) {
+          if (!epochs) epochs = clone(connectionEpochs)
+          epochs[prevKey] = Number(epochs[prevKey] || 0) + 1
+        }
+      }
+      if (epochs) connectionEpochs = epochs
+    }
     pruneConnectionMaps(observation.states)
     // Device bindings can change while the component is still being built.
     // Keep those observations as baseline only; Panel explicitly enables edge
@@ -392,6 +411,23 @@ Item {
     refreshRequested()
   }
 
+  function connectedDeviceByAddress(key) {
+    var devs = controller && controller.devices ? controller.devices : null
+    if (devs && typeof devs.length === "number") {
+      for (var i = 0; i < devs.length; i++) {
+        var candidate = devs[i]
+        if (candidate && candidate.connected
+            && Model.normalizedAddress(candidate.address) === key)
+          return candidate
+      }
+    }
+    if (controller && typeof controller.deviceByAddress === "function") {
+      var matched = controller.deviceByAddress(key)
+      if (matched && matched.connected) return matched
+    }
+    return null
+  }
+
   function applyPending() {
     var keys = Object.keys(pendingApplications)
     if (keys.length === 0 || !preferencesReady) return
@@ -410,7 +446,7 @@ Item {
     for (var i = 0; i < keys.length; i++) {
       var key = keys[i]
       var entry = pendingApplications[key]
-      var device = controller.deviceByAddress(key)
+      var device = connectedDeviceByAddress(key)
       if (!device || !device.connected) continue
 
       // Preferences can change while this queue is waiting for PipeWire to

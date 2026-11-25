@@ -208,6 +208,51 @@ printf 'end:%s\\n' "$1" >> "$BT_SHUTDOWN_LOG"
     events = shutdown_log.read_text().splitlines()
     assert events == ["start:connect", "cleanup:connect", "start:disconnect", "end:disconnect"], events
 
+    # Abrupt SIGKILL of the backend (as during Quickshell Process destruction)
+    # must still deliver parent-death SIGTERM so the helper runs cleanup and
+    # never completes after service death.
+    kill_log = root / "kill.log"
+    kill_env = dict(environment, BT_SHUTDOWN_LOG=str(kill_log))
+    with subprocess.Popen([root / "bin/omarchy-bluetooth-service", "--stdio"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, env=kill_env) as killed_backend:
+        send(killed_backend, 1, "device.action", action="connect", address="00:11:22:33:44:55")
+        deadline = time.monotonic() + 3
+        while not kill_log.exists() or "start:connect" not in kill_log.read_text():
+            assert time.monotonic() < deadline, "connect helper did not start before SIGKILL"
+            time.sleep(.01)
+        killed_backend.kill()
+        killed_backend.wait(timeout=5)
+    deadline = time.monotonic() + 3
+    while "cleanup:connect" not in kill_log.read_text():
+        assert time.monotonic() < deadline, f"helper missed parent-death cleanup: {kill_log.read_text()}"
+        time.sleep(.02)
+    assert "end:connect" not in kill_log.read_text().splitlines(), kill_log.read_text()
+
+    # Closing stdin while commands drain must keep SIGTERM handling active so
+    # neither the in-flight connect nor a queued property edit completes.
+    eof_log = root / "eof-shutdown.log"
+    prop_script = root / "scripts/bluetooth-device-property"
+    prop_script.write_text('#!/bin/sh\nprintf "property:%s\\n" "$1" >> "$BT_SHUTDOWN_LOG"\nexit 0\n')
+    prop_script.chmod(0o755)
+    eof_env = dict(environment, BT_SHUTDOWN_LOG=str(eof_log))
+    with subprocess.Popen([root / "bin/omarchy-bluetooth-service", "--stdio"],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, env=eof_env) as draining:
+        send(draining, 1, "device.action", action="connect", address="00:11:22:33:44:55")
+        send(draining, 2, "device.property", property="trusted",
+             path="/org/bluez/hci0/dev_00_11_22_33_44_55", value="true")
+        deadline = time.monotonic() + 3
+        while not eof_log.exists() or "start:connect" not in eof_log.read_text():
+            assert time.monotonic() < deadline, "connect helper did not start before EOF"
+            time.sleep(.01)
+        draining.stdin.close()
+        time.sleep(0.05)
+        draining.terminate()
+        assert draining.wait(timeout=5) == 0
+    eof_events = eof_log.read_text().splitlines()
+    assert eof_events == ["start:connect", "cleanup:connect"], eof_events
+
     # device.cancel must immediately interrupt a mutation waiting on the cross-process lock.
     lock_file = root / f"omarchy-bluetooth-service-{os.geteuid()}.lock"
     with lock_file.open("a+") as lock_handle:

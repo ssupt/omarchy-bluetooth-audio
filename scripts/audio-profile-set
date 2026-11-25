@@ -94,10 +94,25 @@ read_active_profile() {
   ' <<<"$payload"
 }
 
+confirm_live_card_profile() {
+  local expected_profile=$1
+  local payload
+
+  payload=$(run_pactl -f json list cards 2>/dev/null) || return 1
+  jq -e --arg card "$card" --argjson card_index "$card_index" \
+    --arg expected "$expected_profile" '
+    any(.[];
+      .name == $card
+      and (.index // -1) == $card_index
+      and (.active_profile // "") == $expected)
+  ' <<<"$payload" >/dev/null
+}
+
 endpoint_filter='
   def belongs_to_card($card_index; $card_name):
-    ((.card // -1) == $card_index)
-    or ((.properties["device.name"] // "") == $card_name);
+    ((.properties["device.name"] // "") == $card_name)
+    or (((.properties["device.name"] // "") == "")
+      and ((.card // -1) == $card_index));
   .[] | select(belongs_to_card($card_index; $card_name))
 '
 
@@ -261,11 +276,32 @@ merge_first_states() {
   '
 }
 
+live_endpoint_matches() {
+  local kind=$1
+  local filter=$2
+  local expected_profile=$3
+  local expected_state=$4
+  local plural payload live_states
+
+  confirm_live_card_profile "$expected_profile" || return 1
+  plural="${kind}s"
+  payload=$(read_endpoints "$plural") || return 1
+  live_states=$(project_endpoint_states "$payload" "$filter") || return 1
+  jq -e --argjson expected "$expected_state" '
+    any(.[];
+      .index == $expected.index
+      and .name == $expected.name
+      and .serial == $expected.serial)
+  ' <<<"$live_states" >/dev/null
+}
+
 restore_new_endpoint_states() {
   local kind=$1
   local old_states=$2
   local first_states=$3
   local current_states=$4
+  local verify_profile=${5:-}
+  local verify_filter=${6:-}
   local count position new_state saved_state endpoint_index endpoint_muted
   local initial_mute saved_count new_channel_count
   local -a saved_volumes volume_arguments
@@ -297,9 +333,15 @@ restore_new_endpoint_states() {
       else
         volume_arguments=("${saved_volumes[0]}")
       fi
+      if [[ -n $verify_profile ]]; then
+        live_endpoint_matches "$kind" "$verify_filter" "$verify_profile" "$new_state" || return 1
+      fi
       run_pactl "set-${kind}-volume" "$endpoint_index" \
         "${volume_arguments[@]}" >/dev/null 2>&1 || return 1
       endpoint_muted=$(jq -r '.mute' <<<"$saved_state") || return 1
+      if [[ -n $verify_profile ]]; then
+        live_endpoint_matches "$kind" "$verify_filter" "$verify_profile" "$new_state" || return 1
+      fi
       run_pactl "set-${kind}-mute" "$endpoint_index" "$endpoint_muted" \
         >/dev/null 2>&1 || return 1
       continue
@@ -318,6 +360,9 @@ restore_new_endpoint_states() {
         then $initial.mute else empty end
     ' <<<"$first_states") || return 1
     if [[ $initial_mute == false ]]; then
+      if [[ -n $verify_profile ]]; then
+        live_endpoint_matches "$kind" "$verify_filter" "$verify_profile" "$new_state" || return 1
+      fi
       run_pactl "set-${kind}-mute" "$endpoint_index" false \
         >/dev/null 2>&1 || return 1
     fi
@@ -327,12 +372,10 @@ restore_new_endpoint_states() {
 rollback_profile() {
   local rollback_deadline rollback_sink_payload rollback_source_payload
   local rollback_sink_states='[]' rollback_source_states='[]'
-  local last_good_rollback_sink_states='[]' last_good_rollback_source_states='[]'
   local first_rollback_sink_states='[]' first_rollback_source_states='[]'
   local expected_old_sinks expected_old_sources sink_index sink_muted
   local source_index source_muted
   local rollback_active_profile=
-  local rollback_profile_confirmed=false
   local rollback_signature= last_rollback_signature=
   local rollback_stable_ticks=0 rollback_sink_count rollback_source_count
   local rollback_transient_source_count
@@ -373,15 +416,6 @@ rollback_profile() {
       rollback_source_states='[]'
     fi
     rollback_active_profile=$(read_active_profile) || rollback_active_profile=
-    if [[ $rollback_active_profile == "$active_profile" ]]; then
-      rollback_profile_confirmed=true
-      if [[ $rollback_sinks_read_ok == true ]]; then
-        last_good_rollback_sink_states=$rollback_sink_states
-      fi
-      if [[ $rollback_sources_read_ok == true ]]; then
-        last_good_rollback_source_states=$rollback_source_states
-      fi
-    fi
     first_rollback_sink_states=$(merge_first_states \
       "$first_rollback_sink_states" "$rollback_sink_states") || return 1
     first_rollback_source_states=$(merge_first_states \
@@ -476,19 +510,40 @@ rollback_profile() {
   fi
 
   # Even when one direction's inventory could not be read or settled during
-  # rollback, restore every recovered endpoint whose state is known so we do
-  # not leave playback or capture endpoints stuck muted after rollback muted
-  # them. Still report incomplete rollback to the caller.
-  if [[ $rollback_profile_confirmed == true ]]; then
-    if (( $(jq 'length' <<<"$last_good_rollback_sink_states" 2>/dev/null || printf '0') > 0 )); then
-      restore_new_endpoint_states sink "$old_sink_states" \
-        "$first_rollback_sink_states" "$last_good_rollback_sink_states" || rollback_complete=false
+  # rollback, restore every live endpoint still belonging to the original card
+  # on the previous profile so playback or capture is not left muted. Revalidate
+  # card and endpoint identity before every volume or mute write so a hotplugged
+  # device reusing an old index is never touched.
+  if confirm_live_card_profile "$active_profile"; then
+    if rollback_sink_payload=$(read_endpoints sinks) \
+        && rollback_sink_states=$(project_endpoint_states \
+          "$rollback_sink_payload" "$endpoint_filter"); then
+      if (( $(jq 'length' <<<"$rollback_sink_states") > 0 )); then
+        restore_new_endpoint_states sink "$old_sink_states" \
+          "$first_rollback_sink_states" "$rollback_sink_states" \
+          "$active_profile" "$endpoint_filter" || rollback_complete=false
+      elif (( expected_old_sinks > 0 )); then
+        rollback_complete=false
+      fi
+    else
+      rollback_complete=false
     fi
 
-    if (( $(jq 'length' <<<"$last_good_rollback_source_states" 2>/dev/null || printf '0') > 0 )); then
-      restore_new_endpoint_states source "$old_source_states" \
-        "$first_rollback_source_states" "$last_good_rollback_source_states" || rollback_complete=false
+    if rollback_source_payload=$(read_endpoints sources) \
+        && rollback_source_states=$(project_endpoint_states \
+          "$rollback_source_payload" "$source_filter"); then
+      if (( $(jq 'length' <<<"$rollback_source_states") > 0 )); then
+        restore_new_endpoint_states source "$old_source_states" \
+          "$first_rollback_source_states" "$rollback_source_states" \
+          "$active_profile" "$source_filter" || rollback_complete=false
+      elif (( expected_old_sources > 0 )); then
+        rollback_complete=false
+      fi
+    else
+      rollback_complete=false
     fi
+  else
+    rollback_complete=false
   fi
 
   [[ $rollback_complete == true ]]

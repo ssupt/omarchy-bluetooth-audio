@@ -115,8 +115,13 @@ Item {
   function setManualAudioProfile(address, profile) {
     if (manualProfileBusy || sharedPolicy.profileSwitchBusy || !address || !profile)
       return false
+    var localEpoch = !ready && controller && controller.policyEngine
+      && typeof controller.policyEngine.connectionEpoch === "function"
+      ? controller.policyEngine.connectionEpoch(address) : undefined
     var operation = {
-      id: ++manualProfileSequence, address: String(address), profile: String(profile)
+      id: ++manualProfileSequence, address: String(address), profile: String(profile),
+      connectionEpoch: sharedPolicy.connectionEpoch(address),
+      localConnectionEpoch: localEpoch
     }
     manualProfileResult = null
     manualProfileOperation = operation
@@ -144,10 +149,12 @@ Item {
       outcome = "unknown"
     var message = String(failure && failure.message || result && result.message || "")
     if (outcome === "applied" || outcome === "persistence_failed")
-      sharedPolicy.noteManualProfileSelection(operation.address)
+      sharedPolicy.noteManualProfileSelection(operation.address, operation.connectionEpoch)
     manualProfileOperation = null
     manualProfileResult = {
       id: operation.id, address: operation.address, profile: operation.profile,
+      connectionEpoch: operation.connectionEpoch,
+      localConnectionEpoch: operation.localConnectionEpoch,
       outcome: outcome, message: message
     }
   }
@@ -305,10 +312,13 @@ Item {
       return null
     }
     if (normalized === "") return null
+    var fallback = null
     for (var j = 0; j < devs.length; j++) {
-      if (devs[j] && Model.normalizedAddress(devs[j].address) === normalized) return devs[j]
+      if (!devs[j] || Model.normalizedAddress(devs[j].address) !== normalized) continue
+      if (devs[j].connected) return devs[j]
+      if (!fallback) fallback = devs[j]
     }
-    return null
+    return fallback
   }
 
   function startDeviceAction(action, address, pendingState, devicePath) {
@@ -677,6 +687,14 @@ Item {
     destroying = true
     launchTimer.stop()
     reconnectTimer.stop()
+    if (fallbackDeviceAction.running) {
+      fallbackDeviceAction.signal(15)
+      fallbackDeviceAction.running = false
+    }
+    if (manualProfileSetProc.running) {
+      manualProfileSetProc.signal(15)
+      manualProfileSetProc.running = false
+    }
     backend.running = false
     failPending("Bluetooth service stopped")
   }

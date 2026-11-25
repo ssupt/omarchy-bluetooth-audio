@@ -753,6 +753,7 @@ corrupt_policy_overrides=$(mktemp)
 sanitized_preferences=$(mktemp)
 corrupt_preferences=$(mktemp)
 profile_fail_once_state=$(mktemp)
+profile_hotplug_state=$(mktemp)
 shared_preferences_lock="${shared_preferences}.lock"
 failed_preferences_lock="${failed_preferences}.lock"
 no_source_preferences_lock="${no_source_preferences}.lock"
@@ -762,7 +763,7 @@ migration_overrides_lock="${migration_overrides}.lock"
 corrupt_policy_overrides_lock="${corrupt_policy_overrides}.lock"
 sanitized_preferences_lock="${sanitized_preferences}.lock"
 corrupt_preferences_lock="${corrupt_preferences}.lock"
-trap 'rm -f "$fallback_card_fixture" "$profile_log" "$profile_state" "$profile_recreate_state" "$profile_fail_once_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$policy_preferences" "$policy_overrides" "$migration_overrides" "$corrupt_policy_overrides" "$sanitized_preferences" "$corrupt_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock" "$policy_preferences_lock" "$policy_overrides_lock" "$migration_overrides_lock" "$corrupt_policy_overrides_lock" "$sanitized_preferences_lock" "$corrupt_preferences_lock" "$profile_runtime/omarchy-audio-mutation-${UID}.lock" "$profile_runtime/omarchy-audio-mutation.lock" "$profile_runtime/omarchy-bluetooth-mutation-${UID}.lock" "$profile_runtime/omarchy-bluetooth-service-${UID}.lock"; rmdir "$profile_runtime"' EXIT
+trap 'rm -f "$fallback_card_fixture" "$profile_log" "$profile_state" "$profile_recreate_state" "$profile_fail_once_state" "$profile_hotplug_state" "$bluetooth_action_log" "$bluetooth_action_error" "$bluetooth_property_log" "$bluetooth_property_error" "$shared_preferences" "$failed_preferences" "$no_source_preferences" "$policy_preferences" "$policy_overrides" "$migration_overrides" "$corrupt_policy_overrides" "$sanitized_preferences" "$corrupt_preferences" "$shared_preferences_lock" "$failed_preferences_lock" "$no_source_preferences_lock" "$policy_preferences_lock" "$policy_overrides_lock" "$migration_overrides_lock" "$corrupt_policy_overrides_lock" "$sanitized_preferences_lock" "$corrupt_preferences_lock" "$profile_runtime/omarchy-audio-mutation-${UID}.lock" "$profile_runtime/omarchy-audio-mutation.lock" "$profile_runtime/omarchy-bluetooth-mutation-${UID}.lock" "$profile_runtime/omarchy-bluetooth-service-${UID}.lock"; rmdir "$profile_runtime"' EXIT
 export XDG_RUNTIME_DIR="$profile_runtime"
 printf 'old\n' >"$profile_state"
 
@@ -781,6 +782,34 @@ EOF
 )
 [[ $(<"$bluetooth_action_log") == "$expected_bluetooth_action_log" ]] \
   || fail "result-aware Bluetooth pairing sequence"
+
+# Address-only pairing must not trust a device whose name spoofs "Bonded: yes"
+# or treat a name containing "Blocked: yes" as blocked.
+: >"$bluetooth_action_log"
+BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_DEVICE_NAME="Evil Bonded: yes Blocked: yes Paired: yes" \
+  BLUETOOTH_ACTION_PAIRED=yes \
+  BLUETOOTH_ACTION_BONDED=no \
+  BLUETOOTH_ACTION_BLOCKED=no \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" pair 00:11:22:33:44:55
+if rg -q '^trust ' "$bluetooth_action_log"; then
+  fail "spoofed device name granted Trusted during address-only pairing"
+fi
+rg -q '^connect 00:11:22:33:44:55$' "$bluetooth_action_log" \
+  || fail "spoofed Blocked text in device name blocked pairing"
+
+: >"$bluetooth_action_log"
+BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
+  BLUETOOTH_ACTION_DEVICE_NAME="Evil Paired: yes" \
+  BLUETOOTH_ACTION_PAIRED=no \
+  BLUETOOTH_ACTION_BONDED=omit \
+  BLUETOOTH_ACTION_BLOCKED=no \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/bluetooth-device-action" pair 00:11:22:33:44:55
+if rg -q '^trust ' "$bluetooth_action_log"; then
+  fail "spoofed Paired text in device name granted Trusted on older BlueZ"
+fi
 
 : >"$bluetooth_action_log"
 if BLUETOOTH_ACTION_LOG="$bluetooth_action_log" \
@@ -1559,6 +1588,31 @@ EOF
 [[ $(<"$profile_log") == "$expected_partial_rollback_log" ]] \
   || fail "rollback with unreadable sources left playback muted"
 echo "PASS: rollback restores playback even when source inventory is unreadable"
+
+# If the original card disappears mid-rollback and an unrelated muted sink
+# reuses its index (100), rollback must not restore volume or unmute it.
+: >"$profile_log"
+: >"$profile_hotplug_state"
+: >"$bluetooth_action_error"
+printf 'old\n' >"$profile_state"
+if AUDIO_CONTROL_CARD_FIXTURE="$TEST_DIR/fixtures/cards.json" \
+  AUDIO_CONTROL_PROFILE_LOG="$profile_log" \
+  AUDIO_CONTROL_PROFILE_STATE="$profile_state" \
+  AUDIO_CONTROL_PROFILE_CARD_INDEX=20 \
+  AUDIO_CONTROL_PROFILE_SET_FAIL=1 \
+  AUDIO_CONTROL_PROFILE_NO_OLD_SOURCE=1 \
+  AUDIO_CONTROL_PROFILE_ROLLBACK_SOURCE_READ_FAIL=1 \
+  AUDIO_CONTROL_PROFILE_HOTPLUG_STATE="$profile_hotplug_state" \
+  PATH="$TEST_DIR/mocks:$PATH" \
+  "$ROOT/scripts/audio-profile-set" \
+    bluez_card.00_11_22_33_44_55 headset-head-unit-msbc \
+      >/dev/null 2>"$bluetooth_action_error"; then
+  fail "hotplug during partial rollback reported success"
+fi
+if rg -q '^set-sink-volume 100 |^set-sink-mute 100 false$' "$profile_log"; then
+  fail "partial rollback touched an unrelated sink that reused index 100"
+fi
+echo "PASS: partial rollback revalidates card and endpoint identity across hotplug"
 
 : >"$profile_log"
 printf 'old\n' >"$profile_state"

@@ -311,16 +311,38 @@ impl Service {
             ));
         }
         let path = self.scripts.join(name);
-        let mut child = Command::new(&path)
+        let parent_pid = unsafe { libc::getpid() };
+        let mut command = Command::new(&path);
+        command
             .args(args)
             .process_group(0)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| {
-                Failure::rejected("unavailable", format!("Could not run {name}: {error}"))
-            })?;
+            .kill_on_drop(true);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            command.pre_exec(move || {
+                // Ensure helpers receive SIGTERM for BlueZ/audio cleanup even if
+                // the service is abruptly SIGKILLed during shell Process teardown.
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGTERM as libc::c_ulong,
+                    0usize,
+                    0usize,
+                    0usize,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    libc::_exit(128 + libc::SIGTERM);
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| {
+            Failure::rejected("unavailable", format!("Could not run {name}: {error}"))
+        })?;
         let pid = child
             .id()
             .ok_or_else(|| Failure::unknown("Bluetooth helper has no process ID"))?;
@@ -669,7 +691,7 @@ impl Service {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args == ["--build-info"] {
@@ -702,6 +724,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         jobs: Mutex::new(HashMap::new()),
         cancel_notify: Notify::new(),
         shutdown: shutdown_rx,
+    });
+    // Keep signal handling active even after stdin reaches EOF so queued and
+    // in-flight mutations are still cancelled cleanly if SIGTERM/SIGINT/SIGHUP
+    // arrives while the worker drains.
+    let signal_service = service.clone();
+    let signal_shutdown_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
+            _ = sighup.recv() => {}
+        }
+        {
+            let mut jobs = signal_service.jobs.lock().await;
+            for job in jobs.values_mut() {
+                job.cancelled = true;
+            }
+        }
+        signal_service.cancel_notify.notify_waiters();
+        let _ = signal_shutdown_tx.send(true);
     });
     let (tx, mut rx) = mpsc::channel::<Value>(32);
     let (mutation_tx, mut mutation_rx) = mpsc::channel::<Request>(32);
@@ -801,23 +843,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut line = Vec::new();
-    let mut signaled_shutdown = false;
+    let mut read_shutdown = service.shutdown.clone();
     loop {
         line.clear();
         let read_result = tokio::select! {
+            biased;
+            _ = read_shutdown.wait_for(|shutting_down| *shutting_down) => {
+                break;
+            }
             result = read_frame(&mut stdin, &mut line) => result,
-            _ = sigterm.recv() => {
-                signaled_shutdown = true;
-                break;
-            }
-            _ = sigint.recv() => {
-                signaled_shutdown = true;
-                break;
-            }
-            _ = sighup.recv() => {
-                signaled_shutdown = true;
-                break;
-            }
         };
         if !read_result? {
             break;
@@ -903,29 +937,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     }
-    if signaled_shutdown {
-        {
-            let mut jobs = service.jobs.lock().await;
-            for job in jobs.values_mut() {
-                job.cancelled = true;
-            }
-        }
-        service.cancel_notify.notify_waiters();
-        let _ = shutdown_tx.send(true);
-    }
     drop(mutation_tx);
     worker.await?;
     let _ = other_permits.acquire_many(32).await;
     let _ = cancel_permits.acquire_many(4).await;
     drop(tx);
-    if signaled_shutdown {
+    if *service.shutdown.borrow() {
         let _ = tokio::time::timeout(Duration::from_millis(250), writer).await;
         // All helpers are reaped and locks released. Exit directly so Tokio's
         // blocking stdin thread cannot hold the process open if the parent has
         // not closed stdin yet.
         std::process::exit(0);
     }
-    writer.await??;
+    tokio::select! {
+        result = writer => {
+            result??;
+        }
+        _ = read_shutdown.wait_for(|shutting_down| *shutting_down) => {
+            std::process::exit(0);
+        }
+    }
     Ok(())
 }
 

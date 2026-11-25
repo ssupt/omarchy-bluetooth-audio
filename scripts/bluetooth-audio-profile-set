@@ -28,7 +28,7 @@ card=$("$script_dir/bluetooth-audio-profiles" | jq -r --arg address "$address" -
 # individual BlueZ card and restores it the next time that device appears.
 profile_set_pid=
 cancel_profile_set() {
-  trap - INT TERM HUP
+  trap ':' INT TERM HUP
   if [[ -n $profile_set_pid ]]; then
     kill -TERM "$profile_set_pid" >/dev/null 2>&1 || true
     wait "$profile_set_pid" >/dev/null 2>&1 || true

@@ -57,7 +57,10 @@ disconnect_cleanup_failed() {
 }
 
 cancel_active_control() {
-  trap - INT TERM HUP
+  # Ignore duplicate termination signals (for example, parent-death SIGTERM
+  # after an explicit cancel) while bounded cleanup runs, without setting
+  # SIG_IGN that child commands would inherit across exec.
+  trap ':' INT TERM HUP
   if [[ -n $active_control_pid ]]; then
     kill -TERM "$active_control_pid" >/dev/null 2>&1 || true
     wait "$active_control_pid" >/dev/null 2>&1 || true
@@ -264,15 +267,43 @@ run_control() {
   fi
 }
 
+bluetoothctl_bool_property() {
+  local output=$1
+  local property=$2
+  local line value=
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    if [[ $line =~ ^[[:space:]]+${property}:[[:space:]]*(yes|no)[[:space:]]*$ ]]; then
+      value=${BASH_REMATCH[1]}
+    fi
+  done <<<"$output"
+  [[ -n $value ]] || return 1
+  printf '%s\n' "$value"
+}
+
+bluetoothctl_has_device_header() {
+  local output=$1
+  local expected=${2^^}
+  local line
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    if [[ ${line^^} =~ ^DEVICE[[:space:]]+${expected}([[:space:]]|$) ]]; then
+      return 0
+    fi
+  done <<<"$output"
+  return 1
+}
+
 ensure_powered() {
-  local state
+  local state powered
   if [[ -n $device_path ]]; then
     state=$(timeout --kill-after=1s 2s busctl get-property \
       org.bluez "$adapter_path" org.bluez.Adapter1 Powered 2>/dev/null 9>&-) || state=
     [[ $state == "b true" ]] && return 0
   else
     state=$(timeout --kill-after=1s 2s bluetoothctl show 2>/dev/null 9>&- | strip_terminal_codes) || state=
-    [[ $state == *"Powered: yes"* ]] && return 0
+    powered=$(bluetoothctl_bool_property "$state" Powered) || powered=
+    [[ $powered == yes ]] && return 0
   fi
 
   omarchy-bluetooth-power on >/dev/null 2>&1 9>&- &
@@ -291,21 +322,25 @@ ensure_powered() {
 }
 
 ensure_not_blocked() {
-  local info
+  local info blocked=
   if [[ -n $device_path ]]; then
     info=$(timeout --kill-after=1s 2s busctl get-property \
       org.bluez "$device_path" org.bluez.Device1 Blocked 2>/dev/null 9>&-) || return 0
+    [[ $info == "b true" ]] && blocked=yes
   else
     info=$(timeout --kill-after=1s 2s bluetoothctl info "$address" 2>/dev/null 9>&- | strip_terminal_codes) || return 0
+    if bluetoothctl_has_device_header "$info" "$address"; then
+      blocked=$(bluetoothctl_bool_property "$info" Blocked) || blocked=
+    fi
   fi
-  if [[ $info == "b true" || $info == *"Blocked: yes"* ]]; then
+  if [[ $blocked == yes ]]; then
     echo "This device is blocked. Unblock it before trying again." >&2
     return 1
   fi
 }
 
 device_has_bond() {
-  local state status=0
+  local state status=0 bonded= paired=
   if [[ -n $device_path ]]; then
     state=$(timeout --kill-after=1s 2s busctl get-property \
       org.bluez "$device_path" org.bluez.Device1 Bonded 2>&1 9>&-) || status=$?
@@ -334,12 +369,14 @@ device_has_bond() {
 
   state=$(timeout --kill-after=1s 2s bluetoothctl info "$address" 2>/dev/null 9>&- \
     | strip_terminal_codes) || return 1
-  if [[ $state == *"Bonded: yes"* ]]; then
-    return 0
-  elif [[ $state == *"Bonded:"* ]]; then
-    return 1
+  bluetoothctl_has_device_header "$state" "$address" || return 1
+  paired=$(bluetoothctl_bool_property "$state" Paired) || paired=
+  if bonded=$(bluetoothctl_bool_property "$state" Bonded); then
+    [[ $bonded == yes && $paired != no ]]
+    return
   fi
-  [[ $state == *"Device "* && $state == *"Paired: yes"* ]]
+  # Older BlueZ (< 5.65) omits Bonded entirely from bluetoothctl info.
+  [[ $paired == yes ]]
 }
 
 trust_device() {

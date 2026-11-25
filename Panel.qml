@@ -458,10 +458,13 @@ Panel {
     var normalized = Model.normalizedAddress(address)
     if (normalized === "") return null
     var devs = devices || []
+    var fallback = null
     for (var i = 0; i < devs.length; i++) {
-      if (devs[i] && Model.normalizedAddress(devs[i].address) === normalized) return devs[i]
+      if (!devs[i] || Model.normalizedAddress(devs[i].address) !== normalized) continue
+      if (devs[i].connected) return devs[i]
+      if (!fallback) fallback = devs[i]
     }
-    return null
+    return fallback
   }
 
   function deviceByIdentity(address, dbusPath) {
@@ -785,12 +788,16 @@ Panel {
 
   function finishAudioProfileOperation(result) {
     if (!result) return
+    var operation = pendingAudioProfile || unconfirmedAudioProfile
+    var expectedEpoch = result.localConnectionEpoch !== undefined
+      ? result.localConnectionEpoch
+      : (operation && operation.id === result.id
+        ? operation.localConnectionEpoch : result.connectionEpoch)
     if ((result.outcome === "applied" || result.outcome === "persistence_failed")
         && (!bluetoothService || !bluetoothService.ready)
         && typeof localPolicyEngine !== "undefined"
         && typeof localPolicyEngine.noteManualProfileSelection === "function")
-      localPolicyEngine.noteManualProfileSelection(result.address)
-    var operation = pendingAudioProfile || unconfirmedAudioProfile
+      localPolicyEngine.noteManualProfileSelection(result.address, expectedEpoch)
     if (operation && operation.id === result.id
         && result.outcome !== "applied" && result.outcome !== "persistence_failed") {
       pendingAudioProfile = null
@@ -1071,7 +1078,12 @@ Panel {
     if (!device || !device.connected) return
     pendingAudioProfile = {
       address: Model.normalizedAddress(operation.address),
-      profile: String(operation.profile), id: operation.id
+      profile: String(operation.profile), id: operation.id,
+      localConnectionEpoch: operation.localConnectionEpoch !== undefined
+        ? operation.localConnectionEpoch
+        : (typeof localPolicyEngine !== "undefined"
+          && typeof localPolicyEngine.connectionEpoch === "function"
+          ? localPolicyEngine.connectionEpoch(operation.address) : undefined)
     }
     unconfirmedAudioProfile = pendingAudioProfile
     audioProfileSetError = ""
@@ -1730,6 +1742,7 @@ Panel {
     syncPendingActions()
     var actions = pendingActions
     var kinds = pendingActionKinds
+    var paths = typeof pendingActionPaths !== "undefined" ? pendingActionPaths : ({})
     var deadlines = pendingActionDeadlines
     var now = Date.now()
     var expired = []
@@ -1737,10 +1750,11 @@ Panel {
       if (Number(deadlines[address] || 0) > now) continue
       // A helper owns its row until it exits; its success path starts a fresh
       // confirmation deadline and its failure path clears the pending state.
-      if (deviceActionOwner(address)) continue
+      var pendingPath = String(paths[address] || "")
+      if (deviceActionOwner(address, "", pendingPath)) continue
       var action = String(kinds[address] || "")
       if (action !== "")
-        setDeviceActionFailure(address, action, pendingActionTimeoutMessage(action))
+        setDeviceActionFailure(address, action, pendingActionTimeoutMessage(action), pendingPath)
       expired.push(address)
     }
     for (var expiredIndex = 0; expiredIndex < expired.length; expiredIndex++)

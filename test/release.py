@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Detect stale source, binary, and metadata in a staged plugin."""
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -50,15 +51,19 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-release-test-") as temporary:
     except ValueError:
         pass
 
-    # Consecutive no-change Cargo checks using the default backend/target dir
-    # must stay incremental instead of rebuilding on build-output writes.
+    # Consecutive no-change Cargo checks targeting staged/backend/target must
+    # stay incremental instead of rebuilding on build-output writes, even when
+    # CARGO_TARGET_DIR is set in the caller's environment.
+    target_dir = staged / "backend/target"
+    cargo_env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
     check_cmd = [
         "cargo", "check", "--locked", "--offline",
         "--manifest-path", str(staged / "backend/Cargo.toml"),
+        "--target-dir", str(target_dir),
     ]
-    first_check = subprocess.run(check_cmd, check=True, capture_output=True, text=True)
+    first_check = subprocess.run(check_cmd, check=True, capture_output=True, text=True, env=cargo_env)
     assert "omarchy-bluetooth-service" in first_check.stderr, first_check.stderr
-    second_check = subprocess.run(check_cmd, check=True, capture_output=True, text=True)
+    second_check = subprocess.run(check_cmd, check=True, capture_output=True, text=True, env=cargo_env)
     assert "omarchy-bluetooth-service" not in second_check.stderr, second_check.stderr
 
     # Adding a top-level QML file without listing it in packaging/sources.txt
@@ -67,9 +72,10 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-release-test-") as temporary:
     build_cmd = [
         "cargo", "build", "--locked", "--offline",
         "--manifest-path", str(staged / "backend/Cargo.toml"),
+        "--target-dir", str(target_dir),
     ]
-    subprocess.run(build_cmd, check=True, capture_output=True, text=True)
-    built_binary = staged / "backend/target/debug/omarchy-bluetooth-service"
+    subprocess.run(build_cmd, check=True, capture_output=True, text=True, env=cargo_env)
+    built_binary = target_dir / "debug/omarchy-bluetooth-service"
     before = release.checked_info(staged, built_binary)
     added_qml.write_text("import QtQuick\nItem {}\n")
     try:
@@ -80,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix="bluetooth-release-test-") as temporary:
     manifest_file = staged / release.SOURCES_MANIFEST
     listed = sorted(manifest_file.read_text().splitlines() + [added_qml.name])
     manifest_file.write_text("\n".join(listed) + "\n")
-    subprocess.run(build_cmd, check=True, capture_output=True, text=True)
+    subprocess.run(build_cmd, check=True, capture_output=True, text=True, env=cargo_env)
     after = release.checked_info(staged, built_binary)
     assert after["sourceId"] != before["sourceId"], (before, after)
 
